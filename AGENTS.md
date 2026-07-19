@@ -26,6 +26,16 @@ For a task explicitly intended to change the design, update `design.md` first or
 
 If sources conflict, report the conflict before making a design-changing implementation.
 
+## Context loading
+
+- Treat this file as persistent repository guidance; do not repeatedly reopen it during the same task unless it changed or a rule needs exact verification.
+- Do not read `LICENSE` during normal implementation work. Its only project-specific rule is that the file must remain unchanged.
+- Do not reread the complete `README.md` for every task. Consult only the relevant requirement section when the issue does not already provide sufficient task context, when requirement compliance is uncertain, or during final delivery verification.
+- Do not reread the complete `design.md` for every task. Inspect only the sections relevant to the component or decision being changed. Read it more broadly only for architecture work, cross-cutting changes, or when the issue may conflict with the approved design.
+- Start from the current issue and the files directly involved in the requested change. Expand repository inspection only as needed to understand dependencies, existing behavior, tests, or risks.
+- Reuse information already established in the current task or review instead of fetching the same unchanged content again.
+- Never skip necessary verification merely to save tokens; optimize by reading narrowly, not by guessing.
+
 ## Preserve the provided repository baseline
 
 - Treat files already present in the original assessment repository as part of the assignment unless explicitly identified otherwise.
