@@ -18,19 +18,13 @@ Use the following precedence:
 
 Do not modify `README.md`. It is provided by the assessment owner and represents the original task requirements.
 
+Do not modify, rename, replace, reformat, or delete `LICENSE`. It is outside the implementation scope.
+
 For tasks that do not explicitly concern architecture or design, treat `design.md` as authoritative. Follow its decisions and constraints rather than introducing alternative designs.
 
 For a task explicitly intended to change the design, update `design.md` first or as part of the same focused change. Do not silently make the implementation diverge from the documented design.
 
 If sources conflict, report the conflict before making a design-changing implementation.
-
-## License
-
-- Read and comply with the repository `LICENSE` file.
-- Treat `LICENSE` as externally provided, out of scope for the assessment, and immutable.
-- Do not edit, replace, rename, reformat, regenerate, or delete `LICENSE`.
-- Preserve all copyright and permission notices required by the license in copies or substantial portions of the software.
-- If a requested change appears to conflict with the license, stop and report the conflict before proceeding.
 
 ## Preserve the provided repository baseline
 
