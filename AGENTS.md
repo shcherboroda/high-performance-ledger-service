@@ -13,7 +13,7 @@ Use the following precedence:
 1. `README.md` — official assessment requirements;
 2. the current GitHub issue or explicit user instruction;
 3. `design.md` — approved design and implementation direction;
-4. existing tests and code;
+4. existing tests, workflows, configuration, infrastructure, and code;
 5. this file.
 
 Do not modify `README.md`. It is provided by the assessment owner and represents the original task requirements.
@@ -31,6 +31,15 @@ If sources conflict, report the conflict before making a design-changing impleme
 - Do not edit, replace, rename, reformat, regenerate, or delete `LICENSE`.
 - Preserve all copyright and permission notices required by the license in copies or substantial portions of the software.
 - If a requested change appears to conflict with the license, stop and report the conflict before proceeding.
+
+## Preserve the provided repository baseline
+
+- Treat files already present in the original assessment repository as part of the assignment unless explicitly identified otherwise.
+- Do not remove, replace, simplify, disable, or weaken existing tests, checks, workflows, configuration, infrastructure, dependencies, or safeguards merely because they are not yet used by the current implementation.
+- Prefer extending the existing setup over replacing it.
+- Modify an existing baseline file only when the current issue explicitly requires it or when a concrete defect blocks the requested work.
+- Before changing a baseline file, inspect its purpose and preserve its existing behavior unless the approved change explicitly says otherwise.
+- Report potentially obsolete, premature, or failing baseline configuration instead of deleting or reducing it without approval.
 
 ## Development workflow
 
@@ -90,4 +99,4 @@ A pull request should state:
 - how it was verified;
 - any remaining risks or limitations.
 
-Before completion, review the final diff for unrelated changes, generated files, secrets, accidental formatting churn, and any change to `README.md` or `LICENSE`.
+Before completion, review the final diff for unrelated changes, generated files, secrets, accidental formatting churn, changes to `README.md` or `LICENSE`, and any unintended weakening of the original repository baseline.
