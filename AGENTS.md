@@ -24,6 +24,14 @@ For a task explicitly intended to change the design, update `design.md` first or
 
 If sources conflict, report the conflict before making a design-changing implementation.
 
+## License
+
+- Read and comply with the repository `LICENSE` file.
+- Treat `LICENSE` as externally provided, out of scope for the assessment, and immutable.
+- Do not edit, replace, rename, reformat, regenerate, or delete `LICENSE`.
+- Preserve all copyright and permission notices required by the license in copies or substantial portions of the software.
+- If a requested change appears to conflict with the license, stop and report the conflict before proceeding.
+
 ## Development workflow
 
 - Work from a dedicated branch created from the latest `origin/main`.
@@ -82,4 +90,4 @@ A pull request should state:
 - how it was verified;
 - any remaining risks or limitations.
 
-Before completion, review the final diff for unrelated changes, generated files, secrets, and accidental formatting churn.
+Before completion, review the final diff for unrelated changes, generated files, secrets, accidental formatting churn, and any change to `README.md` or `LICENSE`.
