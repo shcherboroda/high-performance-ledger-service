@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-Install Rust 1.92 or newer, Docker Compose, and `curl`. PostgreSQL 18 is supplied by the existing Compose service.
+Install Rust 1.94 or newer, Docker Compose, and `curl`. PostgreSQL 18 is supplied by the existing Compose service.
 
 ## Run locally
 
