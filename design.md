@@ -2,19 +2,19 @@
 
 ## 1. Overview
 
-The Ledger Service provides authenticated REST APIs for account management, atomic money transfers, transfer reversal and transaction history.
+The Ledger Service provides authenticated REST APIs for account creation, balance reads, atomic transfers, transfer reversal and account-centric transaction history.
 
-The service is designed for:
+The design prioritizes:
 
 * strong consistency of balances;
-* safe concurrent execution;
-* low latency on the critical transfer path;
-* horizontal scaling of stateless application instances;
-* an immutable transfer audit trail;
-* efficient account-centric history reads;
+* safe concurrent execution across stateless instances;
+* short financial transactions;
+* immutable transfer records;
+* efficient account-history reads;
+* explicit idempotency and crash recovery;
 * optional cross-currency transfers.
 
-PostgreSQL is the authoritative source of financial state and provides transaction isolation, row-level locking and cross-instance concurrency control.
+PostgreSQL is the authoritative source of financial state and cross-instance coordination.
 
 ## 2. Goals
 
@@ -23,14 +23,14 @@ The implementation must:
 * create accounts with an initial balance and currency;
 * return the current account balance;
 * transfer funds atomically between distinct accounts;
-* support transfers between accounts owned by the same client;
-* prevent overdrafts for normal transfers;
-* reject normal transfers between incompatible currencies;
+* support transfers between different accounts of the same owner;
+* prevent overdrafts for normal and FX transfers;
+* reject same-currency transfers between incompatible currencies;
 * reverse completed transfers atomically;
-* allow an overdraft on the original destination during reversal;
-* expose account and account-pair transaction history;
-* authenticate all business operations using JWT;
-* provide request idempotency;
+* allow the original destination account to become negative during reversal;
+* expose account and account-pair history;
+* authenticate business operations using JWT;
+* provide replay-safe idempotency;
 * return structured errors;
 * expose an OpenAPI 3.1 specification;
 * remain correct with multiple application instances.
@@ -48,7 +48,7 @@ The following are outside the required scope:
 * account status transition endpoints;
 * real-time settlement with external financial institutions.
 
-## 4. System architecture
+## 4. Architecture
 
 ```text
 Clients
@@ -68,88 +68,73 @@ Ledger Instance A   Ledger Instance B
          PostgreSQL
 ```
 
-Ledger application instances are stateless. Any instance may process a request for any client.
+Application instances are stateless. Any instance may process any request. PostgreSQL owns balances, transfers, entries, exchange-rate snapshots and idempotency state.
 
-No application instance owns an account, client or balance. All authoritative state is stored in PostgreSQL.
-
-The application consists of the following logical components:
+Logical components:
 
 * HTTP API;
-* JWT authentication middleware;
+* JWT middleware;
 * account application service;
-* transfer application service;
+* transfer and reversal application services;
 * history query service;
-* idempotency handling;
+* idempotency coordinator;
 * SQLx persistence layer;
 * configuration and observability.
 
-HTTP handlers perform transport-level validation and response mapping. Application services own use-case logic and transaction boundaries. SQLx persistence functions execute database operations.
+HTTP handlers perform transport validation and response mapping. Application services own use-case logic and transaction boundaries.
 
 ## 5. Authentication and authorization
 
-All business endpoints require an access token:
+All business endpoints require:
 
 ```http
 Authorization: Bearer <JWT>
 ```
 
-JWT issuance is delegated to an external authentication provider.
+JWT issuance belongs to an external provider. The service validates signature, `exp`, `sub`, configured `iss` and configured `aud`.
 
-The Ledger Service validates:
-
-* token signature;
-* expiration time (`exp`);
-* subject (`sub`);
-* configured issuer (`iss`);
-* configured audience (`aud`).
-
-The `sub` claim is used as the authenticated client identifier. JWT verification occurs once at the beginning of every protected HTTP request.
+The `sub` claim identifies the client.
 
 Authorization rules:
 
-* an account is owned by the authenticated client that created it;
-* only the owner may read an account balance or history;
-* the authenticated client must own the source account of a normal or FX transfer;
-* the destination account may belong to the same or another client;
-* a reversal may be requested only by the owner of the original destination account.
+* the creator owns an account;
+* only the owner may read its balance or history;
+* the caller must own the source account of a normal or FX transfer;
+* the destination may belong to the same or another client;
+* only the owner of the original destination account may request reversal.
 
-Health and readiness endpoints do not require JWT. Metrics access is deployment-specific and should normally be restricted at the infrastructure level.
+Health and readiness endpoints do not require JWT. Metrics access is deployment-specific.
 
 ## 6. Domain model
-
-### Client
-
-A client is identified by the JWT `sub` claim. No local client table is required because the service does not manage client profiles or credentials.
 
 ### Account
 
 An account has:
 
-* a unique account ID;
+* a unique ID;
 * one owner;
-* one currency;
-* a currency scale;
+* one immutable currency and scale;
 * a current balance;
 * a status;
 * a monotonic version;
 * creation and update timestamps.
 
-A client may own multiple accounts, including multiple accounts in the same currency. Transfers between a client's own distinct accounts are valid.
+A client may own multiple accounts, including several in the same currency. Transfers between distinct accounts of one owner are valid.
 
-The current implementation supports only the `active` status. Both source and destination accounts must exist and be active for transfers and reversals. Future states such as `blocked`, `suspended` and `closed` may be introduced later without changing account identity.
+The first version supports only `active`. Both participating accounts must exist and be active. Future states such as `blocked`, `suspended` and `closed` may be introduced later.
 
 ### Money
 
-Balances and persisted monetary amounts are stored as signed 64-bit integers in the smallest supported currency unit.
+Balances and monetary amounts are stored as signed 64-bit integers in minor units.
 
 Examples:
 
-* `10.25 PLN` is stored as `1025` for scale 2;
-* `100 JPY` is stored as `100` for scale 0.
+* `10.25 PLN` with scale 2 is stored as `1025`;
+* `100 JPY` with scale 0 is stored as `100`.
 
-Binary floating-point types are not used for balances, fees, rates or transfer amounts.
+Binary floating point is not used for balances, amounts, fees or rates.
 
-REST monetary input is represented as a decimal string, for example:
+REST monetary input is a decimal string:
 
 ```json
 {
@@ -157,61 +142,52 @@ REST monetary input is represented as a decimal string, for example:
 }
 ```
 
-The value must have no more fractional digits than the configured currency scale. The API does not silently round normal monetary input.
+Input may not have more fractional digits than the currency scale. Normal monetary input is never silently rounded. Arithmetic overflow is rejected.
 
-Account creation requires `initial_balance >= 0`. Transfer and reversal amounts must be greater than zero. Arithmetic overflow is rejected.
-
-### Currency
-
-Currency codes are normalized uppercase three-letter ASCII codes. Supported currencies and scales are defined by a server-side allowlist.
-
-An account's currency and scale are immutable after creation.
+Account creation requires `initial_balance >= 0`. Transfer amounts must be positive.
 
 ### Transfer
 
-A transfer is the immutable authoritative record of one completed business operation.
+A transfer is the immutable authoritative record of one completed business operation. It stores:
 
-A transfer stores:
-
-* source and destination accounts;
+* source and destination account IDs;
 * source and destination currencies;
 * source and destination amounts;
-* conversion fee and total source debit;
-* applied exchange rate and rate reference when applicable;
+* fee and total source debit;
+* rate and rate reference where applicable;
 * initiating client;
-* transfer kind;
-* reference to the original transfer for reversals;
+* operation kind;
+* original transfer reference for reversal;
 * creation timestamp.
 
-Failed transfer attempts do not create completed transfer records.
+Failed attempts do not create transfer records.
 
 ### Account entry
 
-An account entry is an immutable account-centric history projection. One completed operation creates one entry for each participating account:
+An account entry is an immutable account-centric history projection. A completed operation creates:
 
-* a debit entry for the source account;
-* a credit entry for the destination account.
+* one debit entry for the source account;
+* one credit entry for the destination account.
 
-This does not duplicate operations in an account history query because every query is scoped to one selected `account_id`.
+This does not duplicate rows in an account query because each query is scoped to one `account_id`.
 
-Account entries contain only information needed for efficient history lists:
+Entries contain only summary data needed by history lists:
 
-* account ID;
-* transfer ID;
+* account and transfer IDs;
 * counterparty account ID;
 * direction;
-* amount and currency relevant to the selected account;
+* amount and currency from the selected account's perspective;
 * operation kind;
-* principal and fee summary when useful for an outgoing FX operation;
-* creation timestamp.
+* optional principal and fee summary for outgoing FX;
+* timestamp.
 
-Detailed FX information, the applied rate and reversal relationships remain in `transfers` and are returned by the transfer-details endpoint.
+Rate details and reversal relationships remain in `transfers` and are returned by the transfer-details endpoint.
 
-Creating an account does not create a transfer or account entry. The `accounts` row and its `created_at` value are sufficient to represent account creation and its initial balance.
+Account creation does not create a transfer or account entry. The account row represents creation and its initial balance.
 
 ## 7. Data model
 
-The SQL below is illustrative. Exact names may be refined during implementation while preserving the invariants.
+The SQL is illustrative; implementation names may change while preserving the invariants.
 
 ### accounts
 
@@ -232,9 +208,9 @@ CREATE TABLE accounts (
 );
 ```
 
-The current balance is stored directly in the account row for constant-size balance reads. It is not recalculated from history.
+The current balance is stored directly in the account row. It is not recalculated from history.
 
-A negative balance is not generally forbidden by a database check because a reversal is explicitly allowed to make the original destination negative. Application transaction logic enforces that normal outgoing transfers cannot create or deepen an overdraft.
+No global `balance_minor >= 0` check is used because reversal may make the original destination negative. Domain logic prevents normal outgoing operations from overdrawing an account.
 
 ### transfers
 
@@ -247,39 +223,28 @@ CREATE TYPE transfer_kind AS ENUM (
 
 CREATE TABLE transfers (
     id UUID PRIMARY KEY,
-
     source_account_id UUID NOT NULL REFERENCES accounts(id),
     destination_account_id UUID NOT NULL REFERENCES accounts(id),
-
     source_currency CHAR(3) NOT NULL,
     destination_currency CHAR(3) NOT NULL,
-
     source_amount_minor BIGINT NOT NULL,
     destination_amount_minor BIGINT NOT NULL,
     fee_amount_minor BIGINT NOT NULL DEFAULT 0,
     total_source_debit_minor BIGINT NOT NULL,
-
     fee_bps INTEGER,
     exchange_rate NUMERIC(30, 12),
     exchange_rate_id UUID,
-
     kind transfer_kind NOT NULL,
     reverses_transfer_id UUID REFERENCES transfers(id),
-
     initiated_by TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-
     CHECK (source_account_id <> destination_account_id),
     CHECK (source_amount_minor > 0),
     CHECK (destination_amount_minor > 0),
     CHECK (fee_amount_minor >= 0),
     CHECK (total_source_debit_minor > 0)
 );
-```
 
-A partial unique index prevents multiple reversals of one transfer:
-
-```sql
 CREATE UNIQUE INDEX transfers_single_reversal
 ON transfers(reverses_transfer_id)
 WHERE reverses_transfer_id IS NOT NULL;
@@ -305,81 +270,164 @@ CREATE TABLE account_entries (
     CHECK (amount_minor > 0),
     CHECK (fee_amount_minor IS NULL OR fee_amount_minor >= 0)
 );
-```
 
-The primary history index is:
-
-```sql
 CREATE INDEX account_entries_history
 ON account_entries(account_id, created_at DESC, id DESC);
-```
 
-Account-pair history additionally uses `counterparty_account_id`:
-
-```sql
 CREATE INDEX account_entries_pair_history
 ON account_entries(account_id, counterparty_account_id, created_at DESC, id DESC);
 ```
 
 ### idempotency_records
 
-Idempotency records store enough information to replay both successful results and deterministic business errors:
+```sql
+CREATE TYPE idempotency_state AS ENUM (
+    'processing',
+    'succeeded',
+    'business_failed'
+);
 
-* authenticated client ID;
-* idempotency key;
-* operation type;
-* normalized request fingerprint;
-* state;
-* HTTP status;
-* response body or structured result;
-* optional resulting transfer ID;
-* creation and expiration timestamps.
+CREATE TABLE idempotency_records (
+    client_id TEXT NOT NULL,
+    operation_type TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    state idempotency_state NOT NULL,
+    claim_token UUID,
+    lease_expires_at TIMESTAMPTZ,
+    http_status INTEGER,
+    response_body JSONB,
+    resulting_resource_id UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (client_id, operation_type, idempotency_key)
+);
+```
 
-The key is unique within the chosen scope, normally `(client_id, operation_type, idempotency_key)`.
+`claim_token` identifies the worker currently allowed to finalize a `processing` record. A final row contains the original HTTP status and response body, allowing exact replay.
 
 ## 8. Account creation
 
-Account creation:
+Account creation validates the allowlisted currency, scale and non-negative initial balance, then inserts one active account. It creates no transfer or account entry.
 
-1. authenticates the client;
-2. validates the currency against the allowlist;
-3. parses the initial balance using the currency scale;
-4. rejects a negative initial balance;
-5. inserts one active `accounts` row;
-6. completes the idempotency record where account creation is idempotent;
-7. commits.
+Where account creation is idempotent, it follows the same protocol described below: claim first, commit the account and successful outcome atomically, or finalize a deterministic business error separately.
 
-No `transfer` or `account_entry` is created for the initial balance.
+## 9. Idempotency protocol
 
-## 9. Atomic transfer algorithm
+Account creation, transfer, FX transfer and reversal accept an `Idempotency-Key` where applicable.
 
-A normal same-currency transfer is executed in one PostgreSQL transaction.
+The key scope is:
 
-1. Validate request format and parse the positive decimal-string amount.
-2. Resolve or create the idempotency record.
-3. Return a stored response for an identical completed request.
-4. Reject the same key with a different fingerprint using `409 Conflict`.
-5. Start the financial database transaction.
-6. Lock both account rows using `SELECT ... FOR UPDATE` in deterministic account-ID order.
-7. Verify that both accounts exist and are `active`.
-8. Verify that source and destination IDs differ.
-9. Verify that the authenticated client owns the source account.
-10. Verify that both accounts use the same currency.
-11. Verify sufficient source balance.
-12. Debit the source and credit the destination.
-13. Increment both account versions.
-14. Insert the immutable transfer record.
-15. Insert the source debit and destination credit account entries.
-16. Complete the idempotency record with the success response.
-17. Commit.
+```text
+(client_id, operation_type, idempotency_key)
+```
 
-Both account rows should be selected and locked in one database round trip where practical. The transaction contains no external network calls, event publishing or expensive computation.
+A normalized fingerprint contains all business-significant client input. For same-currency transfer it includes at least source account, destination account, currency and amount. For FX it does not include the server-selected rate or calculated fee.
 
-## 10. FX transfer
+### 9.1 Claim transaction
 
-The optional FX operation uses a client-supplied source amount. The system calculates the destination amount.
+Before the financial transaction, the service opens a short transaction that atomically claims or loads the key.
 
-The authoritative formulas are:
+For a new key it inserts:
+
+* the fingerprint;
+* `state = processing`;
+* a random `claim_token`;
+* a short `lease_expires_at`;
+* the configured result-retention `expires_at`.
+
+For an existing key:
+
+* a different fingerprint returns `409 idempotency_conflict`;
+* `succeeded` or `business_failed` returns the stored status and body;
+* an unexpired `processing` record indicates another worker owns the claim, so the request returns a retryable in-progress response rather than executing concurrently;
+* an expired `processing` record may be taken over atomically by replacing `claim_token` and renewing the lease.
+
+The claim transaction commits before financial work starts. Therefore row locks on accounts are never held while waiting for idempotency ownership.
+
+### 9.2 Successful financial operation
+
+The financial operation runs in its own transaction. The current `claim_token` is checked before mutation and again when finalizing the idempotency row.
+
+The transaction atomically commits:
+
+* all balance changes;
+* the immutable transfer or created account;
+* account entries where applicable;
+* `state = succeeded`;
+* the response status and body;
+* the resulting resource ID;
+* removal of the processing lease.
+
+If the transaction commits, both the financial mutation and replayable success exist. If it rolls back, neither exists.
+
+### 9.3 Deterministic business failure
+
+A deterministic business failure such as insufficient funds must not commit financial changes, but it must remain replayable.
+
+The financial transaction is rolled back first. While still logically owning the claim, the service opens a separate short transaction that:
+
+* verifies the same `claim_token` still owns the non-expired processing record;
+* changes the state to `business_failed`;
+* stores the original business-error HTTP status and response body;
+* clears the processing lease;
+* commits.
+
+Examples include:
+
+* insufficient funds;
+* account not found;
+* account not active;
+* same-account transfer;
+* currency mismatch;
+* unauthorized reversal;
+* already-reversed transfer.
+
+The separate finalization transaction resolves the apparent contradiction between rolling back financial work and persisting a deterministic error.
+
+### 9.4 Transient and internal failure
+
+Timeouts, unavailable infrastructure and unexpected `5xx` errors are not stored as final outcomes.
+
+The worker either:
+
+* deletes/releases its processing claim in a short transaction when it can do so safely; or
+* leaves it to expire when the failure prevents cleanup.
+
+A later request may take over only after `lease_expires_at`. This makes abandoned claims recoverable after process crashes.
+
+A takeover must never overwrite a completed result. Updates use both the key and current `claim_token` in their predicates.
+
+### 9.5 Retention
+
+Final results are retained for a configurable window, default 24 hours. Expired final rows may be deleted asynchronously. A processing lease is much shorter than result retention and is configurable separately.
+
+## 10. Atomic same-currency transfer
+
+After acquiring the idempotency claim, a transfer transaction:
+
+1. verifies ownership of the active claim;
+2. locks both account rows using `SELECT ... FOR UPDATE` in deterministic ascending account-ID order;
+3. verifies both accounts exist and are active;
+4. verifies IDs differ;
+5. verifies the caller owns the source;
+6. verifies equal currencies;
+7. verifies sufficient source balance;
+8. debits source and credits destination;
+9. increments account versions;
+10. inserts the transfer;
+11. inserts source debit and destination credit entries;
+12. finalizes idempotency as `succeeded`;
+13. commits.
+
+If a deterministic validation fails inside this transaction, it rolls back and the error is finalized according to section 9.3.
+
+Both accounts should be selected and locked in one round trip where practical. No network call, event publication or expensive computation occurs while account locks are held.
+
+## 11. FX transfer
+
+The optional FX operation uses a client-supplied source amount. The system calculates destination amount.
 
 ```text
 fee = round_half_up(source_amount * fee_bps / 10_000)
@@ -387,87 +435,48 @@ total_source_debit = source_amount + fee
 destination_amount = round_half_up(source_amount * exchange_rate)
 ```
 
-The destination amount is rounded half-up to the destination currency scale. Commission is calculated in the source currency and may be zero.
+Destination amount is rounded half-up to destination scale. Fee is denominated in source currency and may be zero. The balance check uses total source debit.
 
-The balance check uses `total_source_debit`.
+The transfer immutably captures source and destination amounts, currencies, rate, rate reference, fee basis points, fee and total debit.
 
-The applied rate, rate record, fee basis points, fee amount, source amount, destination amount and total debit are captured immutably in the transfer record.
+The rate is selected before account locks where possible and validated against its database validity semantics in the operation. No external provider call occurs while accounts are locked.
 
-The rate is read and validated before account locks where possible, then revalidated or protected by its validity semantics inside the operation. No external rate-provider call occurs while account rows are locked.
+An FX operation creates only two entries:
 
-One FX transfer still creates only two account entries. There is no separate fee entry:
+* source entry for total debit, optionally including principal and fee summary;
+* destination entry for the amount received.
 
-* the source entry represents the total debit and may include principal and fee summary fields;
-* the destination entry represents the received destination amount.
+There is no separate fee entry.
 
-## 11. Transfer reversal
+## 12. Reversal
 
-A reversal is a full, one-time financial inverse of a completed transfer. Partial reversals and reversal of a reversal are not supported.
+A reversal is a full, one-time inverse of a completed transfer. Partial reversal and reversal of a reversal are unsupported.
 
-Only the owner of the original destination account may request reversal.
+Only the owner of the original destination may request it.
 
-The reversal transaction:
+After acquiring an idempotency claim, the reversal transaction:
 
-1. resolves idempotency;
+1. verifies ownership of the active claim;
 2. locks the original transfer;
-3. verifies that it exists and is not itself a reversal;
-4. verifies that the authenticated client owns the original destination account;
-5. verifies that no reversal already exists;
-6. locks both affected accounts in deterministic account-ID order;
-7. verifies that both accounts exist and are active;
-8. debits the original destination by the exact amount it received;
+3. verifies it exists and is not a reversal;
+4. verifies caller authorization;
+5. verifies no reversal exists;
+6. locks both accounts in deterministic order;
+7. verifies both accounts exist and are active;
+8. debits the original destination by the exact received amount;
 9. credits the original source by the exact original total debit;
-10. inserts an immutable reversal transfer;
-11. inserts two reversal account entries;
-12. completes the idempotency record;
+10. inserts the reversal transfer;
+11. inserts two reversal entries;
+12. finalizes idempotency as `succeeded`;
 13. commits.
 
-The original destination may become negative during reversal. A reversal is therefore allowed regardless of that account's current balance.
+The original destination may become negative regardless of its current balance. Incoming transfers remain allowed; normal outgoing operations require enough balance for the complete debit.
 
-After a reversal creates a negative balance:
-
-* ordinary outgoing transfers and FX transfers remain forbidden unless the balance covers the complete debit;
-* incoming transfers remain allowed and may restore the balance.
-
-A reversal uses the exact amounts, fee and rate snapshot stored in the original transfer. It never uses a current exchange rate or recalculates the original fee.
-
-The partial unique index on `reverses_transfer_id` is the final database guarantee against concurrent duplicate reversals.
-
-## 12. Idempotency
-
-Account creation, transfer, FX transfer and reversal endpoints accept an `Idempotency-Key` header where applicable.
-
-A normalized fingerprint includes the business-significant request fields. For a same-currency transfer this includes at least:
-
-```text
-source_account_id
-destination_account_id
-currency
-amount
-idempotency_key scope
-```
-
-For FX, the fingerprint is based on client intent and does not include the server-selected exchange rate or calculated fee.
-
-Behaviour:
-
-* a new key executes the operation;
-* the same key with the same fingerprint returns the original HTTP status and response body;
-* the same key with a different fingerprint returns `409 idempotency_conflict`;
-* concurrent requests with the same key produce one authoritative outcome;
-* successful results are stored;
-* deterministic business errors are stored for the idempotency window;
-* transient infrastructure failures and unexpected internal errors are not stored as final outcomes.
-
-Examples of stored deterministic errors include insufficient funds, account not found, account not active, currency mismatch, same-account transfer, unauthorized reversal and already-reversed transfer.
-
-The default retention window is 24 hours and is configurable.
+Reversal reuses the exact original amounts, fee and rate snapshot. The unique index on `reverses_transfer_id` is the final database guarantee against concurrent duplicate reversals.
 
 ## 13. History queries
 
 ### Account history
-
-Account history is read from `account_entries` using the selected account ID. Because the query is account-scoped, one business operation appears once from that account's perspective.
 
 ```sql
 SELECT ...
@@ -480,8 +489,6 @@ LIMIT $4;
 
 ### Account-pair history
 
-History between two accounts is also account-relative:
-
 ```sql
 SELECT ...
 FROM account_entries
@@ -492,39 +499,28 @@ ORDER BY created_at DESC, id DESC
 LIMIT $5;
 ```
 
-This avoids doubled rows: the debit entry belongs to one account and the credit entry belongs to the other.
+A business operation appears once from the selected account's perspective. History returns summary fields only. Full transfer, FX and reversal details come from `GET /v1/transfers/{transfer_id}`.
 
-History responses contain material summary data only, such as direction, amount, currency, operation kind, counterparty and timestamp. Full FX rate and reversal details are returned by `GET /v1/transfers/{transfer_id}`.
+History uses keyset pagination:
 
-### Cursor pagination
-
-History uses keyset/cursor pagination rather than `OFFSET`.
-
-* stable order: `created_at DESC, id DESC`;
-* cursor contents: the last returned `(created_at, id)` pair;
+* order: `created_at DESC, id DESC`;
+* cursor: last returned `(created_at, id)`;
 * default limit: 50;
 * maximum limit: 100.
 
-Using both fields makes ordering deterministic when multiple entries share the same timestamp. Newer inserts do not shift or duplicate subsequent pages.
+`OFFSET` is not used.
 
 ## 14. Consistency and concurrency
 
-PostgreSQL is the only authoritative source for:
+PostgreSQL is authoritative for balances, statuses, completed transfers, entries, reversals, applied FX snapshots and idempotency state.
 
-* account balances and statuses;
-* completed transfers;
-* account entries;
-* reversals;
-* exchange-rate snapshots used by completed FX transfers;
-* idempotency state.
+No cache participates in financial validation or balance mutation.
 
-No cache participates in transfer validation or balance mutation.
+Operations on independent accounts execute concurrently. Operations on the same accounts serialize through row-level locks.
 
-Operations on independent accounts may execute concurrently. Operations contending on the same account are intentionally serialized using row-level locks.
+All multi-account operations lock accounts in deterministic ascending ID order. Transfer reversal also locks the original transfer, and the unique reversal index remains the final duplicate-prevention guarantee.
 
-All multi-account operations lock account rows in deterministic ascending account-ID order. This reduces deadlock risk for opposing operations such as `A → B` and `B → A`.
-
-The transfer, both balance updates, both account entries and the idempotency outcome are committed atomically.
+The idempotency claim transaction is deliberately separate from financial work. Successful idempotency completion is atomic with financial mutation. Deterministic business-error completion is committed only after the financial transaction has rolled back.
 
 ## 15. API outline
 
@@ -545,13 +541,11 @@ GET  /ready
 GET  /metrics
 ```
 
-A same-owner transfer uses the same transfer endpoint as any other transfer. The only invalid self-transfer is one where source and destination account IDs are identical.
+OpenAPI defines request, response, cursor and error schemas.
 
-The complete request, response and error schemas are defined in the OpenAPI 3.1 specification.
+## 16. Errors
 
-## 16. Error handling
-
-API errors use a stable structured representation:
+Errors use a stable structure:
 
 ```json
 {
@@ -562,170 +556,75 @@ API errors use a stable structured representation:
 }
 ```
 
-Expected error categories include:
+Expected categories include invalid request, unauthorized, forbidden, account not found, account not active, transfer not found, insufficient funds, currency mismatch, idempotency conflict, operation in progress, already reversed and internal error.
 
-* invalid request;
-* unauthorized;
-* forbidden;
-* account not found;
-* account not active;
-* transfer not found;
-* insufficient funds;
-* currency mismatch;
-* same-account transfer;
-* exchange rate unavailable or expired;
-* idempotency conflict;
-* transfer already reversed;
-* reversal not permitted;
-* internal error.
+Database details are logged, never returned.
 
-A missing account returns `404`. An existing but inactive account returns a domain conflict such as `409 account_not_active`.
+## 17. Observability
 
-Internal database details are logged but never returned to API clients.
+Structured logs and traces include endpoint, request ID, client ID where appropriate, operation result, latency and database-error category.
 
-## 17. Performance strategy
+Idempotency telemetry includes claim creation, replay, conflict, in-progress response, lease takeover, business-error finalization and abandoned-claim recovery.
 
-The initial performance strategy focuses on reducing work in the critical transaction path:
+Sensitive values, JWTs and complete financial request bodies are not logged.
 
-* stateless Tokio/Axum instances;
-* SQLx connection pooling;
-* short database transactions;
-* deterministic row locking;
-* minimal database round trips;
-* primary-key balance reads;
-* account-entry history projections;
-* cursor-based history pagination;
-* prepared statement reuse;
-* targeted indexing;
-* no remote calls inside financial transactions;
-* no authoritative distributed cache.
+Metrics may include request count and latency, transfer outcomes, financial transaction duration, pool utilization, deadlocks, retries and idempotency lease takeovers.
 
-History summary queries normally read `account_entries` without joining the full transfer table. Detailed transfer reads use the transfer ID only when requested.
+## 18. Testing
 
-Connection-pool size is configurable. PgBouncer may be introduced later if measured connection scaling requires it.
+Unit tests cover money parsing, scale validation, fingerprints, fee calculation, half-up rounding and cursor encoding.
 
-Performance changes should be benchmark-driven rather than based on speculative caching.
+Integration tests cover:
 
-## 18. Observability
-
-The service uses structured tracing with request correlation IDs.
-
-Logs and traces include:
-
-* endpoint;
-* request ID;
-* authenticated client ID where appropriate;
-* operation result;
-* latency;
-* database error category.
-
-Sensitive values, JWTs and full financial request bodies are not logged.
-
-Metrics may include:
-
-* request count;
-* request latency;
-* transfer success and rejection counts;
-* transaction duration;
-* database pool utilization;
-* deadlock and retry counts.
-
-## 19. Testing strategy
-
-Unit tests cover deterministic validation, decimal-string parsing, currency-scale enforcement, fee calculation, half-up FX rounding and overflow rejection.
-
-Integration tests against PostgreSQL cover:
-
-* account creation with zero and positive initial balances;
-* rejection of negative initial balance;
-* no account entry on account creation;
-* balance reads;
-* same-currency transfers;
+* account creation and balance reads;
 * same-owner transfers;
-* insufficient funds;
-* currency mismatch;
-* same-account rejection;
-* missing and inactive accounts;
-* authorization;
-* account history and account-pair history;
-* stable cursor pagination;
-* successful FX transfer;
-* FX fee and rounding;
-* successful reversal;
-* reversal authorization by original destination owner;
-* reversal overdraft;
-* duplicate and reversal-of-reversal rejection;
-* idempotent success replay;
-* idempotent deterministic-error replay;
-* idempotency-key conflict.
+* inactive and missing accounts;
+* successful and rejected transfers;
+* FX calculation and rounding;
+* reversal, reversal overdraft and duplicate reversal;
+* account and pair history;
+* successful idempotent replay;
+* deterministic-error replay;
+* fingerprint conflict;
+* concurrent requests with one key;
+* processing response while a lease is active;
+* takeover of an expired processing lease;
+* crash after claim but before financial work;
+* rollback before business-error finalization;
+* transient failure remaining retryable.
 
-Concurrency tests verify:
+Concurrency tests verify that balances cannot be overdrawn by normal operations, funds are conserved, opposing transfers do not corrupt state, only one reversal succeeds and only the current claim owner may finalize an idempotency record.
 
-* concurrent transfers cannot create an ordinary overdraft;
-* total funds are conserved for same-currency operations;
-* opposing transfers do not corrupt balances;
-* concurrent reversal attempts create only one reversal;
-* concurrent requests with one idempotency key execute once.
+Load tests report throughput and p50, p95 and p99 latency for independent and contended accounts.
 
-Load tests report throughput and p50, p95 and p99 latency for representative account distributions, including independent accounts and intentionally contended hot accounts.
+## 19. Future evolution
 
-## 20. Scalability and future evolution
+Possible measured extensions:
 
-The service scales horizontally by adding stateless application instances against one PostgreSQL database.
-
-The initial design can evolve through:
-
-* additional account states and lifecycle endpoints;
-* read replicas for non-authoritative history queries;
+* additional account statuses and transitions;
+* read replicas for history;
 * time-based partitioning;
 * PgBouncer;
-* transactional outbox for event publishing;
+* transactional outbox;
 * asynchronous read projections;
 * externally managed exchange rates;
-* asymmetric JWT verification;
-* fine-grained account permissions.
+* finer account permissions.
 
-These mechanisms are not introduced until measurements or requirements justify their operational complexity.
+These are not introduced without a requirement or benchmark justification.
 
-## 21. Key invariants
+## 20. Key invariants
 
-The implementation must preserve the following invariants:
-
-* account initial balance is non-negative;
 * account currency and scale are immutable;
-* source and destination account IDs differ;
-* both participating accounts exist and are active;
-* normal and FX source debits never exceed the available balance;
-* a negative balance may arise only through reversal domain logic;
-* one completed business operation has one transfer and exactly two account entries;
+* initial balance is non-negative;
+* source and destination IDs differ;
+* normal and FX debits require sufficient balance;
+* only reversal may make the original destination negative;
+* one completed operation creates one transfer and exactly two entries;
 * one original transfer has at most one reversal;
-* a reversal cannot itself be reversed;
-* full and partial monetary amounts are positive where applicable;
-* idempotency-key reuse with a different fingerprint never executes the new request;
-* balances, transfer records, account entries and idempotency outcomes change atomically.
-
-## 22. Key trade-offs
-
-### PostgreSQL instead of an authoritative cache
-
-This favors correctness and operational simplicity and avoids dual-write consistency problems while still providing fast indexed balance access.
-
-### Row locking instead of optimistic retries
-
-Row locking gives predictable correctness under contention. Optimistic concurrency may perform better under very low contention but can cause repeated retries for hot accounts.
-
-### Current balance plus immutable audit records
-
-Storing the current balance avoids recalculating it from complete history. Atomic updates keep the current-state projection and immutable audit records consistent.
-
-### Account entries as a partial read projection
-
-Account entries deliberately duplicate only the summary fields needed for fast history reads. Full transfer details remain authoritative in `transfers`, avoiding both expensive history joins and complete duplication of every transfer twice.
-
-### Cursor pagination instead of offsets
-
-Cursor pagination keeps deep history queries efficient and prevents new inserts from shifting later pages.
-
-### Stateless application instances
-
-Stateless instances simplify horizontal scaling and failure recovery. PostgreSQL remains the shared coordination point and eventual throughput boundary.
+* reversal of reversal is forbidden;
+* all account locks follow deterministic order;
+* only the current idempotency claim owner may execute or finalize;
+* a successful outcome is atomic with financial mutation;
+* a deterministic business error is finalized only after financial rollback;
+* transient failures never become replayable final outcomes;
+* history uses stable cursor pagination.
