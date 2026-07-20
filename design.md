@@ -11,7 +11,7 @@ The design prioritizes:
 * short financial transactions;
 * immutable transfer records;
 * efficient account-history reads;
-* explicit idempotency and crash recovery;
+* success-only request idempotency;
 * optional cross-currency transfers.
 
 PostgreSQL is the authoritative source of financial state and cross-instance coordination.
@@ -25,12 +25,12 @@ The implementation must:
 * transfer funds atomically between distinct accounts;
 * support transfers between different accounts of the same owner;
 * prevent overdrafts for normal and FX transfers;
-* reject same-currency transfers between incompatible currencies;
+* reject regular transfers between incompatible currencies;
 * reverse completed transfers atomically;
 * allow the original destination account to become negative during reversal;
 * expose account and account-pair history;
 * authenticate business operations using JWT;
-* provide replay-safe idempotency;
+* prevent duplicate committed side effects for retried successful requests;
 * return structured errors;
 * expose an OpenAPI 3.1 specification;
 * remain correct with multiple application instances.
@@ -68,7 +68,7 @@ Ledger Instance A   Ledger Instance B
          PostgreSQL
 ```
 
-Application instances are stateless. Any instance may process any request. PostgreSQL owns balances, transfers, entries, exchange-rate snapshots and idempotency state.
+Application instances are stateless. Any instance may process any request. PostgreSQL owns balances, transfers, entries, exchange-rate snapshots and committed idempotency records.
 
 Logical components:
 
@@ -77,7 +77,6 @@ Logical components:
 * account application service;
 * transfer and reversal application services;
 * history query service;
-* idempotency coordinator;
 * SQLx persistence layer;
 * configuration and observability.
 
@@ -280,40 +279,26 @@ ON account_entries(account_id, counterparty_account_id, created_at DESC, id DESC
 
 ### idempotency_records
 
-```sql
-CREATE TYPE idempotency_state AS ENUM (
-    'processing',
-    'succeeded',
-    'business_failed'
-);
+Only committed successful side-effecting operations are retained.
 
+```sql
 CREATE TABLE idempotency_records (
     client_id TEXT NOT NULL,
     operation_type TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
     request_fingerprint TEXT NOT NULL,
-    state idempotency_state NOT NULL,
-    claim_token UUID,
-    lease_expires_at TIMESTAMPTZ,
-    http_status INTEGER,
-    response_body JSONB,
-    resulting_resource_id UUID,
+    http_status INTEGER NOT NULL,
+    response_body JSONB NOT NULL,
+    resulting_resource_id UUID NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     expires_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (client_id, operation_type, idempotency_key)
 );
 ```
 
-`claim_token` identifies the worker currently allowed to finalize a `processing` record. A final row contains the original HTTP status and response body, allowing exact replay.
+There is no `processing` state, lease, claim token, takeover protocol or persisted failure state.
 
-## 8. Account creation
-
-Account creation validates the allowlisted currency, scale and non-negative initial balance, then inserts one active account. It creates no transfer or account entry.
-
-Where account creation is idempotent, it follows the same protocol described below: claim first, commit the account and successful outcome atomically, or finalize a deterministic business error separately.
-
-## 9. Idempotency protocol
+## 8. Success-only idempotency
 
 Account creation, transfer, FX transfer and reversal accept an `Idempotency-Key` where applicable.
 
@@ -323,111 +308,70 @@ The key scope is:
 (client_id, operation_type, idempotency_key)
 ```
 
-A normalized fingerprint contains all business-significant client input. For same-currency transfer it includes at least source account, destination account, currency and amount. For FX it does not include the server-selected rate or calculated fee.
+A normalized fingerprint contains all business-significant client input. For a same-currency transfer it includes at least source account, destination account, currency and amount. For FX it does not include the server-selected rate or calculated fee.
 
-### 9.1 Claim transaction
+The idempotency record is handled inside the same PostgreSQL transaction as the side effect.
 
-Before the financial transaction, the service opens a short transaction that atomically claims or loads the key.
+Protocol:
 
-For a new key it inserts:
+1. Start the operation transaction.
+2. Attempt to insert the idempotency record key and fingerprint under the unique constraint as part of that transaction.
+3. If a committed row already exists with the same fingerprint, return its stored successful status and body without repeating the side effect.
+4. If a committed row exists with a different fingerprint, return `409 idempotency_conflict`.
+5. If another transaction is currently attempting the same key, PostgreSQL unique-key coordination makes the duplicate wait until the first transaction commits or rolls back.
+6. Execute business validation and the financial mutation.
+7. Store the successful response in the idempotency row.
+8. Commit balances, transfer or account, entries and the completed idempotency record atomically.
 
-* the fingerprint;
-* `state = processing`;
-* a random `claim_token`;
-* a short `lease_expires_at`;
-* the configured result-retention `expires_at`.
+If business validation fails, or an infrastructure/internal error aborts the operation, the whole transaction rolls back, including the idempotency reservation. No failure response is retained. A later retry with the same key re-evaluates current state.
 
-For an existing key:
+Consequences:
 
-* a different fingerprint returns `409 idempotency_conflict`;
-* `succeeded` or `business_failed` returns the stored status and body;
-* an unexpired `processing` record indicates another worker owns the claim, so the request returns a retryable in-progress response rather than executing concurrently;
-* an expired `processing` record may be taken over atomically by replacing `claim_token` and renewing the lease.
+* duplicate successful requests produce one committed side effect;
+* a retry after `insufficient_funds`, inactive account or unavailable rate may succeed after state changes;
+* no abandoned in-progress record can block future work;
+* `409 idempotency_conflict` applies only when a committed successful record exists for the same scoped key with a different fingerprint;
+* successful records are retained for a configurable window, default 24 hours, and may be deleted asynchronously after expiry.
 
-The claim transaction commits before financial work starts. Therefore row locks on accounts are never held while waiting for idempotency ownership.
+## 9. Account creation
 
-### 9.2 Successful financial operation
+Account creation runs in one transaction:
 
-The financial operation runs in its own transaction. The current `claim_token` is checked before mutation and again when finalizing the idempotency row.
+1. parse and validate the decimal-string initial balance;
+2. validate the currency and scale against the allowlist;
+3. reserve the idempotency key where required;
+4. insert one active account;
+5. store the successful response in the idempotency row;
+6. commit atomically.
 
-The transaction atomically commits:
-
-* all balance changes;
-* the immutable transfer or created account;
-* account entries where applicable;
-* `state = succeeded`;
-* the response status and body;
-* the resulting resource ID;
-* removal of the processing lease.
-
-If the transaction commits, both the financial mutation and replayable success exist. If it rolls back, neither exists.
-
-### 9.3 Deterministic business failure
-
-A deterministic business failure such as insufficient funds must not commit financial changes, but it must remain replayable.
-
-The financial transaction is rolled back first. While still logically owning the claim, the service opens a separate short transaction that:
-
-* verifies the same `claim_token` still owns the non-expired processing record;
-* changes the state to `business_failed`;
-* stores the original business-error HTTP status and response body;
-* clears the processing lease;
-* commits.
-
-Examples include:
-
-* insufficient funds;
-* account not found;
-* account not active;
-* same-account transfer;
-* currency mismatch;
-* unauthorized reversal;
-* already-reversed transfer.
-
-The separate finalization transaction resolves the apparent contradiction between rolling back financial work and persisting a deterministic error.
-
-### 9.4 Transient and internal failure
-
-Timeouts, unavailable infrastructure and unexpected `5xx` errors are not stored as final outcomes.
-
-The worker either:
-
-* deletes/releases its processing claim in a short transaction when it can do so safely; or
-* leaves it to expire when the failure prevents cleanup.
-
-A later request may take over only after `lease_expires_at`. This makes abandoned claims recoverable after process crashes.
-
-A takeover must never overwrite a completed result. Updates use both the key and current `claim_token` in their predicates.
-
-### 9.5 Retention
-
-Final results are retained for a configurable window, default 24 hours. Expired final rows may be deleted asynchronously. A processing lease is much shorter than result retention and is configurable separately.
+A negative initial balance is rejected and rolls back the reservation. No transfer or account entry is created.
 
 ## 10. Atomic same-currency transfer
 
-After acquiring the idempotency claim, a transfer transaction:
+A normal transfer runs in one PostgreSQL transaction:
 
-1. verifies ownership of the active claim;
-2. locks both account rows using `SELECT ... FOR UPDATE` in deterministic ascending account-ID order;
-3. verifies both accounts exist and are active;
-4. verifies IDs differ;
-5. verifies the caller owns the source;
-6. verifies equal currencies;
-7. verifies sufficient source balance;
-8. debits source and credits destination;
-9. increments account versions;
-10. inserts the transfer;
-11. inserts source debit and destination credit entries;
-12. finalizes idempotency as `succeeded`;
-13. commits.
+1. parse and validate the positive decimal-string amount;
+2. reserve or replay the idempotency key;
+3. lock both account rows using `SELECT ... FOR UPDATE` in deterministic ascending account-ID order;
+4. verify both accounts exist and are active;
+5. verify source and destination differ;
+6. verify the caller owns the source account;
+7. verify both accounts use the same currency;
+8. verify sufficient source balance;
+9. debit the source and credit the destination;
+10. increment account versions;
+11. insert the immutable transfer;
+12. insert one debit and one credit account entry;
+13. store the successful response in the idempotency row;
+14. commit atomically.
 
-If a deterministic validation fails inside this transaction, it rolls back and the error is finalized according to section 9.3.
+Any business error rolls back all work, including the idempotency reservation.
 
-Both accounts should be selected and locked in one round trip where practical. No network call, event publication or expensive computation occurs while account locks are held.
+The transaction contains no remote network calls, event publishing or expensive computation.
 
 ## 11. FX transfer
 
-The optional FX operation uses a client-supplied source amount. The system calculates destination amount.
+The optional FX operation uses a client-supplied source amount. The system calculates the destination amount.
 
 ```text
 fee = round_half_up(source_amount * fee_bps / 10_000)
@@ -435,44 +379,46 @@ total_source_debit = source_amount + fee
 destination_amount = round_half_up(source_amount * exchange_rate)
 ```
 
-Destination amount is rounded half-up to destination scale. Fee is denominated in source currency and may be zero. The balance check uses total source debit.
+The destination amount is rounded half-up to the destination currency scale. The fee is calculated in source currency and may be zero. The balance check uses `total_source_debit`.
 
-The transfer immutably captures source and destination amounts, currencies, rate, rate reference, fee basis points, fee and total debit.
+The applied rate, rate record, fee basis points, fee amount, source amount, destination amount and total debit are captured immutably in the transfer.
 
-The rate is selected before account locks where possible and validated against its database validity semantics in the operation. No external provider call occurs while accounts are locked.
+The rate is read and validated before account locks where practical and must still be valid for the operation. No external rate-provider call occurs while account rows are locked.
 
-An FX operation creates only two entries:
+One FX transfer creates only two account entries:
 
-* source entry for total debit, optionally including principal and fee summary;
-* destination entry for the amount received.
+* source entry: total debit, with optional principal and fee summary;
+* destination entry: received destination amount.
 
-There is no separate fee entry.
+A failed FX operation rolls back its idempotency reservation and may be retried against a newer rate or changed account state.
 
-## 12. Reversal
+## 12. Transfer reversal
 
-A reversal is a full, one-time inverse of a completed transfer. Partial reversal and reversal of a reversal are unsupported.
+A reversal is a full, one-time financial inverse of a completed transfer. Partial reversals and reversal of a reversal are unsupported.
 
-Only the owner of the original destination may request it.
+Only the owner of the original destination account may request reversal.
 
-After acquiring an idempotency claim, the reversal transaction:
+The reversal runs in one PostgreSQL transaction:
 
-1. verifies ownership of the active claim;
-2. locks the original transfer;
-3. verifies it exists and is not a reversal;
-4. verifies caller authorization;
-5. verifies no reversal exists;
-6. locks both accounts in deterministic order;
-7. verifies both accounts exist and are active;
-8. debits the original destination by the exact received amount;
-9. credits the original source by the exact original total debit;
-10. inserts the reversal transfer;
-11. inserts two reversal entries;
-12. finalizes idempotency as `succeeded`;
-13. commits.
+1. reserve or replay the idempotency key;
+2. lock the original transfer;
+3. verify it exists and is not itself a reversal;
+4. verify the caller owns the original destination account;
+5. verify no reversal already exists;
+6. lock both accounts in deterministic ascending account-ID order;
+7. verify both accounts exist and are active;
+8. debit the original destination by the exact amount received;
+9. credit the original source by the exact original total debit;
+10. insert the immutable reversal transfer;
+11. insert two reversal account entries;
+12. store the successful response in the idempotency row;
+13. commit atomically.
 
-The original destination may become negative regardless of its current balance. Incoming transfers remain allowed; normal outgoing operations require enough balance for the complete debit.
+The original destination may become negative regardless of its current balance. Incoming transfers remain allowed and can restore it. Ordinary outgoing and FX transfers still require enough balance for their complete debit.
 
-Reversal reuses the exact original amounts, fee and rate snapshot. The unique index on `reverses_transfer_id` is the final database guarantee against concurrent duplicate reversals.
+A reversal uses the original amounts, fee and rate snapshot. It never uses a current rate or recalculates the fee.
+
+The partial unique index on `reverses_transfer_id` is the final database guarantee against concurrent duplicate reversals.
 
 ## 13. History queries
 
@@ -499,28 +445,38 @@ ORDER BY created_at DESC, id DESC
 LIMIT $5;
 ```
 
-A business operation appears once from the selected account's perspective. History returns summary fields only. Full transfer, FX and reversal details come from `GET /v1/transfers/{transfer_id}`.
+A business operation appears once from the selected account's perspective. History returns summary data; full FX and reversal details come from `GET /v1/transfers/{transfer_id}`.
 
-History uses keyset pagination:
+### Cursor pagination
+
+History uses keyset pagination rather than `OFFSET`:
 
 * order: `created_at DESC, id DESC`;
 * cursor: last returned `(created_at, id)`;
 * default limit: 50;
 * maximum limit: 100.
 
-`OFFSET` is not used.
+Using both fields keeps ordering deterministic when timestamps match. Newer inserts do not shift subsequent pages.
 
 ## 14. Consistency and concurrency
 
-PostgreSQL is authoritative for balances, statuses, completed transfers, entries, reversals, applied FX snapshots and idempotency state.
+PostgreSQL is authoritative for:
 
-No cache participates in financial validation or balance mutation.
+* account balances and statuses;
+* completed transfers and reversals;
+* account entries;
+* exchange-rate snapshots used by completed FX transfers;
+* completed successful idempotency records.
 
-Operations on independent accounts execute concurrently. Operations on the same accounts serialize through row-level locks.
+No cache participates in validation or balance mutation.
 
-All multi-account operations lock accounts in deterministic ascending ID order. Transfer reversal also locks the original transfer, and the unique reversal index remains the final duplicate-prevention guarantee.
+Operations on independent accounts may execute concurrently. Operations touching the same account serialize through row locks.
 
-The idempotency claim transaction is deliberately separate from financial work. Successful idempotency completion is atomic with financial mutation. Deterministic business-error completion is committed only after the financial transaction has rolled back.
+All multi-account operations lock account rows in deterministic ascending account-ID order.
+
+For each successful side-effecting request, the financial mutation, transfer/account record, account entries and idempotency result commit in one transaction. On any failure, all of them roll back.
+
+Concurrent duplicate requests coordinate through the unique idempotency key. After the winning transaction commits, duplicates replay the stored success; after rollback, a duplicate may proceed and re-evaluate current state.
 
 ## 15. API outline
 
@@ -541,11 +497,11 @@ GET  /ready
 GET  /metrics
 ```
 
-OpenAPI defines request, response, cursor and error schemas.
+The OpenAPI 3.1 specification defines exact request, response and error schemas.
 
-## 16. Errors
+## 16. Error handling
 
-Errors use a stable structure:
+Errors use a stable shape:
 
 ```json
 {
@@ -556,75 +512,161 @@ Errors use a stable structure:
 }
 ```
 
-Expected categories include invalid request, unauthorized, forbidden, account not found, account not active, transfer not found, insufficient funds, currency mismatch, idempotency conflict, operation in progress, already reversed and internal error.
+Expected categories include:
 
-Database details are logged, never returned.
+* invalid request;
+* unauthorized;
+* forbidden;
+* account not found;
+* account not active;
+* transfer not found;
+* insufficient funds;
+* currency mismatch;
+* same-account transfer;
+* missing or stale FX rate;
+* idempotency conflict;
+* transfer already reversed;
+* internal error.
+
+Business and technical failures are not persisted as idempotency outcomes. Internal database details are logged but never returned.
 
 ## 17. Observability
 
-Structured logs and traces include endpoint, request ID, client ID where appropriate, operation result, latency and database-error category.
+Structured logs and traces include:
 
-Idempotency telemetry includes claim creation, replay, conflict, in-progress response, lease takeover, business-error finalization and abandoned-claim recovery.
+* endpoint and request ID;
+* authenticated client ID where appropriate;
+* operation result and latency;
+* transfer or resulting resource ID on success;
+* idempotency replay or conflict;
+* database error category;
+* deadlock and retry information.
 
-Sensitive values, JWTs and complete financial request bodies are not logged.
+Sensitive values, JWTs and full financial request bodies are not logged.
 
-Metrics may include request count and latency, transfer outcomes, financial transaction duration, pool utilization, deadlocks, retries and idempotency lease takeovers.
+Metrics may include:
 
-## 18. Testing
+* request count and latency;
+* transfer success and rejection counts;
+* idempotent success replay and conflict counts;
+* transaction duration;
+* database-pool utilization;
+* deadlock and retry counts.
 
-Unit tests cover money parsing, scale validation, fingerprints, fee calculation, half-up rounding and cursor encoding.
+## 18. Testing strategy
 
-Integration tests cover:
+Unit tests cover:
 
-* account creation and balance reads;
-* same-owner transfers;
-* inactive and missing accounts;
-* successful and rejected transfers;
-* FX calculation and rounding;
-* reversal, reversal overdraft and duplicate reversal;
-* account and pair history;
+* decimal parsing and currency scale;
+* half-up rounding;
+* fee and FX calculations;
+* fingerprint normalization;
+* domain validation.
+
+Integration tests against PostgreSQL cover:
+
+* account creation and zero initial balance;
+* rejection of negative initial balance;
+* active-account validation;
+* successful same-owner and different-owner transfers;
+* insufficient funds;
+* currency mismatch and same-account rejection;
+* successful FX transfer and fee calculation;
+* missing or stale rate;
+* successful reversal and reversal overdraft;
+* unauthorized, duplicate and reversal-of-reversal rejection;
+* account and account-pair history;
+* cursor pagination;
 * successful idempotent replay;
-* deterministic-error replay;
-* fingerprint conflict;
-* concurrent requests with one key;
-* processing response while a lease is active;
-* takeover of an expired processing lease;
-* crash after claim but before financial work;
-* rollback before business-error finalization;
-* transient failure remaining retryable.
+* same key with different fingerprint after committed success;
+* retry with the same key after a business failure;
+* rollback of both financial work and idempotency reservation on failure.
 
-Concurrency tests verify that balances cannot be overdrawn by normal operations, funds are conserved, opposing transfers do not corrupt state, only one reversal succeeds and only the current claim owner may finalize an idempotency record.
+Concurrency tests verify:
 
-Load tests report throughput and p50, p95 and p99 latency for independent and contended accounts.
+* concurrent transfers cannot create a normal overdraft;
+* total funds are conserved;
+* opposing transfers do not corrupt balances;
+* concurrent reversal attempts create one reversal;
+* concurrent identical requests create one committed side effect;
+* a duplicate waits for the winning transaction and replays its committed success;
+* a duplicate can proceed after the winning transaction rolls back.
 
-## 19. Future evolution
+Load tests report throughput and p50, p95 and p99 latency for independent accounts and intentionally contended hot accounts.
 
-Possible measured extensions:
+## 19. Performance strategy
 
-* additional account statuses and transitions;
-* read replicas for history;
+The critical path uses:
+
+* stateless Tokio/Axum instances;
+* SQLx connection pooling;
+* short PostgreSQL transactions;
+* deterministic row locking;
+* minimal round trips;
+* prepared statements;
+* minimal write indexes;
+* cursor-based history pagination;
+* no remote calls while account rows are locked;
+* no authoritative distributed cache.
+
+The idempotency unique key adds one indexed write to successful side-effecting operations and coordinates duplicate requests without a separate work-claim subsystem.
+
+Pool sizes are configurable and must account for total connections across all instances. PgBouncer may be introduced if measurements justify it.
+
+## 20. Scalability and future evolution
+
+The service scales horizontally by adding stateless instances against PostgreSQL.
+
+Possible future improvements:
+
+* additional account states and status-transition APIs;
+* read replicas for non-authoritative history;
 * time-based partitioning;
 * PgBouncer;
 * transactional outbox;
 * asynchronous read projections;
-* externally managed exchange rates;
-* finer account permissions.
+* externally supplied exchange rates;
+* asymmetric JWT verification;
+* fine-grained account permissions.
 
-These are not introduced without a requirement or benchmark justification.
+These are introduced only when requirements or measurements justify their complexity.
 
-## 20. Key invariants
+## 21. Key invariants
 
+* source and destination account IDs differ;
+* both participating accounts exist and are active;
 * account currency and scale are immutable;
 * initial balance is non-negative;
-* source and destination IDs differ;
-* normal and FX debits require sufficient balance;
-* only reversal may make the original destination negative;
-* one completed operation creates one transfer and exactly two entries;
-* one original transfer has at most one reversal;
-* reversal of reversal is forbidden;
-* all account locks follow deterministic order;
-* only the current idempotency claim owner may execute or finalize;
-* a successful outcome is atomic with financial mutation;
-* a deterministic business error is finalized only after financial rollback;
-* transient failures never become replayable final outcomes;
-* history uses stable cursor pagination.
+* normal and FX transfers never overdraw the source account;
+* reversal may make the original destination negative;
+* transfer amounts are positive;
+* one completed business operation creates exactly two account entries;
+* at most one reversal exists for an original transfer;
+* reversal of a reversal is forbidden;
+* all participating accounts are locked in deterministic order;
+* successful mutation and successful idempotency record commit atomically;
+* failed operations leave no committed idempotency record;
+* one scoped idempotency key maps to one fingerprint only after a successful commit;
+* history ordering is stable by `(created_at, id)`.
+
+## 22. Key trade-offs
+
+### Success-only idempotency
+
+Persisting only successful outcomes keeps the guarantee that duplicate successful requests create one side effect while allowing retries after state-dependent business failures. It avoids processing states, leases, takeover rules and failure-result retention.
+
+### PostgreSQL instead of an authoritative cache
+
+This favors correctness and operational simplicity and avoids dual-write consistency problems.
+
+### Row locking instead of optimistic retries
+
+Row locking gives predictable correctness under contention. Optimistic concurrency may reduce lock waits at low contention but can create repeated retries for hot accounts.
+
+### Current balance plus immutable transfers and entries
+
+The account row provides constant-size balance reads. Transfers provide the authoritative business audit record. Entries provide efficient account-centric history. All are updated atomically.
+
+### Bonus-ready schema without bonus-first implementation
+
+The schema preserves both monetary sides, rate and fee data needed for FX while keeping the mandatory same-currency path small and testable.
