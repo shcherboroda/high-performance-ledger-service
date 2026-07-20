@@ -2,7 +2,12 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
-use rust_backend_technical_assessment::{app, config::PoolConfig, db};
+use rust_backend_technical_assessment::{
+    app,
+    auth::AuthVerifier,
+    config::{AuthConfig, PoolConfig},
+    db,
+};
 use std::time::Duration;
 use tower::ServiceExt;
 
@@ -23,7 +28,16 @@ async fn readiness_succeeds_against_configured_postgres() {
     )
     .await
     .expect("DATABASE_URL must point to reachable PostgreSQL for this integration test");
-    let response = app::router(pool)
+    let auth = AuthVerifier::new(
+        &AuthConfig::new(
+            "https://issuer.example",
+            "ledger",
+            include_str!("fixtures/jwt-test-public.pem"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let response = app::router(pool, auth)
         .oneshot(Request::get("/ready").body(Body::empty()).unwrap())
         .await
         .unwrap();

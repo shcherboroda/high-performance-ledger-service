@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-Install Rust 1.92 or newer, Docker Compose, and `curl`. PostgreSQL 18 is supplied by the existing Compose service.
+Install Rust 1.94 or newer, Docker Compose, and `curl`. PostgreSQL 18 is supplied by the existing Compose service.
 
 ## Run locally
 
@@ -17,8 +17,19 @@ Set the required connection string and start the service:
 
 ```bash
 export DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/ledger'
+export JWT_ISSUER='https://issuer.example'
+export JWT_AUDIENCE='ledger-service'
+export JWT_PUBLIC_KEY_PEM="$(cat ./path/to/issuer-public-key.pem)"
 cargo run
 ```
+
+JWT authentication requires `JWT_ISSUER`, `JWT_AUDIENCE`, and `JWT_PUBLIC_KEY_PEM`. The PEM must
+be an RSA public key. The command substitution above preserves a multiline PEM; alternatively use
+your secret manager's multiline environment-value support. Never commit keys or use a private key.
+
+The service validates externally issued RS256 bearer tokens only. It verifies the signature,
+expiration, issuer, audience, and a nonblank `sub` client identifier; it does not issue, refresh,
+store, or revoke tokens.
 
 Optional variables are `BIND_ADDRESS` (default `0.0.0.0:3000`), `DB_MAX_CONNECTIONS` (10), `DB_MIN_CONNECTIONS` (0), `DB_ACQUIRE_TIMEOUT_SECS` (5), `DB_CONNECT_TIMEOUT_SECS` (5), and `RUST_LOG` (info). All numeric timeout values are positive seconds.
 
