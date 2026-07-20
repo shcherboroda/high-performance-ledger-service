@@ -27,7 +27,14 @@ In another shell, verify process health and database readiness:
 ```bash
 curl --fail --silent --show-error http://127.0.0.1:3000/health
 curl --fail --silent --show-error http://127.0.0.1:3000/ready
+curl --fail --silent --show-error http://127.0.0.1:3000/openapi.json
 ```
+
+`/openapi.json` serves the generated OpenAPI 3.1 contract. There is no interactive Swagger UI or Redoc UI yet.
+
+API failures use a shared JSON envelope with a stable `error.code`, safe client-facing
+`error.message`, and optional `error.details` and `error.request_id` fields. Internal
+causes are logged by the service and are not returned to clients.
 
 ## Database migrations
 
