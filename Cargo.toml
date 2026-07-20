@@ -1,6 +1,16 @@
 [package]
-name = "rust-backend-technical-assesment"
+name = "rust-backend-technical-assessment"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.92"
 
 [dependencies]
+anyhow = "1.0"
+axum = "0.8"
+dotenvy = "0.15"
+serde = { version = "1.0", features = ["derive"] }
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls"] }
+tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "signal", "net", "time"] }
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

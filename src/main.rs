@@ -1,0 +1,53 @@
+#[cfg(not(unix))]
+use std::future::pending;
+
+use anyhow::Result;
+use rust_backend_technical_assessment::{app, config::Config, db};
+use tracing::{error, info};
+use tracing_subscriber::EnvFilter;
+
+#[tokio::main]
+async fn main() {
+    if let Err(error) = run().await {
+        eprintln!("application failed to start: {error}");
+        error!(error = %error, "application startup failed");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<()> {
+    let config = Config::from_env()?;
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_new(&config.log_filter)?)
+        .init();
+
+    let pool = db::create_pool(&config.database_url, &config.pool).await?;
+    let listener = tokio::net::TcpListener::bind(config.bind_address).await?;
+    info!(address = %config.bind_address, "server listening");
+    axum::serve(listener, app::router(pool))
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler")
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
