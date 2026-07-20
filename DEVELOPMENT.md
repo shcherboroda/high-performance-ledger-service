@@ -29,6 +29,30 @@ curl --fail --silent --show-error http://127.0.0.1:3000/health
 curl --fail --silent --show-error http://127.0.0.1:3000/ready
 ```
 
+## Database migrations
+
+Install the SQLx CLI with PostgreSQL support (or run the equivalent command through your preferred Cargo tool runner):
+
+```bash
+cargo install sqlx-cli --no-default-features --features postgres,rustls
+```
+
+With `DATABASE_URL` set, create, apply, and inspect migrations with:
+
+```bash
+cargo sqlx migrate add <migration_name>
+cargo sqlx migrate run
+cargo sqlx migrate info
+```
+
+The application does not run migrations automatically at startup. Apply migrations explicitly before running the service.
+
+Migration-backed integration tests use `#[sqlx::test]`, which creates isolated databases and applies the committed migrations. The PostgreSQL role in `DATABASE_URL` must be able to create and drop databases (typically a local development superuser):
+
+```bash
+DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/ledger' cargo test --test migrations
+```
+
 ## Verify
 
 ```bash
@@ -37,4 +61,4 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 ```
 
-The readiness integration test uses `DATABASE_URL`; without it, the test reports that it was skipped. This first slice contains no migrations or ledger domain schema.
+The readiness integration test uses `DATABASE_URL`; without it, the test reports that it was skipped. Migration-backed tests do not skip when PostgreSQL is unavailable.
