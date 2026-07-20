@@ -128,6 +128,8 @@ mod tests {
 
     const TEST_PUBLIC_KEY: &str = include_str!("../tests/fixtures/jwt-test-public.pem");
     const TEST_PRIVATE_KEY: &str = include_str!("../tests/fixtures/jwt-test-private.pem");
+    const OTHER_TEST_PRIVATE_KEY: &str =
+        include_str!("../tests/fixtures/jwt-other-test-private.pem");
 
     #[derive(Serialize)]
     struct TestClaims {
@@ -143,6 +145,22 @@ mod tests {
     }
 
     fn token(sub: Option<&str>, exp: usize, issuer: &str, audience: &str) -> String {
+        token_with_key(
+            sub,
+            exp,
+            issuer,
+            audience,
+            EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY.as_bytes()).unwrap(),
+        )
+    }
+
+    fn token_with_key(
+        sub: Option<&str>,
+        exp: usize,
+        issuer: &str,
+        audience: &str,
+        key: EncodingKey,
+    ) -> String {
         encode(
             &Header::new(Algorithm::RS256),
             &TestClaims {
@@ -151,7 +169,7 @@ mod tests {
                 iss: issuer.to_owned(),
                 aud: audience.to_owned(),
             },
-            &EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY.as_bytes()).unwrap(),
+            &key,
         )
         .unwrap()
     }
@@ -246,6 +264,54 @@ mod tests {
             assert!(!body.contains("client-123"));
             assert!(!body.contains("BEGIN"));
         }
+    }
+
+    #[tokio::test]
+    async fn duplicate_authorization_headers_are_rejected() {
+        let token = token(
+            Some("client-123"),
+            4_102_444_800,
+            "https://issuer.example",
+            "ledger",
+        );
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/ledger")
+            .unwrap();
+        let mut request = Request::get("/_test/authenticated")
+            .body(Body::empty())
+            .unwrap();
+        request
+            .headers_mut()
+            .append("authorization", format!("Bearer {token}").parse().unwrap());
+        request
+            .headers_mut()
+            .append("authorization", format!("Bearer {token}").parse().unwrap());
+
+        let response = router(pool, test_auth()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            r#"{"error":{"code":"unauthorized","message":"Authentication is required","details":null,"request_id":null}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn token_signed_by_another_rsa_key_is_rejected() {
+        let token = token_with_key(
+            Some("client-123"),
+            4_102_444_800,
+            "https://issuer.example",
+            "ledger",
+            EncodingKey::from_rsa_pem(OTHER_TEST_PRIVATE_KEY.as_bytes()).unwrap(),
+        );
+        let response = protected_response(Some(&format!("Bearer {token}"))).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            r#"{"error":{"code":"unauthorized","message":"Authentication is required","details":null,"request_id":null}}"#
+        );
     }
 
     fn assert_local_schema_references_resolve(value: &Value, schemas: &Map<String, Value>) {
