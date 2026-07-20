@@ -8,7 +8,7 @@ The design prioritizes:
 
 * strong consistency of balances;
 * safe concurrent execution across stateless instances;
-* short financial transactions;
+* short PostgreSQL transactions;
 * immutable transfer records;
 * efficient account-history reads;
 * success-only request idempotency;
@@ -170,7 +170,7 @@ An account entry is an immutable account-centric history projection. A completed
 
 This does not duplicate rows in an account query because each query is scoped to one `account_id`.
 
-Entries contain only summary data needed by history lists:
+Entries contain summary data needed by history lists:
 
 * account and transfer IDs;
 * counterparty account ID;
@@ -249,6 +249,8 @@ ON transfers(reverses_transfer_id)
 WHERE reverses_transfer_id IS NOT NULL;
 ```
 
+`destination_amount_minor > 0` validates the amount credited by the operation, not the destination account balance.
+
 ### account_entries
 
 ```sql
@@ -287,14 +289,25 @@ CREATE TABLE idempotency_records (
     operation_type TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
     request_fingerprint TEXT NOT NULL,
-    http_status INTEGER NOT NULL,
-    response_body JSONB NOT NULL,
-    resulting_resource_id UUID NOT NULL,
+    http_status INTEGER,
+    response_body JSONB,
+    resulting_resource_id UUID,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     expires_at TIMESTAMPTZ NOT NULL,
-    PRIMARY KEY (client_id, operation_type, idempotency_key)
+    PRIMARY KEY (client_id, operation_type, idempotency_key),
+    CHECK (
+        (http_status IS NULL
+            AND response_body IS NULL
+            AND resulting_resource_id IS NULL)
+        OR
+        (http_status IS NOT NULL
+            AND response_body IS NOT NULL
+            AND resulting_resource_id IS NOT NULL)
+    )
 );
 ```
+
+The nullable result fields allow a reservation row to exist inside the owning uncommitted transaction before the business result is known. Application logic guarantees that an incomplete reservation is never committed: it is either completed and committed with the side effect, or rolled back with the operation.
 
 There is no `processing` state, lease, claim token, takeover protocol or persisted failure state.
 
@@ -315,15 +328,33 @@ The idempotency record is handled inside the same PostgreSQL transaction as the 
 Protocol:
 
 1. Start the operation transaction.
-2. Attempt to insert the idempotency record key and fingerprint under the unique constraint as part of that transaction.
-3. If a committed row already exists with the same fingerprint, return its stored successful status and body without repeating the side effect.
-4. If a committed row exists with a different fingerprint, return `409 idempotency_conflict`.
-5. If another transaction is currently attempting the same key, PostgreSQL unique-key coordination makes the duplicate wait until the first transaction commits or rolls back.
-6. Execute business validation and the financial mutation.
-7. Store the successful response in the idempotency row.
-8. Commit balances, transfer or account, entries and the completed idempotency record atomically.
+2. Reserve the scoped key using `INSERT ... ON CONFLICT DO NOTHING`, inserting the key, fingerprint and null result fields.
+3. If the insert succeeds, this transaction owns the reservation and may execute the operation.
+4. If the insert affects no row, load the now-committed conflicting record.
+5. PostgreSQL waits on an uncommitted conflicting unique key before deciding the `ON CONFLICT` outcome, so a concurrent duplicate cannot pass the reservation step while the first transaction is unresolved.
+6. If the committed record has the same fingerprint, return its stored successful status and body without repeating the side effect.
+7. If the committed record has a different fingerprint, return `409 idempotency_conflict`.
+8. For the owning transaction, execute business validation and the account or financial mutation.
+9. Populate `http_status`, `response_body` and `resulting_resource_id` in the reserved row.
+10. Commit balances, transfer or account, entries and the completed idempotency record atomically.
 
-If business validation fails, or an infrastructure/internal error aborts the operation, the whole transaction rolls back, including the idempotency reservation. No failure response is retained. A later retry with the same key re-evaluates current state.
+Illustrative reservation statement:
+
+```sql
+INSERT INTO idempotency_records (
+    client_id,
+    operation_type,
+    idempotency_key,
+    request_fingerprint,
+    expires_at
+)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT DO NOTHING;
+```
+
+A plain insert that raises a unique-constraint violation is not used because that error would abort the PostgreSQL transaction and prevent replay logic from continuing in the same transaction.
+
+If business validation fails, or an infrastructure/internal error aborts the operation, the whole transaction rolls back, including the incomplete reservation. No failure response is retained. A later retry with the same key re-evaluates current state.
 
 Consequences:
 
@@ -339,7 +370,7 @@ Account creation runs in one transaction:
 
 1. parse and validate the decimal-string initial balance;
 2. validate the currency and scale against the allowlist;
-3. reserve the idempotency key where required;
+3. reserve or replay the idempotency key where required;
 4. insert one active account;
 5. store the successful response in the idempotency row;
 6. commit atomically.
@@ -387,36 +418,41 @@ The rate is read and validated before account locks where practical and must sti
 
 One FX transfer creates only two account entries:
 
-* source entry: total debit, with optional principal and fee summary;
+* source entry: total debit, with principal and fee summary;
 * destination entry: received destination amount.
 
-A failed FX operation rolls back its idempotency reservation and may be retried against a newer rate or changed account state.
+There is no separate fee entry.
 
-## 12. Transfer reversal
+## 12. Reversal
 
-A reversal is a full, one-time financial inverse of a completed transfer. Partial reversals and reversal of a reversal are unsupported.
+A reversal is a full one-time financial inverse of a completed transfer.
 
-Only the owner of the original destination account may request reversal.
+Rules:
 
-The reversal runs in one PostgreSQL transaction:
+* only the owner of the original destination account may request it;
+* partial reversal is not supported;
+* reversal of a reversal is not supported;
+* only one reversal may reference an original transfer;
+* original stored amounts, fee and rate snapshot are reused;
+* current exchange rates and fees are not recalculated.
+
+The reversal transaction:
 
 1. reserve or replay the idempotency key;
 2. lock the original transfer;
 3. verify it exists and is not itself a reversal;
-4. verify the caller owns the original destination account;
+4. verify caller authorization;
 5. verify no reversal already exists;
-6. lock both accounts in deterministic ascending account-ID order;
+6. lock both accounts in deterministic ID order;
 7. verify both accounts exist and are active;
-8. debit the original destination by the exact amount received;
-9. credit the original source by the exact original total debit;
-10. insert the immutable reversal transfer;
+8. debit the original destination by the amount it received;
+9. credit the original source by the original total debit;
+10. insert the reversal transfer;
 11. insert two reversal account entries;
-12. store the successful response in the idempotency row;
+12. store the successful response;
 13. commit atomically.
 
-The original destination may become negative regardless of its current balance. Incoming transfers remain allowed and can restore it. Ordinary outgoing and FX transfers still require enough balance for their complete debit.
-
-A reversal uses the original amounts, fee and rate snapshot. It never uses a current rate or recalculates the fee.
+The original destination may become negative during reversal. Incoming transfers remain allowed; ordinary outgoing transfers remain forbidden unless the current balance covers the full debit.
 
 The partial unique index on `reverses_transfer_id` is the final database guarantee against concurrent duplicate reversals.
 
@@ -445,38 +481,40 @@ ORDER BY created_at DESC, id DESC
 LIMIT $5;
 ```
 
-A business operation appears once from the selected account's perspective. History returns summary data; full FX and reversal details come from `GET /v1/transfers/{transfer_id}`.
+History is account-relative, so one business operation appears once from the selected account's perspective.
+
+Full transfer, FX and reversal details are returned by `GET /v1/transfers/{transfer_id}`.
 
 ### Cursor pagination
 
-History uses keyset pagination rather than `OFFSET`:
+History uses keyset pagination:
 
 * order: `created_at DESC, id DESC`;
-* cursor: last returned `(created_at, id)`;
+* cursor: the last returned `(created_at, id)` pair;
 * default limit: 50;
 * maximum limit: 100.
 
-Using both fields keeps ordering deterministic when timestamps match. Newer inserts do not shift subsequent pages.
+`OFFSET` pagination is not used.
 
 ## 14. Consistency and concurrency
 
 PostgreSQL is authoritative for:
 
 * account balances and statuses;
-* completed transfers and reversals;
+* transfers and reversals;
 * account entries;
-* exchange-rate snapshots used by completed FX transfers;
-* completed successful idempotency records.
+* FX snapshots;
+* committed successful idempotency results.
 
-No cache participates in validation or balance mutation.
+No cache participates in transfer validation or balance mutation.
 
-Operations on independent accounts may execute concurrently. Operations touching the same account serialize through row locks.
+Independent accounts may be processed concurrently. Operations touching the same account are serialized with row locks.
 
-All multi-account operations lock account rows in deterministic ascending account-ID order.
+All multi-account operations lock accounts in deterministic ascending ID order.
 
-For each successful side-effecting request, the financial mutation, transfer/account record, account entries and idempotency result commit in one transaction. On any failure, all of them roll back.
+The side effect, audit records, account entries and successful idempotency result commit atomically.
 
-Concurrent duplicate requests coordinate through the unique idempotency key. After the winning transaction commits, duplicates replay the stored success; after rollback, a duplicate may proceed and re-evaluate current state.
+A business or technical failure commits none of them.
 
 ## 15. API outline
 
@@ -497,11 +535,11 @@ GET  /ready
 GET  /metrics
 ```
 
-The OpenAPI 3.1 specification defines exact request, response and error schemas.
+The complete request, response and error schemas belong in OpenAPI 3.1.
 
 ## 16. Error handling
 
-Errors use a stable shape:
+Errors use a stable structure:
 
 ```json
 {
@@ -523,150 +561,125 @@ Expected categories include:
 * insufficient funds;
 * currency mismatch;
 * same-account transfer;
-* missing or stale FX rate;
+* unavailable FX rate;
 * idempotency conflict;
 * transfer already reversed;
 * internal error.
 
-Business and technical failures are not persisted as idempotency outcomes. Internal database details are logged but never returned.
+Internal database details are logged but not returned.
 
 ## 17. Observability
 
 Structured logs and traces include:
 
-* endpoint and request ID;
+* request and correlation IDs;
+* endpoint and operation type;
 * authenticated client ID where appropriate;
-* operation result and latency;
-* transfer or resulting resource ID on success;
-* idempotency replay or conflict;
+* operation result;
+* latency;
 * database error category;
-* deadlock and retry information.
+* idempotency reservation, replay and conflict outcomes.
 
-Sensitive values, JWTs and full financial request bodies are not logged.
+JWTs and full financial request bodies are not logged.
 
 Metrics may include:
 
 * request count and latency;
 * transfer success and rejection counts;
-* idempotent success replay and conflict counts;
 * transaction duration;
-* database-pool utilization;
-* deadlock and retry counts.
+* pool utilization;
+* deadlock and retry counts;
+* idempotency replay and conflict counts.
 
 ## 18. Testing strategy
 
 Unit tests cover:
 
-* decimal parsing and currency scale;
-* half-up rounding;
-* fee and FX calculations;
+* decimal-string parsing;
+* currency scale validation;
 * fingerprint normalization;
+* FX rounding and fee calculation;
 * domain validation.
 
 Integration tests against PostgreSQL cover:
 
-* account creation and zero initial balance;
-* rejection of negative initial balance;
-* active-account validation;
-* successful same-owner and different-owner transfers;
+* account creation and balance reads;
+* normal and self-owned-account transfers;
 * insufficient funds;
-* currency mismatch and same-account rejection;
-* successful FX transfer and fee calculation;
-* missing or stale rate;
-* successful reversal and reversal overdraft;
-* unauthorized, duplicate and reversal-of-reversal rejection;
-* account and account-pair history;
-* cursor pagination;
+* inactive and missing accounts;
+* currency mismatch;
+* same-account rejection;
+* successful FX transfer;
+* unavailable or stale FX rate;
+* successful reversal;
+* reversal overdraft;
+* unauthorized and duplicate reversal;
+* history and cursor pagination;
 * successful idempotent replay;
-* same key with different fingerprint after committed success;
-* retry with the same key after a business failure;
-* rollback of both financial work and idempotency reservation on failure.
+* same key with different fingerprint;
+* concurrent identical requests committing one side effect;
+* business failure rolling back the reservation;
+* retry after a state-changing business failure;
+* uncommitted reservation visibility and rollback behavior.
 
 Concurrency tests verify:
 
-* concurrent transfers cannot create a normal overdraft;
-* total funds are conserved;
-* opposing transfers do not corrupt balances;
-* concurrent reversal attempts create one reversal;
-* concurrent identical requests create one committed side effect;
-* a duplicate waits for the winning transaction and replays its committed success;
-* a duplicate can proceed after the winning transaction rolls back.
+* no overdraft from concurrent transfers;
+* conservation of funds;
+* safe opposing transfers;
+* one committed reversal under concurrent attempts;
+* one committed side effect for concurrent duplicate successful requests.
 
-Load tests report throughput and p50, p95 and p99 latency for independent accounts and intentionally contended hot accounts.
+## 19. Key invariants
 
-## 19. Performance strategy
-
-The critical path uses:
-
-* stateless Tokio/Axum instances;
-* SQLx connection pooling;
-* short PostgreSQL transactions;
-* deterministic row locking;
-* minimal round trips;
-* prepared statements;
-* minimal write indexes;
-* cursor-based history pagination;
-* no remote calls while account rows are locked;
-* no authoritative distributed cache.
-
-The idempotency unique key adds one indexed write to successful side-effecting operations and coordinates duplicate requests without a separate work-claim subsystem.
-
-Pool sizes are configurable and must account for total connections across all instances. PgBouncer may be introduced if measurements justify it.
+* account currency and scale are immutable;
+* source and destination IDs differ;
+* transfer amounts are positive;
+* fees are non-negative;
+* ordinary outgoing operations require enough balance for the full debit;
+* only reversal may create a negative balance;
+* one reversal exists per original transfer;
+* each completed operation creates exactly two account entries;
+* incomplete idempotency reservations never commit;
+* each committed successful side effect has one completed idempotency record;
+* the idempotency key scope is unique;
+* failures leave no committed idempotency record.
 
 ## 20. Scalability and future evolution
 
-The service scales horizontally by adding stateless instances against PostgreSQL.
+The first version scales through stateless application instances and one PostgreSQL database.
 
-Possible future improvements:
+Potential later improvements:
 
-* additional account states and status-transition APIs;
-* read replicas for non-authoritative history;
-* time-based partitioning;
 * PgBouncer;
+* history read replicas;
+* transfer-table partitioning;
 * transactional outbox;
 * asynchronous read projections;
-* externally supplied exchange rates;
-* asymmetric JWT verification;
-* fine-grained account permissions.
+* externally managed FX rates;
+* additional account statuses and lifecycle APIs;
+* fine-grained permissions.
 
 These are introduced only when requirements or measurements justify their complexity.
 
-## 21. Key invariants
+## 21. Trade-offs
 
-* source and destination account IDs differ;
-* both participating accounts exist and are active;
-* account currency and scale are immutable;
-* initial balance is non-negative;
-* normal and FX transfers never overdraw the source account;
-* reversal may make the original destination negative;
-* transfer amounts are positive;
-* one completed business operation creates exactly two account entries;
-* at most one reversal exists for an original transfer;
-* reversal of a reversal is forbidden;
-* all participating accounts are locked in deterministic order;
-* successful mutation and successful idempotency record commit atomically;
-* failed operations leave no committed idempotency record;
-* one scoped idempotency key maps to one fingerprint only after a successful commit;
-* history ordering is stable by `(created_at, id)`.
+### Current balance plus immutable history
 
-## 22. Key trade-offs
+Balance reads are constant-size, while immutable transfers and entries provide auditability. All projections are updated atomically.
+
+### Row locking
+
+Row locks give predictable correctness under contention. Deterministic lock order reduces deadlock risk.
 
 ### Success-only idempotency
 
-Persisting only successful outcomes keeps the guarantee that duplicate successful requests create one side effect while allowing retries after state-dependent business failures. It avoids processing states, leases, takeover rules and failure-result retention.
+Only committed successful outcomes are retained. The reservation and business mutation share one transaction, so failures naturally remove the reservation and retries can re-evaluate changed state.
 
-### PostgreSQL instead of an authoritative cache
+Nullable result fields are an internal transactional mechanism, not a persisted incomplete state. The application must complete them before commit.
 
-This favors correctness and operational simplicity and avoids dual-write consistency problems.
+This avoids leases, claim tokens, failure replay and abandoned-work recovery while preserving the essential guarantee of one committed side effect for duplicate successful requests.
 
-### Row locking instead of optimistic retries
+### Account-entry projection
 
-Row locking gives predictable correctness under contention. Optimistic concurrency may reduce lock waits at low contention but can create repeated retries for hot accounts.
-
-### Current balance plus immutable transfers and entries
-
-The account row provides constant-size balance reads. Transfers provide the authoritative business audit record. Entries provide efficient account-centric history. All are updated atomically.
-
-### Bonus-ready schema without bonus-first implementation
-
-The schema preserves both monetary sides, rate and fee data needed for FX while keeping the mandatory same-currency path small and testable.
+The extra two rows per completed operation increase write volume but make account and account-pair history direct indexed reads without reconstructing direction from transfer columns.
