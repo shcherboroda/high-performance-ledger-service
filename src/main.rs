@@ -2,7 +2,7 @@
 use std::future::pending;
 
 use anyhow::Result;
-use rust_backend_technical_assessment::{app, config::Config, db};
+use rust_backend_technical_assessment::{app, auth::AuthVerifier, config::Config, db};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -17,6 +17,7 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let config = Config::from_env()?;
+    let auth = AuthVerifier::new(&config.auth)?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_new(&config.log_filter)?)
         .init();
@@ -24,7 +25,7 @@ async fn run() -> Result<()> {
     let pool = db::create_pool(&config.database_url, &config.pool).await?;
     let listener = tokio::net::TcpListener::bind(config.bind_address).await?;
     info!(address = %config.bind_address, "server listening");
-    axum::serve(listener, app::router(pool))
+    axum::serve(listener, app::router(pool, auth))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())

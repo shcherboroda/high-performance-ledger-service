@@ -4,9 +4,13 @@ use axum::{Json, Router, extract::State, http::StatusCode, response::IntoRespons
 use serde::Serialize;
 use sqlx::PgPool;
 use tracing::error;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+use utoipa::{Modify, OpenApi, ToSchema};
 
-use crate::api_error::{ApiErrorBody, AppError, ErrorEnvelope};
+use crate::{
+    api_error::{ApiErrorBody, AppError, ErrorEnvelope},
+    auth::AuthVerifier,
+};
 
 pub const SERVICE_TITLE: &str = "FJX High-Performance Ledger Service";
 pub const SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -14,14 +18,25 @@ pub const SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
+    pub auth: AuthVerifier,
 }
 
-pub fn router(pool: PgPool) -> Router {
-    Router::new()
+pub fn router(pool: PgPool, auth: AuthVerifier) -> Router {
+    let router = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
-        .route("/openapi.json", get(openapi))
-        .with_state(AppState { pool })
+        .route("/openapi.json", get(openapi));
+
+    #[cfg(test)]
+    let router = router.route("/_test/authenticated", get(test_authenticated));
+    router.with_state(AppState { pool, auth })
+}
+
+#[cfg(test)]
+async fn test_authenticated(
+    crate::auth::AuthenticatedClient { client_id }: crate::auth::AuthenticatedClient,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "client_id": client_id }))
 }
 
 #[derive(Serialize, ToSchema)]
@@ -63,9 +78,30 @@ async fn ready(State(state): State<AppState>) -> Result<impl IntoResponse, AppEr
 #[openapi(
     info(title = SERVICE_TITLE, version = SERVICE_VERSION),
     paths(health, ready),
-    components(schemas(StatusResponse, ErrorEnvelope, ApiErrorBody))
+    components(schemas(StatusResponse, ErrorEnvelope, ApiErrorBody)),
+    modifiers(&SecuritySchemeAddon)
 )]
 struct ApiDoc;
+
+struct SecuritySchemeAddon;
+
+impl Modify for SecuritySchemeAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        openapi
+            .components
+            .as_mut()
+            .expect("OpenAPI components are generated from schemas")
+            .add_security_scheme(
+                "bearerAuth",
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Bearer)
+                        .bearer_format("JWT")
+                        .build(),
+                ),
+            );
+    }
+}
 
 static OPENAPI: LazyLock<utoipa::openapi::OpenApi> = LazyLock::new(ApiDoc::openapi);
 
@@ -80,13 +116,137 @@ mod tests {
         http::{Request, StatusCode},
         response::IntoResponse,
     };
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    use serde::Serialize;
     use serde_json::{Map, Value, json};
     use sqlx::postgres::PgPoolOptions;
     use tower::ServiceExt;
 
-    use crate::api_error::AppError;
+    use crate::{api_error::AppError, auth::AuthVerifier, config::AuthConfig};
 
     use super::router;
+
+    const TEST_PUBLIC_KEY: &str = include_str!("../tests/fixtures/jwt-test-public.pem");
+    const TEST_PRIVATE_KEY: &str = include_str!("../tests/fixtures/jwt-test-private.pem");
+
+    #[derive(Serialize)]
+    struct TestClaims {
+        sub: Option<String>,
+        exp: usize,
+        iss: String,
+        aud: String,
+    }
+
+    fn test_auth() -> AuthVerifier {
+        let config = AuthConfig::new("https://issuer.example", "ledger", TEST_PUBLIC_KEY).unwrap();
+        AuthVerifier::new(&config).unwrap()
+    }
+
+    fn token(sub: Option<&str>, exp: usize, issuer: &str, audience: &str) -> String {
+        encode(
+            &Header::new(Algorithm::RS256),
+            &TestClaims {
+                sub: sub.map(str::to_owned),
+                exp,
+                iss: issuer.to_owned(),
+                aud: audience.to_owned(),
+            },
+            &EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY.as_bytes()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    async fn protected_response(authorization: Option<&str>) -> axum::response::Response {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/ledger")
+            .unwrap();
+        let mut request = Request::get("/_test/authenticated")
+            .body(Body::empty())
+            .unwrap();
+        if let Some(authorization) = authorization {
+            request
+                .headers_mut()
+                .insert("authorization", authorization.parse().unwrap());
+        }
+        router(pool, test_auth()).oneshot(request).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn authenticated_client_extracts_valid_rs256_subject() {
+        let token = token(
+            Some("client-123"),
+            4_102_444_800,
+            "https://issuer.example",
+            "ledger",
+        );
+        let response = protected_response(Some(&format!("bEaReR {token}"))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), br#"{"client_id":"client-123"}"#);
+    }
+
+    #[tokio::test]
+    async fn authentication_failures_are_safe_unauthorized_responses() {
+        let valid = token(
+            Some("client-123"),
+            4_102_444_800,
+            "https://issuer.example",
+            "ledger",
+        );
+        let expired = token(Some("client-123"), 1, "https://issuer.example", "ledger");
+        let wrong_issuer = token(
+            Some("client-123"),
+            4_102_444_800,
+            "https://other.example",
+            "ledger",
+        );
+        let wrong_audience = token(
+            Some("client-123"),
+            4_102_444_800,
+            "https://issuer.example",
+            "other",
+        );
+        let missing_subject = token(None, 4_102_444_800, "https://issuer.example", "ledger");
+        let blank_subject = token(
+            Some("  "),
+            4_102_444_800,
+            "https://issuer.example",
+            "ledger",
+        );
+        let hs256 = encode(
+            &Header::new(Algorithm::HS256),
+            &TestClaims {
+                sub: Some("client-123".into()),
+                exp: 4_102_444_800,
+                iss: "https://issuer.example".into(),
+                aud: "ledger".into(),
+            },
+            &EncodingKey::from_secret(b"not-an-rsa-key"),
+        )
+        .unwrap();
+        let cases = [
+            None,
+            Some("not-a-bearer-header".to_owned()),
+            Some("Basic value".to_owned()),
+            Some("Bearer ".to_owned()),
+            Some(format!("Bearer {valid}x")),
+            Some(format!("Bearer {expired}")),
+            Some(format!("Bearer {wrong_issuer}")),
+            Some(format!("Bearer {wrong_audience}")),
+            Some(format!("Bearer {missing_subject}")),
+            Some(format!("Bearer {blank_subject}")),
+            Some(format!("Bearer {hs256}")),
+        ];
+        for authorization in cases {
+            let response = protected_response(authorization.as_deref()).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body = std::str::from_utf8(&body).unwrap();
+            assert!(body.contains("\"code\":\"unauthorized\""));
+            assert!(!body.contains("client-123"));
+            assert!(!body.contains("BEGIN"));
+        }
+    }
 
     fn assert_local_schema_references_resolve(value: &Value, schemas: &Map<String, Value>) {
         match value {
@@ -117,7 +277,7 @@ mod tests {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/ledger")
             .unwrap();
-        let response = router(pool)
+        let response = router(pool, test_auth())
             .oneshot(Request::get("/health").body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -132,7 +292,7 @@ mod tests {
             .connect_lazy("postgres://user:password@localhost/ledger")
             .unwrap();
         pool.close().await;
-        let response = router(pool)
+        let response = router(pool, test_auth())
             .oneshot(Request::get("/ready").body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -203,7 +363,7 @@ mod tests {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/ledger")
             .unwrap();
-        let response = router(pool)
+        let response = router(pool, test_auth())
             .oneshot(Request::get("/openapi.json").body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -223,6 +383,14 @@ mod tests {
         assert!(paths.contains_key("/ready"));
         assert!(paths["/ready"]["get"]["responses"].get("200").is_some());
         assert!(paths["/ready"]["get"]["responses"].get("503").is_some());
+        assert!(paths["/health"]["get"].get("security").is_none());
+        assert!(paths["/ready"]["get"].get("security").is_none());
+        let security_schemes = document["components"]["securitySchemes"]
+            .as_object()
+            .unwrap();
+        assert_eq!(security_schemes["bearerAuth"]["type"], "http");
+        assert_eq!(security_schemes["bearerAuth"]["scheme"], "bearer");
+        assert_eq!(security_schemes["bearerAuth"]["bearerFormat"], "JWT");
         let schemas = document["components"]["schemas"].as_object().unwrap();
         assert!(schemas.contains_key("ErrorEnvelope"));
         assert!(schemas.contains_key("ApiErrorBody"));

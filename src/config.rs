@@ -1,13 +1,58 @@
-use std::{collections::HashMap, net::SocketAddr, time::Duration};
+use std::{collections::HashMap, fmt, net::SocketAddr, time::Duration};
 
 use anyhow::{Context, Result, bail};
+use jsonwebtoken::DecodingKey;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Config {
     pub database_url: String,
     pub bind_address: SocketAddr,
     pub pool: PoolConfig,
     pub log_filter: String,
+    pub auth: AuthConfig,
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Config")
+            .field("database_url", &"[REDACTED]")
+            .field("bind_address", &self.bind_address)
+            .field("pool", &self.pool)
+            .field("log_filter", &self.log_filter)
+            .field("auth", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct AuthConfig {
+    pub issuer: String,
+    pub audience: String,
+    public_key_pem: String,
+}
+
+impl AuthConfig {
+    pub fn new(
+        issuer: impl Into<String>,
+        audience: impl Into<String>,
+        public_key_pem: impl Into<String>,
+    ) -> Result<Self> {
+        let issuer = nonblank(issuer.into(), "JWT_ISSUER")?;
+        let audience = nonblank(audience.into(), "JWT_AUDIENCE")?;
+        let public_key_pem = public_key_pem.into();
+        DecodingKey::from_rsa_pem(public_key_pem.as_bytes())
+            .context("JWT_PUBLIC_KEY_PEM must contain a valid RSA public key")?;
+        Ok(Self {
+            issuer,
+            audience,
+            public_key_pem,
+        })
+    }
+
+    pub(crate) fn public_key_pem(&self) -> &str {
+        &self.public_key_pem
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +80,11 @@ impl Config {
         if min_connections > max_connections {
             bail!("DB_MIN_CONNECTIONS must not exceed DB_MAX_CONNECTIONS");
         }
+        let auth = AuthConfig::new(
+            required(&values, "JWT_ISSUER")?,
+            required(&values, "JWT_AUDIENCE")?,
+            required(&values, "JWT_PUBLIC_KEY_PEM")?,
+        )?;
 
         Ok(Self {
             database_url,
@@ -46,8 +96,16 @@ impl Config {
                 connect_timeout: parse_seconds(&values, "DB_CONNECT_TIMEOUT_SECS", 5)?,
             },
             log_filter: optional(&values, "RUST_LOG", "info").to_owned(),
+            auth,
         })
     }
+}
+
+fn nonblank(value: String, name: &str) -> Result<String> {
+    if value.trim().is_empty() {
+        bail!("{name} must be set");
+    }
+    Ok(value)
 }
 
 fn required(values: &HashMap<String, String>, name: &str) -> Result<String> {
@@ -89,9 +147,21 @@ mod tests {
             .collect()
     }
 
+    const TEST_PUBLIC_KEY: &str = include_str!("../tests/fixtures/jwt-test-public.pem");
+
+    fn required_values(items: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut values = values(items);
+        values.extend([
+            ("JWT_ISSUER".into(), "https://issuer.example".into()),
+            ("JWT_AUDIENCE".into(), "ledger".into()),
+            ("JWT_PUBLIC_KEY_PEM".into(), TEST_PUBLIC_KEY.into()),
+        ]);
+        values
+    }
+
     #[test]
     fn parses_defaults() {
-        let config = Config::from_values(values(&[(
+        let config = Config::from_values(required_values(&[(
             "DATABASE_URL",
             "postgres://secret@localhost/ledger",
         )]))
