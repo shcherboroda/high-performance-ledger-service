@@ -1,5 +1,5 @@
 use axum::{
-    body::Body,
+    body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
 use rust_backend_technical_assessment::{app, config::PoolConfig, db};
@@ -28,4 +28,6 @@ async fn readiness_succeeds_against_configured_postgres() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(body.as_ref(), br#"{"status":"ready"}"#);
 }

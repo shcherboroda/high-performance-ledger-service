@@ -47,10 +47,8 @@ async fn ready(State(state): State<AppState>) -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use axum::{
-        body::Body,
+        body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
     use sqlx::postgres::PgPoolOptions;
@@ -68,18 +66,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), br#"{"status":"ok"}"#);
     }
 
     #[tokio::test]
     async fn readiness_hides_database_failures() {
         let pool = PgPoolOptions::new()
-            .acquire_timeout(Duration::from_millis(50))
-            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/ledger")
+            .connect_lazy("postgres://user:password@localhost/ledger")
             .unwrap();
+        pool.close().await;
         let response = router(pool)
             .oneshot(Request::get("/ready").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), br#"{"status":"unavailable"}"#);
+        let body = std::str::from_utf8(&body).unwrap();
+        for forbidden in ["postgres://", "user", "password", "sqlx", "PoolClosed"] {
+            assert!(!body.contains(forbidden), "response exposed {forbidden}");
+        }
     }
 }
