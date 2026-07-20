@@ -6,7 +6,7 @@ use sqlx::PgPool;
 use tracing::error;
 use utoipa::{OpenApi, ToSchema};
 
-use crate::api_error::{AppError, ErrorEnvelope};
+use crate::api_error::{ApiErrorBody, AppError, ErrorEnvelope};
 
 pub const SERVICE_TITLE: &str = "FJX High-Performance Ledger Service";
 pub const SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -63,7 +63,7 @@ async fn ready(State(state): State<AppState>) -> Result<impl IntoResponse, AppEr
 #[openapi(
     info(title = SERVICE_TITLE, version = SERVICE_VERSION),
     paths(health, ready),
-    components(schemas(StatusResponse, ErrorEnvelope))
+    components(schemas(StatusResponse, ErrorEnvelope, ApiErrorBody))
 )]
 struct ApiDoc;
 
@@ -80,13 +80,37 @@ mod tests {
         http::{Request, StatusCode},
         response::IntoResponse,
     };
-    use serde_json::{Value, json};
+    use serde_json::{Map, Value, json};
     use sqlx::postgres::PgPoolOptions;
     use tower::ServiceExt;
 
     use crate::api_error::AppError;
 
     use super::router;
+
+    fn assert_local_schema_references_resolve(value: &Value, schemas: &Map<String, Value>) {
+        match value {
+            Value::Object(object) => {
+                if let Some(reference) = object.get("$ref").and_then(Value::as_str)
+                    && let Some(name) = reference.strip_prefix("#/components/schemas/")
+                {
+                    assert!(
+                        schemas.contains_key(name),
+                        "unresolved schema reference: {reference}"
+                    );
+                }
+                for value in object.values() {
+                    assert_local_schema_references_resolve(value, schemas);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    assert_local_schema_references_resolve(value, schemas);
+                }
+            }
+            _ => {}
+        }
+    }
 
     #[tokio::test]
     async fn health_is_available_without_a_database_connection() {
@@ -199,11 +223,10 @@ mod tests {
         assert!(paths.contains_key("/ready"));
         assert!(paths["/ready"]["get"]["responses"].get("200").is_some());
         assert!(paths["/ready"]["get"]["responses"].get("503").is_some());
-        assert!(
-            document["components"]["schemas"]
-                .get("ErrorEnvelope")
-                .is_some()
-        );
+        let schemas = document["components"]["schemas"].as_object().unwrap();
+        assert!(schemas.contains_key("ErrorEnvelope"));
+        assert!(schemas.contains_key("ApiErrorBody"));
+        assert_local_schema_references_resolve(&document, schemas);
         assert!(!std::str::from_utf8(&body).unwrap().contains("postgres://"));
     }
 }
