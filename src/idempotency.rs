@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::api_error::AppError;
 
 pub const ACCOUNT_CREATION_OPERATION: &str = "account_creation";
+pub const TRANSFER_OPERATION: &str = "transfer";
 pub const IDEMPOTENCY_KEY_HEADER: HeaderName = HeaderName::from_static("idempotency-key");
 const MAX_KEY_LENGTH: usize = 255;
 
@@ -61,6 +62,21 @@ pub fn account_creation_fingerprint(currency: &str, balance_minor: i64) -> Strin
     hasher.update(currency.as_bytes());
     hasher.update(b":");
     hasher.update(balance_minor.to_be_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn transfer_fingerprint(
+    source_account_id: Uuid,
+    destination_account_id: Uuid,
+    currency: &str,
+    amount_minor: i64,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"transfer:v1:");
+    hasher.update(source_account_id.as_bytes());
+    hasher.update(destination_account_id.as_bytes());
+    hasher.update(currency.as_bytes());
+    hasher.update(amount_minor.to_be_bytes());
     format!("{:x}", hasher.finalize())
 }
 
@@ -204,6 +220,29 @@ mod tests {
         assert_eq!(first, account_creation_fingerprint("PLN", 1020));
         assert_ne!(first, account_creation_fingerprint("USD", 1020));
         assert_ne!(first, account_creation_fingerprint("PLN", 1021));
+    }
+
+    #[test]
+    fn transfer_fingerprint_covers_every_business_input() {
+        let source = Uuid::new_v4();
+        let destination = Uuid::new_v4();
+        let fingerprint = transfer_fingerprint(source, destination, "USD", 1020);
+        assert_eq!(
+            fingerprint,
+            transfer_fingerprint(source, destination, "USD", 1020)
+        );
+        assert_ne!(
+            fingerprint,
+            transfer_fingerprint(destination, source, "USD", 1020)
+        );
+        assert_ne!(
+            fingerprint,
+            transfer_fingerprint(source, destination, "PLN", 1020)
+        );
+        assert_ne!(
+            fingerprint,
+            transfer_fingerprint(source, destination, "USD", 1021)
+        );
     }
 
     #[sqlx::test]

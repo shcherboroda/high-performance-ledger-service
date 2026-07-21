@@ -18,7 +18,7 @@ use crate::{
     api_error::{ApiErrorBody, AppError, ErrorEnvelope},
     auth::{AuthVerifier, AuthenticatedClient},
     idempotency::{self, IdempotencyKey, Reservation},
-    money::{MoneyError, currency, format_minor_units, parse_initial_balance},
+    money::{MoneyError, currency, format_minor_units, parse_initial_balance, parse_minor_units},
 };
 
 pub const SERVICE_TITLE: &str = "FJX High-Performance Ledger Service";
@@ -45,7 +45,8 @@ pub fn router_with_idempotency_retention(
         .route("/ready", get(ready))
         .route("/openapi.json", get(openapi))
         .route("/accounts", post(create_account))
-        .route("/accounts/{account_id}/balance", get(get_balance));
+        .route("/accounts/{account_id}/balance", get(get_balance))
+        .route("/transfers", post(create_transfer));
 
     #[cfg(test)]
     let router = router.route("/_test/authenticated", get(test_authenticated));
@@ -123,6 +124,38 @@ struct AccountBalanceResponse {
     #[schema(value_type = String, example = "10.25")]
     balance: String,
     version: i64,
+}
+
+#[derive(Deserialize, ToSchema)]
+struct CreateTransferRequest {
+    source_account_id: String,
+    destination_account_id: String,
+    #[schema(example = "10.25")]
+    amount: String,
+}
+
+#[derive(Serialize, ToSchema)]
+struct TransferCreatedResponse {
+    id: Uuid,
+    source_account_id: Uuid,
+    destination_account_id: Uuid,
+    #[schema(example = "USD")]
+    currency: String,
+    #[schema(value_type = String, example = "10.25")]
+    amount: String,
+    status: &'static str,
+    resulting_source_balance: String,
+    resulting_destination_balance: String,
+    created_at: String,
+}
+
+struct LockedAccount {
+    id: Uuid,
+    owner_id: String,
+    currency: String,
+    scale: i16,
+    balance_minor: i64,
+    status: String,
 }
 
 #[utoipa::path(
@@ -249,6 +282,186 @@ async fn get_balance(
     }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/transfers",
+    request_body = CreateTransferRequest,
+    params(("Idempotency-Key" = String, Header, description = "Visible ASCII key, 1 to 255 characters")),
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 201, description = "Transfer created or stored successful replay", body = TransferCreatedResponse),
+        (status = 400, description = "Invalid transfer request or Idempotency-Key", body = ErrorEnvelope),
+        (status = 401, description = "Authentication is required", body = ErrorEnvelope),
+        (status = 404, description = "A requested account is unavailable", body = ErrorEnvelope),
+        (status = 409, description = "Idempotency key was previously used with a different request", body = ErrorEnvelope),
+        (status = 422, description = "Transfer cannot be completed", body = ErrorEnvelope),
+        (status = 500, description = "Internal failure", body = ErrorEnvelope)
+    )
+)]
+async fn create_transfer(
+    State(state): State<AppState>,
+    AuthenticatedClient { client_id }: AuthenticatedClient,
+    headers: HeaderMap,
+    request: Result<Json<CreateTransferRequest>, JsonRejection>,
+) -> Result<axum::response::Response, AppError> {
+    let idempotency_key = IdempotencyKey::from_headers(&headers)?;
+    let Json(request) =
+        request.map_err(|_| AppError::validation("invalid_json", "The request body is invalid"))?;
+    let source_account_id = Uuid::parse_str(&request.source_account_id)
+        .map_err(|_| AppError::validation("malformed_account_id", "The account ID is invalid"))?;
+    let destination_account_id = Uuid::parse_str(&request.destination_account_id)
+        .map_err(|_| AppError::validation("malformed_account_id", "The account ID is invalid"))?;
+    if source_account_id == destination_account_id {
+        return Err(AppError::validation(
+            "same_source_and_destination",
+            "The source and destination accounts must differ",
+        ));
+    }
+
+    let mut transaction = state.pool.begin().await.map_err(AppError::internal)?;
+    let accounts = sqlx::query_as::<_, (Uuid, String, String, i16, i64, String)>(
+        "SELECT id, owner_id, currency, currency_scale, balance_minor, status::text \
+         FROM accounts WHERE id = ANY($1) ORDER BY id FOR UPDATE",
+    )
+    .bind(vec![source_account_id, destination_account_id])
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(AppError::internal)?;
+    if accounts.len() != 2 {
+        return Err(AppError::account_unavailable());
+    }
+    let locked = accounts
+        .into_iter()
+        .map(
+            |(id, owner_id, currency, scale, balance_minor, status)| LockedAccount {
+                id,
+                owner_id,
+                currency,
+                scale,
+                balance_minor,
+                status,
+            },
+        )
+        .collect::<Vec<_>>();
+    let source = locked
+        .iter()
+        .find(|account| account.id == source_account_id)
+        .expect("both locked accounts returned");
+    let destination = locked
+        .iter()
+        .find(|account| account.id == destination_account_id)
+        .expect("both locked accounts returned");
+    if source.owner_id != client_id || source.status != "active" || destination.status != "active" {
+        return Err(AppError::account_unavailable());
+    }
+    if source.currency != destination.currency || source.scale != destination.scale {
+        return Err(AppError::business(
+            "currency_mismatch",
+            "The account currencies do not match",
+        ));
+    }
+    let scale = u8::try_from(source.scale).map_err(AppError::internal)?;
+    let amount_minor = parse_minor_units(&request.amount, scale).map_err(transfer_money_error)?;
+    if amount_minor == 0 {
+        return Err(AppError::validation(
+            "non_positive_amount",
+            "The amount must be greater than zero",
+        ));
+    }
+    let fingerprint = idempotency::transfer_fingerprint(
+        source_account_id,
+        destination_account_id,
+        &source.currency,
+        amount_minor,
+    );
+    match idempotency::reserve(
+        &mut transaction,
+        &client_id,
+        idempotency::TRANSFER_OPERATION,
+        &idempotency_key,
+        &fingerprint,
+        state.idempotency_retention,
+    )
+    .await
+    .map_err(AppError::internal)?
+    {
+        Reservation::Replay {
+            http_status,
+            response_body,
+        } => {
+            transaction.commit().await.map_err(AppError::internal)?;
+            let status = StatusCode::from_u16(http_status as u16).map_err(AppError::internal)?;
+            return Ok((status, Json(response_body)).into_response());
+        }
+        Reservation::Conflict => return Err(AppError::idempotency_conflict()),
+        Reservation::Owned => {}
+    }
+    if source.balance_minor < amount_minor {
+        return Err(AppError::business(
+            "insufficient_funds",
+            "The source account has insufficient funds",
+        ));
+    }
+    let source_balance = source
+        .balance_minor
+        .checked_sub(amount_minor)
+        .ok_or_else(|| AppError::internal(anyhow::anyhow!("source balance overflow")))?;
+    let destination_balance = destination
+        .balance_minor
+        .checked_add(amount_minor)
+        .ok_or_else(|| AppError::internal(anyhow::anyhow!("destination balance overflow")))?;
+    let transfer_id = Uuid::new_v4();
+    let created_at: String = sqlx::query_scalar(
+        "INSERT INTO transfers (id, source_account_id, destination_account_id, source_currency, destination_currency, source_amount_minor, destination_amount_minor, total_source_debit_minor, kind, initiated_by) \
+         VALUES ($1, $2, $3, $4, $4, $5, $5, $5, 'transfer', $6) RETURNING created_at::text",
+    )
+    .bind(transfer_id).bind(source_account_id).bind(destination_account_id).bind(&source.currency).bind(amount_minor).bind(&client_id)
+    .fetch_one(&mut *transaction).await.map_err(AppError::internal)?;
+    for (id, balance) in [
+        (source_account_id, source_balance),
+        (destination_account_id, destination_balance),
+    ] {
+        sqlx::query("UPDATE accounts SET balance_minor = $1, version = version + 1, updated_at = now() WHERE id = $2")
+            .bind(balance).bind(id).execute(&mut *transaction).await.map_err(AppError::internal)?;
+    }
+    for (account_id, counterparty_account_id, direction) in [
+        (source_account_id, destination_account_id, "debit"),
+        (destination_account_id, source_account_id, "credit"),
+    ] {
+        sqlx::query(
+            "INSERT INTO account_entries (id, account_id, transfer_id, counterparty_account_id, direction, operation_kind, amount_minor, currency) \
+             VALUES ($1, $2, $3, $4, $5::entry_direction, 'transfer', $6, $7)",
+        )
+        .bind(Uuid::new_v4()).bind(account_id).bind(transfer_id).bind(counterparty_account_id).bind(direction).bind(amount_minor).bind(&source.currency)
+        .execute(&mut *transaction).await.map_err(AppError::internal)?;
+    }
+    let response_body = serde_json::to_value(TransferCreatedResponse {
+        id: transfer_id,
+        source_account_id,
+        destination_account_id,
+        currency: source.currency.clone(),
+        amount: format_minor_units(amount_minor, scale),
+        status: "completed",
+        resulting_source_balance: format_minor_units(source_balance, scale),
+        resulting_destination_balance: format_minor_units(destination_balance, scale),
+        created_at,
+    })
+    .map_err(AppError::internal)?;
+    idempotency::store_success(
+        &mut transaction,
+        &client_id,
+        idempotency::TRANSFER_OPERATION,
+        &idempotency_key,
+        StatusCode::CREATED.as_u16().into(),
+        &response_body,
+        transfer_id,
+    )
+    .await
+    .map_err(AppError::internal)?;
+    transaction.commit().await.map_err(AppError::internal)?;
+    Ok((StatusCode::CREATED, Json(response_body)).into_response())
+}
+
 fn money_error(error: MoneyError) -> AppError {
     match error {
         MoneyError::Malformed => {
@@ -268,11 +481,30 @@ fn money_error(error: MoneyError) -> AppError {
     }
 }
 
+fn transfer_money_error(error: MoneyError) -> AppError {
+    match error {
+        MoneyError::Malformed => {
+            AppError::validation("malformed_amount", "The amount is malformed")
+        }
+        MoneyError::TooManyFractionalDigits => AppError::validation(
+            "too_many_fractional_digits",
+            "The amount has too many fractional digits for this currency",
+        ),
+        MoneyError::Negative => AppError::validation(
+            "non_positive_amount",
+            "The amount must be greater than zero",
+        ),
+        MoneyError::Overflow => {
+            AppError::validation("amount_overflow", "The amount is out of range")
+        }
+    }
+}
+
 #[derive(OpenApi)]
 #[openapi(
     info(title = SERVICE_TITLE, version = SERVICE_VERSION),
-    paths(health, ready, create_account, get_balance),
-    components(schemas(StatusResponse, CreateAccountRequest, AccountCreatedResponse, AccountBalanceResponse, ErrorEnvelope, ApiErrorBody)),
+    paths(health, ready, create_account, get_balance, create_transfer),
+    components(schemas(StatusResponse, CreateAccountRequest, AccountCreatedResponse, AccountBalanceResponse, CreateTransferRequest, TransferCreatedResponse, ErrorEnvelope, ApiErrorBody)),
     modifiers(&SecuritySchemeAddon)
 )]
 struct ApiDoc;
@@ -418,6 +650,45 @@ mod tests {
             .oneshot(builder.body(body).unwrap())
             .await
             .unwrap()
+    }
+
+    async fn transfer_response(
+        pool: PgPool,
+        token: &str,
+        idempotency_key: &str,
+        body: Value,
+    ) -> axum::response::Response {
+        account_response_with_key(
+            pool,
+            "POST",
+            "/transfers",
+            token,
+            idempotency_key,
+            Some(body),
+        )
+        .await
+    }
+
+    async fn insert_test_account(
+        pool: &PgPool,
+        id: Uuid,
+        owner_id: &str,
+        currency: &str,
+        scale: i16,
+        balance_minor: i64,
+    ) {
+        sqlx::query(
+            "INSERT INTO accounts (id, owner_id, currency, currency_scale, balance_minor) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(id)
+        .bind(owner_id)
+        .bind(currency)
+        .bind(scale)
+        .bind(balance_minor)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -675,11 +946,12 @@ mod tests {
         let document: Value = serde_json::from_slice(&body).unwrap();
         assert!(document["openapi"].as_str().unwrap().starts_with("3.1"));
         let paths = document["paths"].as_object().unwrap();
-        assert_eq!(paths.len(), 4);
+        assert_eq!(paths.len(), 5);
         assert!(paths.contains_key("/health"));
         assert!(paths.contains_key("/ready"));
         assert!(paths.contains_key("/accounts"));
         assert!(paths.contains_key("/accounts/{account_id}/balance"));
+        assert!(paths.contains_key("/transfers"));
         assert!(paths["/ready"]["get"]["responses"].get("200").is_some());
         assert!(paths["/ready"]["get"]["responses"].get("503").is_some());
         assert!(paths["/health"]["get"].get("security").is_none());
@@ -690,6 +962,10 @@ mod tests {
         );
         assert_eq!(
             paths["/accounts/{account_id}/balance"]["get"]["security"][0]["bearerAuth"],
+            json!([])
+        );
+        assert_eq!(
+            paths["/transfers"]["post"]["security"][0]["bearerAuth"],
             json!([])
         );
         let security_schemes = document["components"]["securitySchemes"]
@@ -704,6 +980,8 @@ mod tests {
         assert!(schemas.contains_key("CreateAccountRequest"));
         assert!(schemas.contains_key("AccountCreatedResponse"));
         assert!(schemas.contains_key("AccountBalanceResponse"));
+        assert!(schemas.contains_key("CreateTransferRequest"));
+        assert!(schemas.contains_key("TransferCreatedResponse"));
         assert_local_schema_references_resolve(&document, schemas);
         assert!(!std::str::from_utf8(&body).unwrap().contains("postgres://"));
     }
@@ -1217,5 +1495,118 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[sqlx::test]
+    async fn transfer_is_atomic_auditable_and_replayable(pool: PgPool) {
+        let source = Uuid::new_v4();
+        let destination = Uuid::new_v4();
+        insert_test_account(&pool, source, "client-123", "USD", 2, 2_000).await;
+        insert_test_account(&pool, destination, "client-456", "USD", 2, 500).await;
+        let owner_token = token(
+            Some("client-123"),
+            4_102_444_800,
+            "https://issuer.example",
+            "ledger",
+        );
+        let request = json!({"source_account_id": source, "destination_account_id": destination, "amount": "10.2"});
+        let first = transfer_response(pool.clone(), &owner_token, "transfer-key", request).await;
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&first_body).unwrap();
+        assert_eq!(body["amount"], "10.20");
+        assert_eq!(body["resulting_source_balance"], "9.80");
+        assert_eq!(body["resulting_destination_balance"], "15.20");
+        assert_eq!(body["status"], "completed");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT balance_minor FROM accounts WHERE id = $1")
+                .bind(source)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            980
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT balance_minor FROM accounts WHERE id = $1")
+                .bind(destination)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1_520
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM transfers")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM account_entries")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM account_entries WHERE direction = 'debit'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM account_entries WHERE direction = 'credit'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+
+        let replay = transfer_response(pool.clone(), &owner_token, "transfer-key", json!({"source_account_id": source, "destination_account_id": destination, "amount": "10.20"})).await;
+        assert_eq!(replay.status(), StatusCode::CREATED);
+        assert_eq!(
+            to_bytes(replay.into_body(), usize::MAX).await.unwrap(),
+            first_body
+        );
+        let conflict = transfer_response(pool.clone(), &owner_token, "transfer-key", json!({"source_account_id": source, "destination_account_id": destination, "amount": "10.21"})).await;
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    }
+
+    #[sqlx::test]
+    async fn transfer_failures_roll_back_the_reservation_and_balances(pool: PgPool) {
+        let source = Uuid::new_v4();
+        let destination = Uuid::new_v4();
+        insert_test_account(&pool, source, "client-123", "USD", 2, 100).await;
+        insert_test_account(&pool, destination, "client-456", "USD", 2, 0).await;
+        let owner_token = token(
+            Some("client-123"),
+            4_102_444_800,
+            "https://issuer.example",
+            "ledger",
+        );
+        let failed = transfer_response(pool.clone(), &owner_token, "retry-key", json!({"source_account_id":source,"destination_account_id":destination,"amount":"1.01"})).await;
+        assert_eq!(failed.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM idempotency_records")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT balance_minor FROM accounts WHERE id = $1")
+                .bind(source)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            100
+        );
+        let retry = transfer_response(pool.clone(), &owner_token, "retry-key", json!({"source_account_id":source,"destination_account_id":destination,"amount":"1.00"})).await;
+        assert_eq!(retry.status(), StatusCode::CREATED);
     }
 }
