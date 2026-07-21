@@ -43,18 +43,30 @@ impl ErrorEnvelope {
 /// Transport-level failures shared by HTTP handlers.
 #[derive(Debug)]
 pub enum AppError {
-    BadRequest { details: Option<Value> },
+    BadRequest {
+        details: Option<Value>,
+    },
+    Validation {
+        code: &'static str,
+        message: &'static str,
+    },
     Unauthorized,
     Forbidden,
     NotFound,
     Conflict,
     ServiceUnavailable,
-    Internal { source: Error },
+    Internal {
+        source: Error,
+    },
 }
 
 impl AppError {
     pub fn bad_request(details: Option<Value>) -> Self {
         Self::BadRequest { details }
+    }
+
+    pub fn validation(code: &'static str, message: &'static str) -> Self {
+        Self::Validation { code, message }
     }
 
     pub fn unauthorized() -> Self {
@@ -84,6 +96,10 @@ impl AppError {
             Self::BadRequest { details } => (
                 StatusCode::BAD_REQUEST,
                 ErrorEnvelope::new("bad_request", "The request is invalid", details.clone()),
+            ),
+            Self::Validation { code, message } => (
+                StatusCode::BAD_REQUEST,
+                ErrorEnvelope::new(code, message, None),
             ),
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
