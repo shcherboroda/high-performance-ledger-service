@@ -356,6 +356,49 @@ async fn create_transfer(
         let status = StatusCode::from_u16(http_status as u16).map_err(AppError::internal)?;
         return Ok((status, Json(response_body)).into_response());
     }
+    let (fingerprint_currency, source_scale): (String, i16) =
+        sqlx::query_as("SELECT currency, currency_scale FROM accounts WHERE id = $1")
+            .bind(source_account_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(AppError::internal)?
+            .ok_or_else(AppError::account_unavailable)?;
+    let scale = u8::try_from(source_scale).map_err(AppError::internal)?;
+    let amount_minor = parse_minor_units(&request.amount, scale).map_err(transfer_money_error)?;
+    if amount_minor <= 0 {
+        return Err(AppError::validation(
+            "non_positive_amount",
+            "The amount must be greater than zero",
+        ));
+    }
+    let fingerprint = idempotency::transfer_fingerprint(
+        source_account_id,
+        destination_account_id,
+        &fingerprint_currency,
+        amount_minor,
+    );
+    match idempotency::reserve(
+        &mut transaction,
+        &client_id,
+        idempotency::TRANSFER_OPERATION,
+        &idempotency_key,
+        &fingerprint,
+        state.idempotency_retention,
+    )
+    .await
+    .map_err(AppError::internal)?
+    {
+        Reservation::Replay {
+            http_status,
+            response_body,
+        } => {
+            transaction.commit().await.map_err(AppError::internal)?;
+            let status = StatusCode::from_u16(http_status as u16).map_err(AppError::internal)?;
+            return Ok((status, Json(response_body)).into_response());
+        }
+        Reservation::Conflict => return Err(AppError::idempotency_conflict()),
+        Reservation::Owned => {}
+    }
     let accounts = sqlx::query_as::<_, (Uuid, String, String, i16, i64, String)>(
         "SELECT id, owner_id, currency, currency_scale, balance_minor, status::text \
          FROM accounts WHERE id = ANY($1) ORDER BY id FOR UPDATE",
@@ -397,41 +440,10 @@ async fn create_transfer(
             "The account currencies do not match",
         ));
     }
-    let scale = u8::try_from(source.scale).map_err(AppError::internal)?;
-    let amount_minor = parse_minor_units(&request.amount, scale).map_err(transfer_money_error)?;
-    if amount_minor <= 0 {
-        return Err(AppError::validation(
-            "non_positive_amount",
-            "The amount must be greater than zero",
-        ));
-    }
-    let fingerprint = idempotency::transfer_fingerprint(
-        source_account_id,
-        destination_account_id,
-        &source.currency,
-        amount_minor,
-    );
-    match idempotency::reserve(
-        &mut transaction,
-        &client_id,
-        idempotency::TRANSFER_OPERATION,
-        &idempotency_key,
-        &fingerprint,
-        state.idempotency_retention,
-    )
-    .await
-    .map_err(AppError::internal)?
-    {
-        Reservation::Replay {
-            http_status,
-            response_body,
-        } => {
-            transaction.commit().await.map_err(AppError::internal)?;
-            let status = StatusCode::from_u16(http_status as u16).map_err(AppError::internal)?;
-            return Ok((status, Json(response_body)).into_response());
-        }
-        Reservation::Conflict => return Err(AppError::idempotency_conflict()),
-        Reservation::Owned => {}
+    if source.currency != fingerprint_currency || source.scale != source_scale {
+        return Err(AppError::internal(anyhow::anyhow!(
+            "account currency metadata changed during transfer"
+        )));
     }
     if source.balance_minor < amount_minor {
         return Err(AppError::business(
@@ -1732,8 +1744,39 @@ mod tests {
             to_bytes(missing.into_body(), usize::MAX).await.unwrap(),
             to_bytes(foreign.into_body(), usize::MAX).await.unwrap()
         );
-        let mismatch = transfer_response(pool, &token, "mismatch", json!({"source_account_id":source,"destination_account_id":jpy_destination,"amount":"0.01"})).await;
+        let mismatch = transfer_response(pool.clone(), &token, "mismatch", json!({"source_account_id":source,"destination_account_id":jpy_destination,"amount":"0.01"})).await;
         assert_eq!(mismatch.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        for (account_id, key) in [
+            (source, "inactive-source"),
+            (destination, "inactive-destination"),
+        ] {
+            sqlx::query("UPDATE accounts SET status = 'inactive' WHERE id = $1")
+                .bind(account_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            let response = transfer_response(pool.clone(), &token, key, json!({"source_account_id":source,"destination_account_id":destination,"amount":"0.01"})).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["error"]["code"], "account_unavailable");
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM idempotency_records WHERE idempotency_key = $1"
+                )
+                .bind(key)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+                0
+            );
+            sqlx::query("UPDATE accounts SET status = 'active' WHERE id = $1")
+                .bind(account_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
     }
 
     #[sqlx::test]
@@ -1914,6 +1957,22 @@ mod tests {
                 0
             );
         }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT balance_minor FROM accounts WHERE id = $1")
+                .bind(source)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            500
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT balance_minor FROM accounts WHERE id = $1")
+                .bind(destination)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            100
+        );
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM transfers")
                 .fetch_one(&pool)

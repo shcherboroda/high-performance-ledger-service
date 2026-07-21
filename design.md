@@ -120,7 +120,7 @@ An account has:
 
 A client may own multiple accounts, including several in the same currency. Transfers between distinct accounts of one owner are valid.
 
-The first version supports only `active`. Both participating accounts must exist and be active. Future states such as `blocked`, `suspended` and `closed` may be introduced later.
+Accounts are created as `active` and may be set to `inactive`. Both participating accounts must exist and be active for a normal transfer. Future states such as `blocked`, `suspended` and `closed` may be introduced later.
 
 ### Money
 
