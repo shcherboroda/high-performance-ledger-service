@@ -485,6 +485,8 @@ async fn create_transfer(
         .checked_add(amount_minor)
         .ok_or_else(|| AppError::internal(anyhow::anyhow!("destination balance overflow")))?;
     let transfer_id = Uuid::new_v4();
+    // Fee and rate fields preserve the original operation snapshot for auditability;
+    // they are not an additional fee charged by the reversal.
     let created_at: String = sqlx::query_scalar(
         "INSERT INTO transfers (id, source_account_id, destination_account_id, source_currency, destination_currency, source_amount_minor, destination_amount_minor, total_source_debit_minor, kind, initiated_by) \
          VALUES ($1, $2, $3, $4, $4, $5, $5, $5, 'transfer', $6) RETURNING created_at::text",
@@ -2229,11 +2231,19 @@ mod tests {
         let first_destination = Uuid::new_v4();
         let second_source = Uuid::new_v4();
         let second_destination = Uuid::new_v4();
+        let third_source = Uuid::new_v4();
+        let third_destination = Uuid::new_v4();
+        let fourth_source = Uuid::new_v4();
+        let fourth_destination = Uuid::new_v4();
         for (id, owner) in [
             (first_source, "client-123"),
             (second_source, "client-123"),
+            (third_source, "client-123"),
+            (fourth_source, "client-123"),
             (first_destination, "client-456"),
             (second_destination, "client-456"),
+            (third_destination, "client-456"),
+            (fourth_destination, "client-456"),
         ] {
             insert_test_account(&pool, id, owner, "USD", 2, 1_000).await;
         }
@@ -2318,10 +2328,62 @@ mod tests {
             1
         );
         assert_eq!(
-            reversal_response(pool, &destination_token, "same-key", first_id)
+            reversal_response(pool.clone(), &destination_token, "same-key", first_id)
                 .await
                 .status(),
             StatusCode::CONFLICT
+        );
+
+        let third_original = transfer_response(pool.clone(), &source_token, "third-original", json!({"source_account_id": third_source, "destination_account_id": third_destination, "amount": "1.00"})).await;
+        let third_id: Uuid = serde_json::from_slice::<Value>(
+            &to_bytes(third_original.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let fourth_original = transfer_response(pool.clone(), &source_token, "fourth-original", json!({"source_account_id": fourth_source, "destination_account_id": fourth_destination, "amount": "1.00"})).await;
+        let fourth_id: Uuid = serde_json::from_slice::<Value>(
+            &to_bytes(fourth_original.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let (winner, conflict) = tokio::join!(
+            reversal_response(
+                pool.clone(),
+                &destination_token,
+                "same-different-key",
+                third_id
+            ),
+            reversal_response(
+                pool.clone(),
+                &destination_token,
+                "same-different-key",
+                fourth_id
+            ),
+        );
+        assert!(
+            (winner.status() == StatusCode::CREATED && conflict.status() == StatusCode::CONFLICT)
+                || (winner.status() == StatusCode::CONFLICT
+                    && conflict.status() == StatusCode::CREATED)
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM transfers WHERE reverses_transfer_id = ANY($1)"
+            )
+            .bind(vec![third_id, fourth_id])
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
         );
     }
 
@@ -2480,6 +2542,85 @@ mod tests {
             .unwrap()["error"]["code"],
             "reversal_of_reversal"
         );
+    }
+
+    #[sqlx::test]
+    async fn reversal_arithmetic_overflow_rolls_back_its_reservation(pool: PgPool) {
+        let original_source = Uuid::new_v4();
+        let original_destination = Uuid::new_v4();
+        let original_id = Uuid::new_v4();
+        insert_test_account(&pool, original_source, "client-123", "USD", 2, i64::MAX).await;
+        insert_test_account(&pool, original_destination, "client-456", "USD", 2, 1).await;
+        sqlx::query(
+            "INSERT INTO transfers (id, source_account_id, destination_account_id, source_currency, destination_currency, source_amount_minor, destination_amount_minor, total_source_debit_minor, kind, initiated_by) VALUES ($1, $2, $3, 'USD', 'USD', 1, 1, 1, 'transfer', 'client-123')",
+        )
+        .bind(original_id)
+        .bind(original_source)
+        .bind(original_destination)
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (account_id, counterparty_account_id, direction) in [
+            (original_source, original_destination, "debit"),
+            (original_destination, original_source, "credit"),
+        ] {
+            sqlx::query(
+                "INSERT INTO account_entries (id, account_id, transfer_id, counterparty_account_id, direction, operation_kind, amount_minor, currency) VALUES ($1, $2, $3, $4, $5::entry_direction, 'transfer', 1, 'USD')",
+            )
+            .bind(Uuid::new_v4())
+            .bind(account_id)
+            .bind(original_id)
+            .bind(counterparty_account_id)
+            .bind(direction)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let token = token(
+            Some("client-456"),
+            4_102_444_800,
+            "https://issuer.example",
+            "ledger",
+        );
+        let response =
+            reversal_response(pool.clone(), &token, "overflow-reversal", original_id).await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &to_bytes(response.into_body(), usize::MAX).await.unwrap()
+            )
+            .unwrap()["error"]["code"],
+            "arithmetic_overflow"
+        );
+        for (id, balance) in [(original_source, i64::MAX), (original_destination, 1)] {
+            assert_eq!(
+                sqlx::query_as::<_, (i64, i64)>(
+                    "SELECT balance_minor, version FROM accounts WHERE id = $1"
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+                (balance, 0)
+            );
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM transfers WHERE kind = 'reversal'")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM account_entries WHERE operation_kind = 'reversal'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM idempotency_records WHERE operation_type = 'reversal' AND idempotency_key = 'overflow-reversal'").fetch_one(&pool).await.unwrap(), 0);
     }
 
     #[sqlx::test]
