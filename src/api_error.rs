@@ -55,6 +55,11 @@ pub enum AppError {
     NotFound,
     Conflict,
     IdempotencyConflict,
+    AccountUnavailable,
+    Business {
+        code: &'static str,
+        message: &'static str,
+    },
     ServiceUnavailable,
     Internal {
         source: Error,
@@ -84,6 +89,12 @@ impl AppError {
     }
     pub fn idempotency_conflict() -> Self {
         Self::IdempotencyConflict
+    }
+    pub fn account_unavailable() -> Self {
+        Self::AccountUnavailable
+    }
+    pub fn business(code: &'static str, message: &'static str) -> Self {
+        Self::Business { code, message }
     }
     pub fn service_unavailable() -> Self {
         Self::ServiceUnavailable
@@ -132,6 +143,18 @@ impl AppError {
                     "The Idempotency-Key was already used for a different request",
                     None,
                 ),
+            ),
+            Self::AccountUnavailable => (
+                StatusCode::NOT_FOUND,
+                ErrorEnvelope::new(
+                    "account_unavailable",
+                    "The requested account is unavailable",
+                    None,
+                ),
+            ),
+            Self::Business { code, message } => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                ErrorEnvelope::new(code, message, None),
             ),
             Self::ServiceUnavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
