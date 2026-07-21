@@ -2,6 +2,7 @@ use axum::{
     Json,
     extract::{Path, RawQuery, State},
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
@@ -54,7 +55,7 @@ struct Cursor {
     v: u8,
     account_id: Uuid,
     counterparty_account_id: Option<Uuid>,
-    created_at: String,
+    created_at: DateTime<Utc>,
     entry_id: Uuid,
 }
 
@@ -104,29 +105,29 @@ pub(crate) async fn get_account_history(
         String,
         Option<i64>,
         Option<i64>,
-        String,
+        DateTime<Utc>,
     );
     let rows = if let Some(counterparty) = query.counterparty_account_id {
         sqlx::query_as::<_, EntryRow>(
-            "SELECT id, transfer_id, counterparty_account_id, direction::text, operation_kind::text, amount_minor, currency, principal_amount_minor, fee_amount_minor, created_at::text \
+            "SELECT id, transfer_id, counterparty_account_id, direction::text, operation_kind::text, amount_minor, currency, principal_amount_minor, fee_amount_minor, created_at \
              FROM account_entries WHERE account_id = $1 AND counterparty_account_id = $2 \
-             AND ($3::timestamptz IS NULL OR (created_at, id) < ($3::timestamptz, $4)) \
+             AND ($3 IS NULL OR (created_at, id) < ($3, $4)) \
              ORDER BY created_at DESC, id DESC LIMIT $5",
         )
         .bind(account_id).bind(counterparty)
-        .bind(query.cursor.as_ref().map(|cursor| cursor.created_at.as_str()))
+        .bind(query.cursor.as_ref().map(|cursor| cursor.created_at))
         .bind(query.cursor.as_ref().map(|cursor| cursor.entry_id))
         .bind(query.limit + 1)
         .fetch_all(&state.pool).await.map_err(AppError::internal)?
     } else {
         sqlx::query_as::<_, EntryRow>(
-            "SELECT id, transfer_id, counterparty_account_id, direction::text, operation_kind::text, amount_minor, currency, principal_amount_minor, fee_amount_minor, created_at::text \
+            "SELECT id, transfer_id, counterparty_account_id, direction::text, operation_kind::text, amount_minor, currency, principal_amount_minor, fee_amount_minor, created_at \
              FROM account_entries WHERE account_id = $1 \
-             AND ($2::timestamptz IS NULL OR (created_at, id) < ($2::timestamptz, $3)) \
+             AND ($2 IS NULL OR (created_at, id) < ($2, $3)) \
              ORDER BY created_at DESC, id DESC LIMIT $4",
         )
         .bind(account_id)
-        .bind(query.cursor.as_ref().map(|cursor| cursor.created_at.as_str()))
+        .bind(query.cursor.as_ref().map(|cursor| cursor.created_at))
         .bind(query.cursor.as_ref().map(|cursor| cursor.entry_id))
         .bind(query.limit + 1)
         .fetch_all(&state.pool).await.map_err(AppError::internal)?
@@ -144,7 +145,7 @@ pub(crate) async fn get_account_history(
             v: 1,
             account_id,
             counterparty_account_id: query.counterparty_account_id,
-            created_at: last.9.clone(),
+            created_at: last.9,
             entry_id: last.0,
         })
     });
@@ -163,7 +164,7 @@ pub(crate) async fn get_account_history(
                 currency: row.6,
                 principal_amount: row.7.map(|amount| format_minor_units(amount, scale)),
                 fee_amount: row.8.map(|amount| format_minor_units(amount, scale)),
-                created_at: row.9,
+                created_at: row.9.to_rfc3339(),
             })
             .collect(),
         next_cursor,
@@ -254,26 +255,10 @@ fn decode_cursor(value: &str) -> Result<Cursor, AppError> {
         .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).map_err(|_| invalid_cursor()))
         .collect::<Result<Vec<_>, _>>()?;
     let cursor: Cursor = serde_json::from_slice(&bytes).map_err(|_| invalid_cursor())?;
-    if cursor.v != 1 || !is_cursor_timestamp(&cursor.created_at) {
+    if cursor.v != 1 {
         return Err(invalid_cursor());
     }
     Ok(cursor)
-}
-
-fn is_cursor_timestamp(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    bytes.len() >= 20
-        && bytes.len() <= 40
-        && bytes.get(4) == Some(&b'-')
-        && bytes.get(7) == Some(&b'-')
-        && bytes
-            .get(10)
-            .is_some_and(|byte| *byte == b' ' || *byte == b'T')
-        && bytes.get(13) == Some(&b':')
-        && bytes.get(16) == Some(&b':')
-        && bytes.iter().all(|byte| {
-            byte.is_ascii_digit() || matches!(*byte, b'-' | b' ' | b'T' | b':' | b'.' | b'+' | b'Z')
-        })
 }
 
 #[cfg(test)]
@@ -286,7 +271,7 @@ mod tests {
             v: 1,
             account_id,
             counterparty_account_id: None,
-            created_at: "2026-01-01 00:00:00+00".into(),
+            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
             entry_id: Uuid::new_v4(),
         };
         let encoded = encode_cursor(&cursor);

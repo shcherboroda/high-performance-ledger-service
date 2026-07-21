@@ -1,5 +1,97 @@
 use super::support::*;
 
+async fn transfer_details_response(
+    pool: PgPool,
+    token: &str,
+    transfer_id: impl std::fmt::Display,
+) -> axum::response::Response {
+    account_response(
+        pool,
+        "GET",
+        &format!("/transfers/{transfer_id}"),
+        token,
+        None,
+    )
+    .await
+}
+
+#[sqlx::test]
+async fn transfer_details_are_visible_to_participants_and_hide_foreign_rows(pool: PgPool) {
+    let source = Uuid::new_v4();
+    let destination = Uuid::new_v4();
+    insert_test_account(&pool, source, "source-client", "USD", 2, 2_000).await;
+    insert_test_account(&pool, destination, "destination-client", "USD", 2, 0).await;
+    let source_token = token(
+        Some("source-client"),
+        4_102_444_800,
+        "https://issuer.example",
+        "ledger",
+    );
+    let destination_token = token(
+        Some("destination-client"),
+        4_102_444_800,
+        "https://issuer.example",
+        "ledger",
+    );
+    let unrelated_token = token(
+        Some("unrelated-client"),
+        4_102_444_800,
+        "https://issuer.example",
+        "ledger",
+    );
+    let created = transfer_response(
+        pool.clone(),
+        &source_token,
+        "detail-transfer",
+        json!({"source_account_id": source, "destination_account_id": destination, "amount": "10.2"}),
+    )
+    .await;
+    let created: Value =
+        serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let transfer_id = created["id"].as_str().unwrap();
+
+    for participant in [&source_token, &destination_token] {
+        let response = transfer_details_response(pool.clone(), participant, transfer_id).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["source_amount"], "10.20");
+        assert_eq!(body["destination_amount"], "10.20");
+        assert_eq!(body["fee_amount"], "0.00");
+        assert_eq!(body["total_source_debit"], "10.20");
+        assert_eq!(body["kind"], "transfer");
+        assert!(body["exchange_rate"].is_null());
+        assert!(body.get("initiated_by").is_none());
+    }
+    let nonexistent =
+        transfer_details_response(pool.clone(), &unrelated_token, Uuid::new_v4()).await;
+    let foreign = transfer_details_response(pool.clone(), &unrelated_token, transfer_id).await;
+    assert_eq!(nonexistent.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        to_bytes(nonexistent.into_body(), usize::MAX).await.unwrap(),
+        to_bytes(foreign.into_body(), usize::MAX).await.unwrap()
+    );
+    let malformed = transfer_details_response(pool.clone(), &source_token, "invalid").await;
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+
+    let reversal = reversal_response(
+        pool.clone(),
+        &destination_token,
+        "detail-reversal",
+        Uuid::parse_str(transfer_id).unwrap(),
+    )
+    .await;
+    let reversal: Value =
+        serde_json::from_slice(&to_bytes(reversal.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let response =
+        transfer_details_response(pool, &source_token, reversal["id"].as_str().unwrap()).await;
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["kind"], "reversal");
+    assert_eq!(body["reverses_transfer_id"], transfer_id);
+}
+
 #[sqlx::test]
 async fn transfer_is_atomic_auditable_and_replayable(pool: PgPool) {
     let source = Uuid::new_v4();
