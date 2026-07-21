@@ -1054,6 +1054,81 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn failed_owning_account_creation_rolls_back_its_reservation(pool: PgPool) {
+        sqlx::query(
+            "CREATE FUNCTION reject_test_account_creation() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN RAISE EXCEPTION 'forced account creation failure'; END; $$",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER reject_test_account_creation BEFORE INSERT ON accounts \
+             FOR EACH ROW EXECUTE FUNCTION reject_test_account_creation()",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let owner_token = token(
+            Some("client-123"),
+            4_102_444_800,
+            "https://issuer.example",
+            "ledger",
+        );
+        let failed = account_response_with_key(
+            pool.clone(),
+            "POST",
+            "/accounts",
+            &owner_token,
+            "owning-retry-key",
+            Some(json!({"currency":"PLN", "initial_balance":"1"})),
+        )
+        .await;
+        assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM accounts")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM idempotency_records")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+
+        sqlx::query("DROP TRIGGER reject_test_account_creation ON accounts")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP FUNCTION reject_test_account_creation()")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let retry = account_response_with_key(
+            pool.clone(),
+            "POST",
+            "/accounts",
+            &owner_token,
+            "owning-retry-key",
+            Some(json!({"currency":"PLN", "initial_balance":"1"})),
+        )
+        .await;
+        assert_eq!(retry.status(), StatusCode::CREATED);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM accounts")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[sqlx::test]
     async fn concurrent_identical_account_creation_has_one_side_effect(pool: PgPool) {
         let owner_token = token(
             Some("client-123"),
