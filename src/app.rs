@@ -46,7 +46,8 @@ pub fn router_with_idempotency_retention(
         .route("/openapi.json", get(openapi))
         .route("/accounts", post(create_account))
         .route("/accounts/{account_id}/balance", get(get_balance))
-        .route("/transfers", post(create_transfer));
+        .route("/transfers", post(create_transfer))
+        .route("/transfers/{transfer_id}/reversal", post(reverse_transfer));
 
     #[cfg(test)]
     let router = router.route("/_test/authenticated", get(test_authenticated));
@@ -143,6 +144,30 @@ struct TransferCreatedResponse {
     currency: String,
     #[schema(value_type = String, example = "10.25")]
     amount: String,
+    status: &'static str,
+    resulting_source_balance: String,
+    resulting_destination_balance: String,
+    created_at: String,
+}
+
+#[derive(Serialize, ToSchema)]
+struct ReversalCreatedResponse {
+    id: Uuid,
+    original_transfer_id: Uuid,
+    source_account_id: Uuid,
+    destination_account_id: Uuid,
+    source_currency: String,
+    destination_currency: String,
+    #[schema(value_type = String, example = "10.25")]
+    source_amount: String,
+    #[schema(value_type = String, example = "10.25")]
+    destination_amount: String,
+    /// Fee snapshot from the original operation; no fee is charged by the reversal itself.
+    #[schema(value_type = String, example = "0.00")]
+    original_fee_amount: String,
+    #[schema(value_type = String, example = "10.25")]
+    total_source_debit: String,
+    kind: &'static str,
     status: &'static str,
     resulting_source_balance: String,
     resulting_destination_balance: String,
@@ -460,6 +485,8 @@ async fn create_transfer(
         .checked_add(amount_minor)
         .ok_or_else(|| AppError::internal(anyhow::anyhow!("destination balance overflow")))?;
     let transfer_id = Uuid::new_v4();
+    // Fee and rate fields preserve the original operation snapshot for auditability;
+    // they are not an additional fee charged by the reversal.
     let created_at: String = sqlx::query_scalar(
         "INSERT INTO transfers (id, source_account_id, destination_account_id, source_currency, destination_currency, source_amount_minor, destination_amount_minor, total_source_debit_minor, kind, initiated_by) \
          VALUES ($1, $2, $3, $4, $4, $5, $5, $5, 'transfer', $6) RETURNING created_at::text",
@@ -511,6 +538,221 @@ async fn create_transfer(
     Ok((StatusCode::CREATED, Json(response_body)).into_response())
 }
 
+#[utoipa::path(
+    post,
+    path = "/transfers/{transfer_id}/reversal",
+    params(
+        ("transfer_id" = String, Path, description = "Original transfer UUID"),
+        ("Idempotency-Key" = String, Header, description = "Visible ASCII key, 1 to 255 characters")
+    ),
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 201, description = "Reversal created or stored successful replay", body = ReversalCreatedResponse),
+        (status = 400, description = "Invalid transfer ID or Idempotency-Key", body = ErrorEnvelope),
+        (status = 401, description = "Authentication is required", body = ErrorEnvelope),
+        (status = 404, description = "Original transfer or a participating account is unavailable", body = ErrorEnvelope),
+        (status = 409, description = "Idempotency key was previously used with a different request", body = ErrorEnvelope),
+        (status = 422, description = "Transfer cannot be reversed", body = ErrorEnvelope),
+        (status = 500, description = "Internal failure", body = ErrorEnvelope)
+    )
+)]
+async fn reverse_transfer(
+    State(state): State<AppState>,
+    AuthenticatedClient { client_id }: AuthenticatedClient,
+    headers: HeaderMap,
+    Path(transfer_id): Path<String>,
+) -> Result<axum::response::Response, AppError> {
+    let idempotency_key = IdempotencyKey::from_headers(&headers)?;
+    let original_transfer_id = Uuid::parse_str(&transfer_id)
+        .map_err(|_| AppError::validation("malformed_transfer_id", "The transfer ID is invalid"))?;
+    let fingerprint = idempotency::reversal_fingerprint(original_transfer_id);
+    let mut transaction = state.pool.begin().await.map_err(AppError::internal)?;
+
+    if let Some((stored_fingerprint, http_status, response_body)) = idempotency::completed_success(
+        &mut transaction,
+        &client_id,
+        idempotency::REVERSAL_OPERATION,
+        &idempotency_key,
+    )
+    .await
+    .map_err(AppError::internal)?
+    {
+        if stored_fingerprint != fingerprint {
+            return Err(AppError::idempotency_conflict());
+        }
+        transaction.commit().await.map_err(AppError::internal)?;
+        let status = StatusCode::from_u16(http_status as u16).map_err(AppError::internal)?;
+        return Ok((status, Json(response_body)).into_response());
+    }
+    match idempotency::reserve(
+        &mut transaction,
+        &client_id,
+        idempotency::REVERSAL_OPERATION,
+        &idempotency_key,
+        &fingerprint,
+        state.idempotency_retention,
+    )
+    .await
+    .map_err(AppError::internal)?
+    {
+        Reservation::Replay {
+            http_status,
+            response_body,
+        } => {
+            transaction.commit().await.map_err(AppError::internal)?;
+            let status = StatusCode::from_u16(http_status as u16).map_err(AppError::internal)?;
+            return Ok((status, Json(response_body)).into_response());
+        }
+        Reservation::Conflict => return Err(AppError::idempotency_conflict()),
+        Reservation::Owned => {}
+    }
+
+    let original = sqlx::query_as::<_, (Uuid, Uuid, String, String, i64, i64, i64, i64, Option<i32>, String, Option<String>, Option<Uuid>, String)>(
+        "SELECT source_account_id, destination_account_id, source_currency, destination_currency, source_amount_minor, destination_amount_minor, fee_amount_minor, total_source_debit_minor, fee_bps, kind::text, exchange_rate::text, exchange_rate_id, initiated_by FROM transfers WHERE id = $1 FOR UPDATE",
+    ).bind(original_transfer_id).fetch_optional(&mut *transaction).await.map_err(AppError::internal)?
+        .ok_or_else(AppError::not_found)?;
+    if original.9 == "reversal" {
+        return Err(AppError::business(
+            "reversal_of_reversal",
+            "A reversal cannot be reversed",
+        ));
+    }
+    let authorized: Option<String> =
+        sqlx::query_scalar("SELECT owner_id FROM accounts WHERE id = $1")
+            .bind(original.1)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(AppError::internal)?;
+    if authorized.as_deref() != Some(&client_id) {
+        return Err(AppError::not_found());
+    }
+    let already_reversed: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM transfers WHERE reverses_transfer_id = $1)",
+    )
+    .bind(original_transfer_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(AppError::internal)?;
+    if already_reversed {
+        return Err(AppError::business(
+            "transfer_already_reversed",
+            "The transfer has already been reversed",
+        ));
+    }
+
+    let source_account_id = original.1;
+    let destination_account_id = original.0;
+    let accounts = sqlx::query_as::<_, (Uuid, String, String, i16, i64, String)>(
+        "SELECT id, owner_id, currency, currency_scale, balance_minor, status::text FROM accounts WHERE id = ANY($1) ORDER BY id FOR UPDATE",
+    ).bind(vec![source_account_id, destination_account_id]).fetch_all(&mut *transaction).await.map_err(AppError::internal)?;
+    if accounts.len() != 2 {
+        return Err(AppError::account_unavailable());
+    }
+    let locked = accounts
+        .into_iter()
+        .map(
+            |(id, owner_id, currency, scale, balance_minor, status)| LockedAccount {
+                id,
+                owner_id,
+                currency,
+                scale,
+                balance_minor,
+                status,
+            },
+        )
+        .collect::<Vec<_>>();
+    let source = locked
+        .iter()
+        .find(|account| account.id == source_account_id)
+        .expect("both locked accounts returned");
+    let destination = locked
+        .iter()
+        .find(|account| account.id == destination_account_id)
+        .expect("both locked accounts returned");
+    if source.status != "active" || destination.status != "active" {
+        return Err(AppError::account_unavailable());
+    }
+    if source.currency != original.3 || destination.currency != original.2 {
+        return Err(AppError::internal(anyhow::anyhow!(
+            "original transfer currency metadata does not match accounts"
+        )));
+    }
+    let source_balance = source
+        .balance_minor
+        .checked_sub(original.5)
+        .ok_or_else(|| {
+            AppError::business("arithmetic_overflow", "The reversal amount is out of range")
+        })?;
+    let destination_balance = destination
+        .balance_minor
+        .checked_add(original.7)
+        .ok_or_else(|| {
+            AppError::business("arithmetic_overflow", "The reversal amount is out of range")
+        })?;
+    let reversal_id = Uuid::new_v4();
+    let created_at: String = sqlx::query_scalar(
+        "INSERT INTO transfers (id, source_account_id, destination_account_id, source_currency, destination_currency, source_amount_minor, destination_amount_minor, fee_amount_minor, total_source_debit_minor, fee_bps, exchange_rate, exchange_rate_id, kind, reverses_transfer_id, initiated_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $6, $9, CAST($10 AS numeric), $11, 'reversal', $12, $13) RETURNING created_at::text",
+    ).bind(reversal_id).bind(source_account_id).bind(destination_account_id).bind(&original.3).bind(&original.2).bind(original.5).bind(original.7).bind(original.6).bind(original.8).bind(original.10).bind(original.11).bind(original_transfer_id).bind(&client_id).fetch_one(&mut *transaction).await.map_err(AppError::internal)?;
+    for (id, balance) in [
+        (source_account_id, source_balance),
+        (destination_account_id, destination_balance),
+    ] {
+        sqlx::query("UPDATE accounts SET balance_minor = $1, version = version + 1, updated_at = now() WHERE id = $2").bind(balance).bind(id).execute(&mut *transaction).await.map_err(AppError::internal)?;
+    }
+    for (account_id, counterparty_account_id, direction, amount, currency) in [
+        (
+            source_account_id,
+            destination_account_id,
+            "debit",
+            original.5,
+            &original.3,
+        ),
+        (
+            destination_account_id,
+            source_account_id,
+            "credit",
+            original.7,
+            &original.2,
+        ),
+    ] {
+        sqlx::query("INSERT INTO account_entries (id, account_id, transfer_id, counterparty_account_id, direction, operation_kind, amount_minor, currency) VALUES ($1, $2, $3, $4, $5::entry_direction, 'reversal', $6, $7)").bind(Uuid::new_v4()).bind(account_id).bind(reversal_id).bind(counterparty_account_id).bind(direction).bind(amount).bind(currency).execute(&mut *transaction).await.map_err(AppError::internal)?;
+    }
+    let response_body = serde_json::to_value(ReversalCreatedResponse {
+        id: reversal_id,
+        original_transfer_id,
+        source_account_id,
+        destination_account_id,
+        source_currency: original.3.clone(),
+        destination_currency: original.2.clone(),
+        source_amount: format_minor_units(original.5, source.scale as u8),
+        destination_amount: format_minor_units(original.7, destination.scale as u8),
+        original_fee_amount: format_minor_units(original.6, destination.scale as u8),
+        total_source_debit: format_minor_units(original.5, source.scale as u8),
+        kind: "reversal",
+        status: "completed",
+        resulting_source_balance: format_minor_units(source_balance, source.scale as u8),
+        resulting_destination_balance: format_minor_units(
+            destination_balance,
+            destination.scale as u8,
+        ),
+        created_at,
+    })
+    .map_err(AppError::internal)?;
+    idempotency::store_success(
+        &mut transaction,
+        &client_id,
+        idempotency::REVERSAL_OPERATION,
+        &idempotency_key,
+        StatusCode::CREATED.as_u16().into(),
+        &response_body,
+        reversal_id,
+    )
+    .await
+    .map_err(AppError::internal)?;
+    transaction.commit().await.map_err(AppError::internal)?;
+    Ok((StatusCode::CREATED, Json(response_body)).into_response())
+}
+
 fn money_error(error: MoneyError) -> AppError {
     match error {
         MoneyError::Malformed => {
@@ -552,8 +794,8 @@ fn transfer_money_error(error: MoneyError) -> AppError {
 #[derive(OpenApi)]
 #[openapi(
     info(title = SERVICE_TITLE, version = SERVICE_VERSION),
-    paths(health, ready, create_account, get_balance, create_transfer),
-    components(schemas(StatusResponse, CreateAccountRequest, AccountCreatedResponse, AccountBalanceResponse, CreateTransferRequest, TransferCreatedResponse, ErrorEnvelope, ApiErrorBody)),
+    paths(health, ready, create_account, get_balance, create_transfer, reverse_transfer),
+    components(schemas(StatusResponse, CreateAccountRequest, AccountCreatedResponse, AccountBalanceResponse, CreateTransferRequest, TransferCreatedResponse, ReversalCreatedResponse, ErrorEnvelope, ApiErrorBody)),
     modifiers(&SecuritySchemeAddon)
 )]
 struct ApiDoc;
@@ -714,6 +956,23 @@ mod tests {
             token,
             idempotency_key,
             Some(body),
+        )
+        .await
+    }
+
+    async fn reversal_response(
+        pool: PgPool,
+        token: &str,
+        idempotency_key: &str,
+        transfer_id: Uuid,
+    ) -> axum::response::Response {
+        account_response_with_key(
+            pool,
+            "POST",
+            &format!("/transfers/{transfer_id}/reversal"),
+            token,
+            idempotency_key,
+            None,
         )
         .await
     }
@@ -995,12 +1254,13 @@ mod tests {
         let document: Value = serde_json::from_slice(&body).unwrap();
         assert!(document["openapi"].as_str().unwrap().starts_with("3.1"));
         let paths = document["paths"].as_object().unwrap();
-        assert_eq!(paths.len(), 5);
+        assert_eq!(paths.len(), 6);
         assert!(paths.contains_key("/health"));
         assert!(paths.contains_key("/ready"));
         assert!(paths.contains_key("/accounts"));
         assert!(paths.contains_key("/accounts/{account_id}/balance"));
         assert!(paths.contains_key("/transfers"));
+        assert!(paths.contains_key("/transfers/{transfer_id}/reversal"));
         assert!(paths["/ready"]["get"]["responses"].get("200").is_some());
         assert!(paths["/ready"]["get"]["responses"].get("503").is_some());
         assert!(paths["/health"]["get"].get("security").is_none());
@@ -1017,6 +1277,27 @@ mod tests {
             paths["/transfers"]["post"]["security"][0]["bearerAuth"],
             json!([])
         );
+        assert_eq!(
+            paths["/transfers/{transfer_id}/reversal"]["post"]["security"][0]["bearerAuth"],
+            json!([])
+        );
+        let reversal = &paths["/transfers/{transfer_id}/reversal"]["post"];
+        assert_eq!(reversal["parameters"][0]["name"], "transfer_id");
+        assert_eq!(reversal["parameters"][0]["in"], "path");
+        assert_eq!(reversal["parameters"][0]["required"], true);
+        assert_eq!(reversal["parameters"][1]["name"], "Idempotency-Key");
+        assert_eq!(reversal["parameters"][1]["in"], "header");
+        assert_eq!(reversal["parameters"][1]["required"], true);
+        for status in ["201", "400", "401", "404", "409", "422", "500"] {
+            assert!(
+                reversal["responses"].get(status).is_some(),
+                "missing {status}"
+            );
+        }
+        assert_eq!(
+            reversal["responses"]["201"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ReversalCreatedResponse"
+        );
         let security_schemes = document["components"]["securitySchemes"]
             .as_object()
             .unwrap();
@@ -1027,6 +1308,7 @@ mod tests {
         assert!(schemas.contains_key("ErrorEnvelope"));
         assert!(schemas.contains_key("ApiErrorBody"));
         assert!(schemas.contains_key("CreateAccountRequest"));
+        assert!(schemas.contains_key("ReversalCreatedResponse"));
         assert!(schemas.contains_key("AccountCreatedResponse"));
         assert!(schemas.contains_key("AccountBalanceResponse"));
         assert!(schemas.contains_key("CreateTransferRequest"));
@@ -1641,6 +1923,704 @@ mod tests {
         );
         let conflict = transfer_response(pool.clone(), &owner_token, "transfer-key", json!({"source_account_id": source, "destination_account_id": destination, "amount": "10.21"})).await;
         assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    }
+
+    #[sqlx::test]
+    async fn reversal_is_atomic_authorized_and_replayable(pool: PgPool) {
+        let original_source = Uuid::new_v4();
+        let original_destination = Uuid::new_v4();
+        insert_test_account(&pool, original_source, "client-123", "USD", 2, 1_000).await;
+        insert_test_account(&pool, original_destination, "client-456", "USD", 2, -100).await;
+        let source_token = token(
+            Some("client-123"),
+            4_102_444_800,
+            "https://issuer.example",
+            "ledger",
+        );
+        let destination_token = token(
+            Some("client-456"),
+            4_102_444_800,
+            "https://issuer.example",
+            "ledger",
+        );
+        let original = transfer_response(
+            pool.clone(),
+            &source_token,
+            "original-transfer",
+            json!({"source_account_id": original_source, "destination_account_id": original_destination, "amount": "10.00"}),
+        )
+        .await;
+        let original_body: Value =
+            serde_json::from_slice(&to_bytes(original.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let original_id = original_body["id"].as_str().unwrap().parse().unwrap();
+        sqlx::query(
+            "UPDATE transfers SET fee_amount_minor = 25, fee_bps = 250, exchange_rate = 1.5 WHERE id = $1",
+        )
+        .bind(original_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let original_snapshot: (i64, i64, i64, i64, String, Option<Uuid>) = sqlx::query_as(
+            "SELECT source_amount_minor, destination_amount_minor, fee_amount_minor, total_source_debit_minor, kind::text, reverses_transfer_id FROM transfers WHERE id = $1",
+        )
+        .bind(original_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let original_entry_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM account_entries WHERE transfer_id = $1")
+                .bind(original_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let foreign =
+            reversal_response(pool.clone(), &source_token, "foreign-reversal", original_id).await;
+        let missing = reversal_response(
+            pool.clone(),
+            &source_token,
+            "missing-reversal",
+            Uuid::new_v4(),
+        )
+        .await;
+        assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            to_bytes(foreign.into_body(), usize::MAX).await.unwrap(),
+            to_bytes(missing.into_body(), usize::MAX).await.unwrap()
+        );
+
+        let first = reversal_response(
+            pool.clone(),
+            &destination_token,
+            "reversal-key",
+            original_id,
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&first_body).unwrap();
+        assert_eq!(body["source_account_id"], original_destination.to_string());
+        assert_eq!(body["destination_account_id"], original_source.to_string());
+        assert_eq!(body["source_amount"], "10.00");
+        assert_eq!(body["total_source_debit"], "10.00");
+        assert_eq!(body["original_fee_amount"], "0.25");
+        assert_eq!(body["resulting_source_balance"], "-1.00");
+        assert_eq!(body["resulting_destination_balance"], "10.00");
+        for id in [original_source, original_destination] {
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT version FROM accounts WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap(),
+                2
+            );
+        }
+        let reversal_id = body["id"].as_str().unwrap().parse::<Uuid>().unwrap();
+        assert_eq!(
+            sqlx::query_as::<_, (Uuid, Uuid, i64, i64, i64, i64, String)>(
+                "SELECT source_account_id, destination_account_id, source_amount_minor, destination_amount_minor, fee_amount_minor, total_source_debit_minor, kind::text FROM transfers WHERE id = $1",
+            )
+            .bind(reversal_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            (original_destination, original_source, 1_000, 1_000, 25, 1_000, "reversal".into())
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (Option<i32>, bool)>(
+                "SELECT fee_bps, exchange_rate = 1.5 FROM transfers WHERE id = $1",
+            )
+            .bind(reversal_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            (Some(250), true)
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<Uuid>>(
+                "SELECT reverses_transfer_id FROM transfers WHERE id = $1"
+            )
+            .bind(reversal_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            Some(original_id)
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (i64, i64, i64, i64, String, Option<Uuid>)>(
+                "SELECT source_amount_minor, destination_amount_minor, fee_amount_minor, total_source_debit_minor, kind::text, reverses_transfer_id FROM transfers WHERE id = $1",
+            )
+            .bind(original_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            original_snapshot
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM account_entries WHERE transfer_id = $1"
+            )
+            .bind(original_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            original_entry_count
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM transfers WHERE kind = 'reversal'")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM account_entries WHERE operation_kind = 'reversal'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            2
+        );
+        let replay = reversal_response(
+            pool.clone(),
+            &destination_token,
+            "reversal-key",
+            original_id,
+        )
+        .await;
+        assert_eq!(replay.status(), StatusCode::CREATED);
+        assert_eq!(
+            to_bytes(replay.into_body(), usize::MAX).await.unwrap(),
+            first_body
+        );
+        let duplicate =
+            reversal_response(pool.clone(), &destination_token, "second-key", original_id).await;
+        assert_eq!(duplicate.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[sqlx::test]
+    async fn late_reversal_failure_rolls_back_every_write_and_allows_retry(pool: PgPool) {
+        let source = Uuid::new_v4();
+        let destination = Uuid::new_v4();
+        insert_test_account(&pool, source, "client-123", "USD", 2, 500).await;
+        insert_test_account(&pool, destination, "client-456", "USD", 2, 100).await;
+        let source_token = token(
+            Some("client-123"),
+            4_102_444_800,
+            "https://issuer.example",
+            "ledger",
+        );
+        let destination_token = token(
+            Some("client-456"),
+            4_102_444_800,
+            "https://issuer.example",
+            "ledger",
+        );
+        let original = transfer_response(
+            pool.clone(),
+            &source_token,
+            "rollback-original",
+            json!({"source_account_id": source, "destination_account_id": destination, "amount": "1.00"}),
+        )
+        .await;
+        let original: Value =
+            serde_json::from_slice(&to_bytes(original.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let original_id: Uuid = original["id"].as_str().unwrap().parse().unwrap();
+        let before_accounts: Vec<(Uuid, i64, i64)> = sqlx::query_as(
+            "SELECT id, balance_minor, version FROM accounts WHERE id = ANY($1) ORDER BY id",
+        )
+        .bind(vec![source, destination])
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let before_original: (i64, i64, i64, i64, String) = sqlx::query_as(
+            "SELECT source_amount_minor, destination_amount_minor, fee_amount_minor, total_source_debit_minor, kind::text FROM transfers WHERE id = $1",
+        )
+        .bind(original_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query("CREATE FUNCTION reject_reversal_entry() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced reversal entry failure'; END; $$")
+            .execute(&pool).await.unwrap();
+        sqlx::query("CREATE TRIGGER reject_reversal_entry BEFORE INSERT ON account_entries FOR EACH ROW WHEN (NEW.operation_kind = 'reversal') EXECUTE FUNCTION reject_reversal_entry()")
+            .execute(&pool).await.unwrap();
+
+        let failed = reversal_response(
+            pool.clone(),
+            &destination_token,
+            "late-reversal",
+            original_id,
+        )
+        .await;
+        assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let failed_body = String::from_utf8(
+            to_bytes(failed.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        for forbidden in ["forced reversal", "postgres", "sqlx", "DATABASE_URL"] {
+            assert!(!failed_body.contains(forbidden));
+        }
+        assert_eq!(
+            sqlx::query_as::<_, (Uuid, i64, i64)>(
+                "SELECT id, balance_minor, version FROM accounts WHERE id = ANY($1) ORDER BY id",
+            )
+            .bind(vec![source, destination])
+            .fetch_all(&pool)
+            .await
+            .unwrap(),
+            before_accounts
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM transfers WHERE kind = 'reversal'")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM account_entries WHERE operation_kind = 'reversal'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (i64, i64, i64, i64, String)>(
+                "SELECT source_amount_minor, destination_amount_minor, fee_amount_minor, total_source_debit_minor, kind::text FROM transfers WHERE id = $1",
+            )
+            .bind(original_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            before_original
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM idempotency_records WHERE operation_type = 'reversal' AND idempotency_key = 'late-reversal'")
+                .fetch_one(&pool).await.unwrap(),
+            0
+        );
+        sqlx::query("DROP TRIGGER reject_reversal_entry ON account_entries")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP FUNCTION reject_reversal_entry()")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            reversal_response(pool, &destination_token, "late-reversal", original_id)
+                .await
+                .status(),
+            StatusCode::CREATED
+        );
+    }
+
+    #[sqlx::test]
+    async fn concurrent_reversals_are_serialized_by_transfer_and_idempotency_keys(pool: PgPool) {
+        let first_source = Uuid::new_v4();
+        let first_destination = Uuid::new_v4();
+        let second_source = Uuid::new_v4();
+        let second_destination = Uuid::new_v4();
+        let third_source = Uuid::new_v4();
+        let third_destination = Uuid::new_v4();
+        let fourth_source = Uuid::new_v4();
+        let fourth_destination = Uuid::new_v4();
+        for (id, owner) in [
+            (first_source, "client-123"),
+            (second_source, "client-123"),
+            (third_source, "client-123"),
+            (fourth_source, "client-123"),
+            (first_destination, "client-456"),
+            (second_destination, "client-456"),
+            (third_destination, "client-456"),
+            (fourth_destination, "client-456"),
+        ] {
+            insert_test_account(&pool, id, owner, "USD", 2, 1_000).await;
+        }
+        let source_token = token(
+            Some("client-123"),
+            4_102_444_800,
+            "https://issuer.example",
+            "ledger",
+        );
+        let destination_token = token(
+            Some("client-456"),
+            4_102_444_800,
+            "https://issuer.example",
+            "ledger",
+        );
+        let first_original = transfer_response(pool.clone(), &source_token, "first-original", json!({"source_account_id": first_source, "destination_account_id": first_destination, "amount": "1.00"})).await;
+        let first_id: Uuid = serde_json::from_slice::<Value>(
+            &to_bytes(first_original.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let second_original = transfer_response(pool.clone(), &source_token, "second-original", json!({"source_account_id": second_source, "destination_account_id": second_destination, "amount": "1.00"})).await;
+        let second_id: Uuid = serde_json::from_slice::<Value>(
+            &to_bytes(second_original.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        let (first, second) = tokio::join!(
+            reversal_response(pool.clone(), &destination_token, "race-a", first_id),
+            reversal_response(pool.clone(), &destination_token, "race-b", first_id),
+        );
+        assert!(
+            (first.status() == StatusCode::CREATED
+                && second.status() == StatusCode::UNPROCESSABLE_ENTITY)
+                || (first.status() == StatusCode::UNPROCESSABLE_ENTITY
+                    && second.status() == StatusCode::CREATED)
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM transfers WHERE reverses_transfer_id = $1"
+            )
+            .bind(first_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+
+        let (same_key_first, same_key_second) = tokio::join!(
+            reversal_response(pool.clone(), &destination_token, "same-key", second_id),
+            reversal_response(pool.clone(), &destination_token, "same-key", second_id),
+        );
+        assert_eq!(same_key_first.status(), StatusCode::CREATED);
+        assert_eq!(same_key_second.status(), StatusCode::CREATED);
+        assert_eq!(
+            to_bytes(same_key_first.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            to_bytes(same_key_second.into_body(), usize::MAX)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM transfers WHERE reverses_transfer_id = $1"
+            )
+            .bind(second_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            reversal_response(pool.clone(), &destination_token, "same-key", first_id)
+                .await
+                .status(),
+            StatusCode::CONFLICT
+        );
+
+        let third_original = transfer_response(pool.clone(), &source_token, "third-original", json!({"source_account_id": third_source, "destination_account_id": third_destination, "amount": "1.00"})).await;
+        let third_id: Uuid = serde_json::from_slice::<Value>(
+            &to_bytes(third_original.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let fourth_original = transfer_response(pool.clone(), &source_token, "fourth-original", json!({"source_account_id": fourth_source, "destination_account_id": fourth_destination, "amount": "1.00"})).await;
+        let fourth_id: Uuid = serde_json::from_slice::<Value>(
+            &to_bytes(fourth_original.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let (winner, conflict) = tokio::join!(
+            reversal_response(
+                pool.clone(),
+                &destination_token,
+                "same-different-key",
+                third_id
+            ),
+            reversal_response(
+                pool.clone(),
+                &destination_token,
+                "same-different-key",
+                fourth_id
+            ),
+        );
+        assert!(
+            (winner.status() == StatusCode::CREATED && conflict.status() == StatusCode::CONFLICT)
+                || (winner.status() == StatusCode::CONFLICT
+                    && conflict.status() == StatusCode::CREATED)
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM transfers WHERE reverses_transfer_id = ANY($1)"
+            )
+            .bind(vec![third_id, fourth_id])
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+    }
+
+    #[sqlx::test]
+    async fn reversal_and_normal_transfer_serialize_without_deadlock(pool: PgPool) {
+        let source = Uuid::new_v4();
+        let destination = Uuid::new_v4();
+        insert_test_account(&pool, source, "client-123", "USD", 2, 1_000).await;
+        insert_test_account(&pool, destination, "client-456", "USD", 2, 1_000).await;
+        let source_token = token(
+            Some("client-123"),
+            4_102_444_800,
+            "https://issuer.example",
+            "ledger",
+        );
+        let destination_token = token(
+            Some("client-456"),
+            4_102_444_800,
+            "https://issuer.example",
+            "ledger",
+        );
+        let original = transfer_response(pool.clone(), &source_token, "interaction-original", json!({"source_account_id": source, "destination_account_id": destination, "amount": "1.00"})).await;
+        let original_id: Uuid = serde_json::from_slice::<Value>(
+            &to_bytes(original.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let (reversal, transfer) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(
+                reversal_response(pool.clone(), &destination_token, "interaction-reversal", original_id),
+                transfer_response(pool.clone(), &destination_token, "interaction-transfer", json!({"source_account_id": destination, "destination_account_id": source, "amount": "0.25"})),
+            )
+        })
+        .await
+        .expect("reversal and transfer must not deadlock");
+        assert_eq!(reversal.status(), StatusCode::CREATED);
+        assert_eq!(transfer.status(), StatusCode::CREATED);
+        assert_eq!(
+            sqlx::query_as::<_, (i64, i64)>(
+                "SELECT balance_minor, version FROM accounts WHERE id = $1",
+            )
+            .bind(source)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            (1_025, 3)
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (i64, i64)>(
+                "SELECT balance_minor, version FROM accounts WHERE id = $1",
+            )
+            .bind(destination)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            (975, 3)
+        );
+    }
+
+    #[sqlx::test]
+    async fn reversal_validates_ids_and_rejects_inactive_accounts_and_reversal_targets(
+        pool: PgPool,
+    ) {
+        let source = Uuid::new_v4();
+        let destination = Uuid::new_v4();
+        insert_test_account(&pool, source, "client-123", "USD", 2, 500).await;
+        insert_test_account(&pool, destination, "client-456", "USD", 2, 0).await;
+        let source_token = token(
+            Some("client-123"),
+            4_102_444_800,
+            "https://issuer.example",
+            "ledger",
+        );
+        let destination_token = token(
+            Some("client-456"),
+            4_102_444_800,
+            "https://issuer.example",
+            "ledger",
+        );
+        let malformed = account_response_with_key(
+            pool.clone(),
+            "POST",
+            "/transfers/not-a-uuid/reversal",
+            &destination_token,
+            "malformed-reversal",
+            None,
+        )
+        .await;
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &to_bytes(malformed.into_body(), usize::MAX).await.unwrap()
+            )
+            .unwrap()["error"]["code"],
+            "malformed_transfer_id"
+        );
+        let original = transfer_response(pool.clone(), &source_token, "status-original", json!({"source_account_id": source, "destination_account_id": destination, "amount": "1.00"})).await;
+        let original_id: Uuid = serde_json::from_slice::<Value>(
+            &to_bytes(original.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        for (id, key) in [
+            (source, "inactive-source"),
+            (destination, "inactive-destination"),
+        ] {
+            sqlx::query("UPDATE accounts SET status = 'inactive' WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            let response =
+                reversal_response(pool.clone(), &destination_token, key, original_id).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(
+                serde_json::from_slice::<Value>(
+                    &to_bytes(response.into_body(), usize::MAX).await.unwrap()
+                )
+                .unwrap()["error"]["code"],
+                "account_unavailable"
+            );
+            assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM idempotency_records WHERE operation_type = 'reversal' AND idempotency_key = $1").bind(key).fetch_one(&pool).await.unwrap(), 0);
+            sqlx::query("UPDATE accounts SET status = 'active' WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let reversal = reversal_response(
+            pool.clone(),
+            &destination_token,
+            "valid-reversal",
+            original_id,
+        )
+        .await;
+        let reversal_id: Uuid = serde_json::from_slice::<Value>(
+            &to_bytes(reversal.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let nested = reversal_response(pool, &source_token, "nested-reversal", reversal_id).await;
+        assert_eq!(nested.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &to_bytes(nested.into_body(), usize::MAX).await.unwrap()
+            )
+            .unwrap()["error"]["code"],
+            "reversal_of_reversal"
+        );
+    }
+
+    #[sqlx::test]
+    async fn reversal_arithmetic_overflow_rolls_back_its_reservation(pool: PgPool) {
+        let original_source = Uuid::new_v4();
+        let original_destination = Uuid::new_v4();
+        let original_id = Uuid::new_v4();
+        insert_test_account(&pool, original_source, "client-123", "USD", 2, i64::MAX).await;
+        insert_test_account(&pool, original_destination, "client-456", "USD", 2, 1).await;
+        sqlx::query(
+            "INSERT INTO transfers (id, source_account_id, destination_account_id, source_currency, destination_currency, source_amount_minor, destination_amount_minor, total_source_debit_minor, kind, initiated_by) VALUES ($1, $2, $3, 'USD', 'USD', 1, 1, 1, 'transfer', 'client-123')",
+        )
+        .bind(original_id)
+        .bind(original_source)
+        .bind(original_destination)
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (account_id, counterparty_account_id, direction) in [
+            (original_source, original_destination, "debit"),
+            (original_destination, original_source, "credit"),
+        ] {
+            sqlx::query(
+                "INSERT INTO account_entries (id, account_id, transfer_id, counterparty_account_id, direction, operation_kind, amount_minor, currency) VALUES ($1, $2, $3, $4, $5::entry_direction, 'transfer', 1, 'USD')",
+            )
+            .bind(Uuid::new_v4())
+            .bind(account_id)
+            .bind(original_id)
+            .bind(counterparty_account_id)
+            .bind(direction)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let token = token(
+            Some("client-456"),
+            4_102_444_800,
+            "https://issuer.example",
+            "ledger",
+        );
+        let response =
+            reversal_response(pool.clone(), &token, "overflow-reversal", original_id).await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &to_bytes(response.into_body(), usize::MAX).await.unwrap()
+            )
+            .unwrap()["error"]["code"],
+            "arithmetic_overflow"
+        );
+        for (id, balance) in [(original_source, i64::MAX), (original_destination, 1)] {
+            assert_eq!(
+                sqlx::query_as::<_, (i64, i64)>(
+                    "SELECT balance_minor, version FROM accounts WHERE id = $1"
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+                (balance, 0)
+            );
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM transfers WHERE kind = 'reversal'")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM account_entries WHERE operation_kind = 'reversal'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM idempotency_records WHERE operation_type = 'reversal' AND idempotency_key = 'overflow-reversal'").fetch_one(&pool).await.unwrap(), 0);
     }
 
     #[sqlx::test]

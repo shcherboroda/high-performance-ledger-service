@@ -9,6 +9,7 @@ use crate::api_error::AppError;
 
 pub const ACCOUNT_CREATION_OPERATION: &str = "account_creation";
 pub const TRANSFER_OPERATION: &str = "transfer";
+pub const REVERSAL_OPERATION: &str = "reversal";
 pub const IDEMPOTENCY_KEY_HEADER: HeaderName = HeaderName::from_static("idempotency-key");
 const MAX_KEY_LENGTH: usize = 255;
 
@@ -77,6 +78,13 @@ pub fn transfer_fingerprint(
     hasher.update(destination_account_id.as_bytes());
     hasher.update(currency.as_bytes());
     hasher.update(amount_minor.to_be_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn reversal_fingerprint(original_transfer_id: Uuid) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"reversal:v1:");
+    hasher.update(original_transfer_id.as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
@@ -264,6 +272,19 @@ mod tests {
         assert_ne!(
             fingerprint,
             transfer_fingerprint(source, destination, "USD", 1021)
+        );
+    }
+
+    #[test]
+    fn reversal_fingerprint_covers_the_original_transfer() {
+        let original = Uuid::new_v4();
+        assert_eq!(
+            reversal_fingerprint(original),
+            reversal_fingerprint(original)
+        );
+        assert_ne!(
+            reversal_fingerprint(original),
+            reversal_fingerprint(Uuid::new_v4())
         );
     }
 
