@@ -31,7 +31,7 @@ The service validates externally issued RS256 bearer tokens only. It verifies th
 expiration, issuer, audience, and a nonblank `sub` client identifier; it does not issue, refresh,
 store, or revoke tokens.
 
-Optional variables are `BIND_ADDRESS` (default `0.0.0.0:3000`), `DB_MAX_CONNECTIONS` (10), `DB_MIN_CONNECTIONS` (0), `DB_ACQUIRE_TIMEOUT_SECS` (5), `DB_CONNECT_TIMEOUT_SECS` (5), and `RUST_LOG` (info). All numeric timeout values are positive seconds.
+Optional variables are `BIND_ADDRESS` (default `0.0.0.0:3000`), `DB_MAX_CONNECTIONS` (10), `DB_MIN_CONNECTIONS` (0), `DB_ACQUIRE_TIMEOUT_SECS` (5), `DB_CONNECT_TIMEOUT_SECS` (5), `IDEMPOTENCY_RETENTION_SECS` (86400), and `RUST_LOG` (info). All numeric timeout and retention values are positive seconds. Successful idempotency results are retained for this duration; failures are never retained.
 
 In another shell, verify process health and database readiness:
 

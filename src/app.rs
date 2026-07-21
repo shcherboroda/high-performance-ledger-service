@@ -1,9 +1,9 @@
-use std::sync::LazyLock;
+use std::{sync::LazyLock, time::Duration};
 
 use axum::{
     Json, Router,
     extract::{Path, State, rejection::JsonRejection},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
 };
@@ -17,6 +17,7 @@ use uuid::Uuid;
 use crate::{
     api_error::{ApiErrorBody, AppError, ErrorEnvelope},
     auth::{AuthVerifier, AuthenticatedClient},
+    idempotency::{self, IdempotencyKey, Reservation},
     money::{MoneyError, currency, format_minor_units, parse_initial_balance},
 };
 
@@ -27,9 +28,18 @@ pub const SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct AppState {
     pub pool: PgPool,
     pub auth: AuthVerifier,
+    pub idempotency_retention: Duration,
 }
 
 pub fn router(pool: PgPool, auth: AuthVerifier) -> Router {
+    router_with_idempotency_retention(pool, auth, Duration::from_secs(24 * 60 * 60))
+}
+
+pub fn router_with_idempotency_retention(
+    pool: PgPool,
+    auth: AuthVerifier,
+    idempotency_retention: Duration,
+) -> Router {
     let router = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
@@ -39,7 +49,11 @@ pub fn router(pool: PgPool, auth: AuthVerifier) -> Router {
 
     #[cfg(test)]
     let router = router.route("/_test/authenticated", get(test_authenticated));
-    router.with_state(AppState { pool, auth })
+    router.with_state(AppState {
+        pool,
+        auth,
+        idempotency_retention,
+    })
 }
 
 #[cfg(test)]
@@ -115,19 +129,23 @@ struct AccountBalanceResponse {
     post,
     path = "/accounts",
     request_body = CreateAccountRequest,
+    params(("Idempotency-Key" = String, Header, description = "Visible ASCII key, 1 to 255 characters")),
     security(("bearerAuth" = [])),
     responses(
-        (status = 201, description = "Account created", body = AccountCreatedResponse),
-        (status = 400, description = "Invalid currency or initial balance", body = ErrorEnvelope),
+        (status = 201, description = "Account created or stored successful replay", body = AccountCreatedResponse),
+        (status = 400, description = "Invalid currency, initial balance, or Idempotency-Key", body = ErrorEnvelope),
         (status = 401, description = "Authentication is required", body = ErrorEnvelope),
+        (status = 409, description = "Idempotency key was previously used with a different request", body = ErrorEnvelope),
         (status = 500, description = "Internal failure", body = ErrorEnvelope)
     )
 )]
 async fn create_account(
     State(state): State<AppState>,
     AuthenticatedClient { client_id }: AuthenticatedClient,
+    headers: HeaderMap,
     request: Result<Json<CreateAccountRequest>, JsonRejection>,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<axum::response::Response, AppError> {
+    let idempotency_key = IdempotencyKey::from_headers(&headers)?;
     let Json(request) =
         request.map_err(|_| AppError::validation("invalid_json", "The request body is invalid"))?;
     let currency = currency(&request.currency).ok_or_else(|| {
@@ -135,26 +153,62 @@ async fn create_account(
     })?;
     let balance_minor =
         parse_initial_balance(&request.initial_balance, currency.scale()).map_err(money_error)?;
-    let (id,): (Uuid,) = sqlx::query_as(
-        "INSERT INTO accounts (id, owner_id, currency, currency_scale, balance_minor) \
-         VALUES (DEFAULT, $1, $2, $3, $4) \
-         RETURNING id",
+    let fingerprint = idempotency::account_creation_fingerprint(currency.code(), balance_minor);
+    let mut transaction = state.pool.begin().await.map_err(AppError::internal)?;
+    match idempotency::reserve(
+        &mut transaction,
+        &client_id,
+        idempotency::ACCOUNT_CREATION_OPERATION,
+        &idempotency_key,
+        &fingerprint,
+        state.idempotency_retention,
     )
-    .bind(client_id)
+    .await
+    .map_err(AppError::internal)?
+    {
+        Reservation::Replay {
+            http_status,
+            response_body,
+        } => {
+            transaction.commit().await.map_err(AppError::internal)?;
+            let status = StatusCode::from_u16(http_status as u16).map_err(AppError::internal)?;
+            return Ok((status, Json(response_body)).into_response());
+        }
+        Reservation::Conflict => return Err(AppError::idempotency_conflict()),
+        Reservation::Owned => {}
+    }
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO accounts (id, owner_id, currency, currency_scale, balance_minor) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(id)
+    .bind(&client_id)
     .bind(currency.code())
     .bind(i16::from(currency.scale()))
     .bind(balance_minor)
-    .fetch_one(&state.pool)
+    .execute(&mut *transaction)
     .await
     .map_err(AppError::internal)?;
-    Ok((
-        StatusCode::CREATED,
-        Json(AccountCreatedResponse {
-            id,
-            currency: currency.code().to_owned(),
-            balance: format_minor_units(balance_minor, currency.scale()),
-        }),
-    ))
+    let response_body = serde_json::to_value(AccountCreatedResponse {
+        id,
+        currency: currency.code().to_owned(),
+        balance: format_minor_units(balance_minor, currency.scale()),
+    })
+    .map_err(AppError::internal)?;
+    idempotency::store_success(
+        &mut transaction,
+        &client_id,
+        idempotency::ACCOUNT_CREATION_OPERATION,
+        &idempotency_key,
+        StatusCode::CREATED.as_u16().into(),
+        &response_body,
+        id,
+    )
+    .await
+    .map_err(AppError::internal)?;
+    transaction.commit().await.map_err(AppError::internal)?;
+    Ok((StatusCode::CREATED, Json(response_body)).into_response())
 }
 
 #[utoipa::path(
@@ -337,10 +391,22 @@ mod tests {
         token: &str,
         body: Option<Value>,
     ) -> axum::response::Response {
+        account_response_with_key(pool, method, uri, token, "test-idempotency-key", body).await
+    }
+
+    async fn account_response_with_key(
+        pool: PgPool,
+        method: &str,
+        uri: &str,
+        token: &str,
+        idempotency_key: &str,
+        body: Option<Value>,
+    ) -> axum::response::Response {
         let mut builder = Request::builder()
             .method(method)
             .uri(uri)
-            .header("authorization", format!("Bearer {token}"));
+            .header("authorization", format!("Bearer {token}"))
+            .header("idempotency-key", idempotency_key);
         let body = match body {
             Some(body) => {
                 builder = builder.header("content-type", "application/json");
@@ -727,6 +793,7 @@ mod tests {
         ] {
             let request = Request::post("/accounts")
                 .header("authorization", format!("Bearer {token}"))
+                .header("idempotency-key", "test-idempotency-key")
                 .header("content-type", "application/json")
                 .body(Body::from(body))
                 .unwrap();
@@ -863,6 +930,292 @@ mod tests {
         assert_eq!(
             to_bytes(other.into_body(), usize::MAX).await.unwrap(),
             to_bytes(missing.into_body(), usize::MAX).await.unwrap()
+        );
+    }
+
+    #[sqlx::test]
+    async fn account_creation_replays_success_and_scopes_keys_by_client(pool: PgPool) {
+        let owner_token = token(
+            Some("client-123"),
+            4_102_444_800,
+            "https://issuer.example",
+            "ledger",
+        );
+        let other_token = token(
+            Some("client-456"),
+            4_102_444_800,
+            "https://issuer.example",
+            "ledger",
+        );
+        let first = account_response_with_key(
+            pool.clone(),
+            "POST",
+            "/accounts",
+            &owner_token,
+            "account-key",
+            Some(json!({"currency":" pln ", "initial_balance":"10.2"})),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+
+        let replay = account_response_with_key(
+            pool.clone(),
+            "POST",
+            "/accounts",
+            &owner_token,
+            "account-key",
+            Some(json!({"currency":"PLN", "initial_balance":"10.20"})),
+        )
+        .await;
+        assert_eq!(replay.status(), StatusCode::CREATED);
+        assert_eq!(
+            to_bytes(replay.into_body(), usize::MAX).await.unwrap(),
+            first_body
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM accounts")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM idempotency_records WHERE http_status = 201 AND response_body IS NOT NULL").fetch_one(&pool).await.unwrap(), 1);
+
+        let conflict = account_response_with_key(
+            pool.clone(),
+            "POST",
+            "/accounts",
+            &owner_token,
+            "account-key",
+            Some(json!({"currency":"USD", "initial_balance":"10.20"})),
+        )
+        .await;
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let conflict_body: Value =
+            serde_json::from_slice(&to_bytes(conflict.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(conflict_body["error"]["code"], "idempotency_conflict");
+
+        let other_client = account_response_with_key(
+            pool.clone(),
+            "POST",
+            "/accounts",
+            &other_token,
+            "account-key",
+            Some(json!({"currency":"USD", "initial_balance":"10.20"})),
+        )
+        .await;
+        assert_eq!(other_client.status(), StatusCode::CREATED);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM accounts")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    #[sqlx::test]
+    async fn failed_account_creation_does_not_retain_an_idempotency_reservation(pool: PgPool) {
+        let owner_token = token(
+            Some("client-123"),
+            4_102_444_800,
+            "https://issuer.example",
+            "ledger",
+        );
+        let failed = account_response_with_key(
+            pool.clone(),
+            "POST",
+            "/accounts",
+            &owner_token,
+            "retry-key",
+            Some(json!({"currency":"PLN", "initial_balance":"-1"})),
+        )
+        .await;
+        assert_eq!(failed.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM idempotency_records")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        let retry = account_response_with_key(
+            pool.clone(),
+            "POST",
+            "/accounts",
+            &owner_token,
+            "retry-key",
+            Some(json!({"currency":"PLN", "initial_balance":"1"})),
+        )
+        .await;
+        assert_eq!(retry.status(), StatusCode::CREATED);
+    }
+
+    #[sqlx::test]
+    async fn failed_owning_account_creation_rolls_back_its_reservation(pool: PgPool) {
+        sqlx::query(
+            "CREATE FUNCTION reject_test_account_creation() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN RAISE EXCEPTION 'forced account creation failure'; END; $$",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER reject_test_account_creation BEFORE INSERT ON accounts \
+             FOR EACH ROW EXECUTE FUNCTION reject_test_account_creation()",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let owner_token = token(
+            Some("client-123"),
+            4_102_444_800,
+            "https://issuer.example",
+            "ledger",
+        );
+        let failed = account_response_with_key(
+            pool.clone(),
+            "POST",
+            "/accounts",
+            &owner_token,
+            "owning-retry-key",
+            Some(json!({"currency":"PLN", "initial_balance":"1"})),
+        )
+        .await;
+        assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM accounts")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM idempotency_records")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+
+        sqlx::query("DROP TRIGGER reject_test_account_creation ON accounts")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP FUNCTION reject_test_account_creation()")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let retry = account_response_with_key(
+            pool.clone(),
+            "POST",
+            "/accounts",
+            &owner_token,
+            "owning-retry-key",
+            Some(json!({"currency":"PLN", "initial_balance":"1"})),
+        )
+        .await;
+        assert_eq!(retry.status(), StatusCode::CREATED);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM accounts")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[sqlx::test]
+    async fn concurrent_identical_account_creation_has_one_side_effect(pool: PgPool) {
+        let owner_token = token(
+            Some("client-123"),
+            4_102_444_800,
+            "https://issuer.example",
+            "ledger",
+        );
+        let request = json!({"currency":"PLN", "initial_balance":"1"});
+        let (first, second) = tokio::join!(
+            account_response_with_key(
+                pool.clone(),
+                "POST",
+                "/accounts",
+                &owner_token,
+                "concurrent-key",
+                Some(request.clone())
+            ),
+            account_response_with_key(
+                pool.clone(),
+                "POST",
+                "/accounts",
+                &owner_token,
+                "concurrent-key",
+                Some(request)
+            ),
+        );
+        assert_eq!(first.status(), StatusCode::CREATED);
+        assert_eq!(second.status(), StatusCode::CREATED);
+        assert_eq!(
+            to_bytes(first.into_body(), usize::MAX).await.unwrap(),
+            to_bytes(second.into_body(), usize::MAX).await.unwrap()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM accounts")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM idempotency_records WHERE http_status IS NULL"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+    }
+
+    #[sqlx::test]
+    async fn concurrent_different_account_creation_fingerprints_conflict(pool: PgPool) {
+        let owner_token = token(
+            Some("client-123"),
+            4_102_444_800,
+            "https://issuer.example",
+            "ledger",
+        );
+        let (first, second) = tokio::join!(
+            account_response_with_key(
+                pool.clone(),
+                "POST",
+                "/accounts",
+                &owner_token,
+                "conflict-key",
+                Some(json!({"currency":"PLN", "initial_balance":"1"})),
+            ),
+            account_response_with_key(
+                pool.clone(),
+                "POST",
+                "/accounts",
+                &owner_token,
+                "conflict-key",
+                Some(json!({"currency":"USD", "initial_balance":"1"})),
+            ),
+        );
+        assert!(
+            (first.status() == StatusCode::CREATED && second.status() == StatusCode::CONFLICT)
+                || (first.status() == StatusCode::CONFLICT
+                    && second.status() == StatusCode::CREATED)
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM accounts")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
         );
     }
 }

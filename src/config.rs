@@ -10,6 +10,7 @@ pub struct Config {
     pub pool: PoolConfig,
     pub log_filter: String,
     pub auth: AuthConfig,
+    pub idempotency_retention: Duration,
 }
 
 impl fmt::Debug for Config {
@@ -21,6 +22,7 @@ impl fmt::Debug for Config {
             .field("pool", &self.pool)
             .field("log_filter", &self.log_filter)
             .field("auth", &"[REDACTED]")
+            .field("idempotency_retention", &self.idempotency_retention)
             .finish()
     }
 }
@@ -97,6 +99,11 @@ impl Config {
             },
             log_filter: optional(&values, "RUST_LOG", "info").to_owned(),
             auth,
+            idempotency_retention: parse_seconds(
+                &values,
+                "IDEMPOTENCY_RETENTION_SECS",
+                24 * 60 * 60,
+            )?,
         })
     }
 }
@@ -170,6 +177,7 @@ mod tests {
         assert_eq!(config.pool.max_connections, 10);
         assert_eq!(config.pool.min_connections, 0);
         assert_eq!(config.pool.acquire_timeout, Duration::from_secs(5));
+        assert_eq!(config.idempotency_retention, Duration::from_secs(86_400));
     }
 
     #[test]
@@ -206,5 +214,15 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(address.to_string().contains("BIND_ADDRESS"));
+    }
+
+    #[test]
+    fn rejects_invalid_idempotency_retention() {
+        let error = Config::from_values(required_values(&[
+            ("DATABASE_URL", "postgres://localhost/ledger"),
+            ("IDEMPOTENCY_RETENTION_SECS", "0"),
+        ]))
+        .unwrap_err();
+        assert!(error.to_string().contains("IDEMPOTENCY_RETENTION_SECS"));
     }
 }

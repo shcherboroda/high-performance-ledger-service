@@ -54,6 +54,7 @@ pub enum AppError {
     Forbidden,
     NotFound,
     Conflict,
+    IdempotencyConflict,
     ServiceUnavailable,
     Internal {
         source: Error,
@@ -80,6 +81,9 @@ impl AppError {
     }
     pub fn conflict() -> Self {
         Self::Conflict
+    }
+    pub fn idempotency_conflict() -> Self {
+        Self::IdempotencyConflict
     }
     pub fn service_unavailable() -> Self {
         Self::ServiceUnavailable
@@ -120,6 +124,14 @@ impl AppError {
             Self::Conflict => (
                 StatusCode::CONFLICT,
                 ErrorEnvelope::new("conflict", "The request conflicts with current state", None),
+            ),
+            Self::IdempotencyConflict => (
+                StatusCode::CONFLICT,
+                ErrorEnvelope::new(
+                    "idempotency_conflict",
+                    "The Idempotency-Key was already used for a different request",
+                    None,
+                ),
             ),
             Self::ServiceUnavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
