@@ -25,9 +25,12 @@ async fn run() -> Result<()> {
     let pool = db::create_pool(&config.database_url, &config.pool).await?;
     let listener = tokio::net::TcpListener::bind(config.bind_address).await?;
     info!(address = %config.bind_address, "server listening");
-    axum::serve(listener, app::router(pool, auth))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app::router_with_idempotency_retention(pool, auth, config.idempotency_retention),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     Ok(())
 }
 
