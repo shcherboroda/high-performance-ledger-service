@@ -519,8 +519,8 @@ A business or technical failure commits none of them.
 ## 15. API outline
 
 ```text
-POST /v1/accounts
-GET  /v1/accounts/{account_id}/balance
+POST /accounts
+GET  /accounts/{account_id}/balance
 
 POST /v1/transfers
 POST /v1/fx-transfers
