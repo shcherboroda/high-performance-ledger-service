@@ -2,7 +2,7 @@ use std::sync::LazyLock;
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, State, rejection::JsonRejection},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -12,6 +12,7 @@ use sqlx::PgPool;
 use tracing::error;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi, ToSchema};
+use uuid::Uuid;
 
 use crate::{
     api_error::{ApiErrorBody, AppError, ErrorEnvelope},
@@ -93,8 +94,7 @@ struct CreateAccountRequest {
 
 #[derive(Serialize, ToSchema)]
 struct AccountCreatedResponse {
-    #[schema(example = "550e8400-e29b-41d4-a716-446655440000")]
-    id: String,
+    id: Uuid,
     #[schema(example = "PLN")]
     currency: String,
     #[schema(value_type = String, example = "10.25")]
@@ -103,8 +103,7 @@ struct AccountCreatedResponse {
 
 #[derive(Serialize, ToSchema)]
 struct AccountBalanceResponse {
-    #[schema(example = "550e8400-e29b-41d4-a716-446655440000")]
-    id: String,
+    id: Uuid,
     #[schema(example = "PLN")]
     currency: String,
     #[schema(value_type = String, example = "10.25")]
@@ -127,17 +126,19 @@ struct AccountBalanceResponse {
 async fn create_account(
     State(state): State<AppState>,
     AuthenticatedClient { client_id }: AuthenticatedClient,
-    Json(request): Json<CreateAccountRequest>,
+    request: Result<Json<CreateAccountRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, AppError> {
+    let Json(request) =
+        request.map_err(|_| AppError::validation("invalid_json", "The request body is invalid"))?;
     let currency = currency(&request.currency).ok_or_else(|| {
         AppError::validation("unsupported_currency", "The currency is not supported")
     })?;
     let balance_minor =
         parse_initial_balance(&request.initial_balance, currency.scale()).map_err(money_error)?;
-    let (id,): (String,) = sqlx::query_as(
+    let (id,): (Uuid,) = sqlx::query_as(
         "INSERT INTO accounts (id, owner_id, currency, currency_scale, balance_minor) \
-         VALUES (md5(random()::text || clock_timestamp()::text)::uuid, $1, $2, $3, $4) \
-         RETURNING id::text",
+         VALUES (DEFAULT, $1, $2, $3, $4) \
+         RETURNING id",
     )
     .bind(client_id)
     .bind(currency.code())
@@ -174,24 +175,20 @@ async fn get_balance(
     AuthenticatedClient { client_id }: AuthenticatedClient,
     Path(account_id): Path<String>,
 ) -> Result<Json<AccountBalanceResponse>, AppError> {
-    if !is_uuid(&account_id) {
-        return Err(AppError::validation(
-            "malformed_account_id",
-            "The account ID is invalid",
-        ));
-    }
+    let id = Uuid::parse_str(&account_id)
+        .map_err(|_| AppError::validation("malformed_account_id", "The account ID is invalid"))?;
     let account = sqlx::query_as::<_, (String, i16, i64, i64)>(
         "SELECT currency, currency_scale, balance_minor, version \
-         FROM accounts WHERE id = $1::uuid AND owner_id = $2",
+         FROM accounts WHERE id = $1 AND owner_id = $2",
     )
-    .bind(&account_id)
+    .bind(id)
     .bind(client_id)
     .fetch_optional(&state.pool)
     .await
     .map_err(AppError::internal)?
     .ok_or_else(AppError::not_found)?;
     Ok(Json(AccountBalanceResponse {
-        id: account_id,
+        id,
         currency: account.0,
         balance: format_minor_units(account.2, account.1 as u8),
         version: account.3,
@@ -215,17 +212,6 @@ fn money_error(error: MoneyError) -> AppError {
             AppError::validation("amount_overflow", "The amount is out of range")
         }
     }
-}
-
-fn is_uuid(value: &str) -> bool {
-    value.len() == 36
-        && value.bytes().enumerate().all(|(index, byte)| {
-            if matches!(index, 8 | 13 | 18 | 23) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_hexdigit()
-            }
-        })
 }
 
 #[derive(OpenApi)]
@@ -275,6 +261,7 @@ mod tests {
     use serde_json::{Map, Value, json};
     use sqlx::{PgPool, postgres::PgPoolOptions};
     use tower::ServiceExt;
+    use uuid::Uuid;
 
     use crate::{api_error::AppError, auth::AuthVerifier, config::AuthConfig};
 
@@ -723,6 +710,72 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn json_extraction_failures_use_the_shared_safe_error_envelope() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/ledger")
+            .unwrap();
+        let token = token(
+            Some("client-123"),
+            4_102_444_800,
+            "https://issuer.example",
+            "ledger",
+        );
+        for body in [
+            r#"{"currency":"PLN","initial_balance":}"#,
+            r#"{"currency":"PLN","initial_balance":1}"#,
+        ] {
+            let request = Request::post("/accounts")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let response = router(pool.clone(), test_auth())
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(
+                response.headers()["content-type"]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("application/json")
+            );
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(
+                std::str::from_utf8(&body).unwrap(),
+                r#"{"error":{"code":"invalid_json","message":"The request body is invalid","details":null,"request_id":null}}"#
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn account_database_failures_use_the_shared_safe_error_envelope() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://user:password@127.0.0.1:1/ledger")
+            .unwrap();
+        let token = token(
+            Some("client-123"),
+            4_102_444_800,
+            "https://issuer.example",
+            "ledger",
+        );
+        let response = account_response(
+            pool,
+            "POST",
+            "/accounts",
+            &token,
+            Some(json!({"currency":"PLN", "initial_balance":"0"})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            r#"{"error":{"code":"internal_error","message":"An internal error occurred","details":null,"request_id":null}}"#
+        );
+    }
+
     #[sqlx::test]
     async fn accounts_are_created_owned_and_read_without_information_leaks(pool: PgPool) {
         let owner_token = token(
@@ -751,9 +804,9 @@ mod tests {
                 .unwrap();
         assert_eq!(created["currency"], "PLN");
         assert_eq!(created["balance"], "0.00");
-        let id = created["id"].as_str().unwrap();
-        let persisted: (String, String, String, i16, i64, String, i64) = sqlx::query_as(
-            "SELECT id::text, owner_id, currency, currency_scale, balance_minor, status::text, version FROM accounts WHERE id = $1::uuid",
+        let id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+        let persisted: (Uuid, String, String, i16, i64, String, i64) = sqlx::query_as(
+            "SELECT id, owner_id, currency, currency_scale, balance_minor, status::text, version FROM accounts WHERE id = $1",
         )
         .bind(id)
         .fetch_one(&pool)
@@ -762,7 +815,7 @@ mod tests {
         assert_eq!(
             persisted,
             (
-                id.to_owned(),
+                id,
                 "client-123".to_owned(),
                 "PLN".to_owned(),
                 2,
