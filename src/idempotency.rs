@@ -89,6 +89,28 @@ pub enum Reservation {
     Conflict,
 }
 
+pub async fn completed_success(
+    transaction: &mut Transaction<'_, Postgres>,
+    client_id: &str,
+    operation_type: &str,
+    key: &IdempotencyKey,
+) -> Result<Option<(String, i32, serde_json::Value)>, sqlx::Error> {
+    let record = sqlx::query_as::<_, (String, Option<i32>, Option<serde_json::Value>)>(
+        "SELECT request_fingerprint, http_status, response_body \
+         FROM idempotency_records WHERE client_id = $1 AND operation_type = $2 AND idempotency_key = $3",
+    )
+    .bind(client_id)
+    .bind(operation_type)
+    .bind(key.as_str())
+    .fetch_optional(&mut **transaction)
+    .await?;
+    Ok(record.map(|(fingerprint, http_status, response_body)| {
+        let http_status = http_status.expect("incomplete idempotency records cannot commit");
+        let response_body = response_body.expect("incomplete idempotency records cannot commit");
+        (fingerprint, http_status, response_body)
+    }))
+}
+
 pub async fn reserve(
     transaction: &mut Transaction<'_, Postgres>,
     client_id: &str,
