@@ -1,0 +1,108 @@
+use super::support::*;
+
+fn assert_local_schema_references_resolve(value: &Value, schemas: &Map<String, Value>) {
+    match value {
+        Value::Object(object) => {
+            if let Some(reference) = object.get("$ref").and_then(Value::as_str)
+                && let Some(name) = reference.strip_prefix("#/components/schemas/")
+            {
+                assert!(
+                    schemas.contains_key(name),
+                    "unresolved schema reference: {reference}"
+                );
+            }
+            for value in object.values() {
+                assert_local_schema_references_resolve(value, schemas);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                assert_local_schema_references_resolve(value, schemas);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[tokio::test]
+async fn openapi_serves_documented_api_contract() {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/ledger")
+        .unwrap();
+    let response = router(pool, test_auth())
+        .oneshot(Request::get("/openapi.json").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("application/json")
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let document: Value = serde_json::from_slice(&body).unwrap();
+    assert!(document["openapi"].as_str().unwrap().starts_with("3.1"));
+    let paths = document["paths"].as_object().unwrap();
+    assert_eq!(paths.len(), 6);
+    assert!(paths.contains_key("/health"));
+    assert!(paths.contains_key("/ready"));
+    assert!(paths.contains_key("/accounts"));
+    assert!(paths.contains_key("/accounts/{account_id}/balance"));
+    assert!(paths.contains_key("/transfers"));
+    assert!(paths.contains_key("/transfers/{transfer_id}/reversal"));
+    assert!(paths["/ready"]["get"]["responses"].get("200").is_some());
+    assert!(paths["/ready"]["get"]["responses"].get("503").is_some());
+    assert!(paths["/health"]["get"].get("security").is_none());
+    assert!(paths["/ready"]["get"].get("security").is_none());
+    assert_eq!(
+        paths["/accounts"]["post"]["security"][0]["bearerAuth"],
+        json!([])
+    );
+    assert_eq!(
+        paths["/accounts/{account_id}/balance"]["get"]["security"][0]["bearerAuth"],
+        json!([])
+    );
+    assert_eq!(
+        paths["/transfers"]["post"]["security"][0]["bearerAuth"],
+        json!([])
+    );
+    assert_eq!(
+        paths["/transfers/{transfer_id}/reversal"]["post"]["security"][0]["bearerAuth"],
+        json!([])
+    );
+    let reversal = &paths["/transfers/{transfer_id}/reversal"]["post"];
+    assert_eq!(reversal["parameters"][0]["name"], "transfer_id");
+    assert_eq!(reversal["parameters"][0]["in"], "path");
+    assert_eq!(reversal["parameters"][0]["required"], true);
+    assert_eq!(reversal["parameters"][1]["name"], "Idempotency-Key");
+    assert_eq!(reversal["parameters"][1]["in"], "header");
+    assert_eq!(reversal["parameters"][1]["required"], true);
+    for status in ["201", "400", "401", "404", "409", "422", "500"] {
+        assert!(
+            reversal["responses"].get(status).is_some(),
+            "missing {status}"
+        );
+    }
+    assert_eq!(
+        reversal["responses"]["201"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/ReversalCreatedResponse"
+    );
+    let security_schemes = document["components"]["securitySchemes"]
+        .as_object()
+        .unwrap();
+    assert_eq!(security_schemes["bearerAuth"]["type"], "http");
+    assert_eq!(security_schemes["bearerAuth"]["scheme"], "bearer");
+    assert_eq!(security_schemes["bearerAuth"]["bearerFormat"], "JWT");
+    let schemas = document["components"]["schemas"].as_object().unwrap();
+    assert!(schemas.contains_key("ErrorEnvelope"));
+    assert!(schemas.contains_key("ApiErrorBody"));
+    assert!(schemas.contains_key("CreateAccountRequest"));
+    assert!(schemas.contains_key("ReversalCreatedResponse"));
+    assert!(schemas.contains_key("AccountCreatedResponse"));
+    assert!(schemas.contains_key("AccountBalanceResponse"));
+    assert!(schemas.contains_key("CreateTransferRequest"));
+    assert!(schemas.contains_key("TransferCreatedResponse"));
+    assert_local_schema_references_resolve(&document, schemas);
+    assert!(!std::str::from_utf8(&body).unwrap().contains("postgres://"));
+}
