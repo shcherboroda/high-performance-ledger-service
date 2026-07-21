@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::{State, rejection::JsonRejection},
+    extract::{Path, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
@@ -40,6 +40,103 @@ pub(crate) struct TransferCreatedResponse {
     resulting_source_balance: String,
     resulting_destination_balance: String,
     created_at: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub(crate) struct TransferDetailsResponse {
+    id: Uuid,
+    source_account_id: Uuid,
+    destination_account_id: Uuid,
+    source_currency: String,
+    destination_currency: String,
+    #[schema(value_type = String, example = "10.25")]
+    source_amount: String,
+    #[schema(value_type = String, example = "10.25")]
+    destination_amount: String,
+    #[schema(value_type = String, example = "0.00")]
+    fee_amount: String,
+    #[schema(value_type = String, example = "10.25")]
+    total_source_debit: String,
+    fee_bps: Option<i32>,
+    #[schema(value_type = Option<String>, example = "1.083500000000")]
+    exchange_rate: Option<String>,
+    exchange_rate_id: Option<Uuid>,
+    kind: String,
+    reverses_transfer_id: Option<Uuid>,
+    created_at: String,
+}
+
+#[utoipa::path(
+    get,
+    path = "/transfers/{transfer_id}",
+    params(("transfer_id" = String, Path, description = "Transfer UUID")),
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 200, description = "Immutable transfer snapshot", body = TransferDetailsResponse),
+        (status = 400, description = "Invalid transfer ID", body = ErrorEnvelope),
+        (status = 401, description = "Authentication is required", body = ErrorEnvelope),
+        (status = 404, description = "Transfer not found", body = ErrorEnvelope),
+        (status = 500, description = "Internal failure", body = ErrorEnvelope)
+    )
+)]
+pub(crate) async fn get_transfer(
+    State(state): State<AppState>,
+    AuthenticatedClient { client_id }: AuthenticatedClient,
+    Path(transfer_id): Path<String>,
+) -> Result<Json<TransferDetailsResponse>, AppError> {
+    let transfer_id = Uuid::parse_str(&transfer_id)
+        .map_err(|_| AppError::validation("malformed_transfer_id", "The transfer ID is invalid"))?;
+    type TransferRow = (
+        Uuid,
+        Uuid,
+        String,
+        String,
+        i64,
+        i64,
+        i64,
+        i64,
+        Option<i32>,
+        Option<String>,
+        Option<Uuid>,
+        String,
+        Option<Uuid>,
+        String,
+        i16,
+        i16,
+    );
+    let row = sqlx::query_as::<_, TransferRow>(
+        "SELECT t.source_account_id, t.destination_account_id, t.source_currency, t.destination_currency, \
+         t.source_amount_minor, t.destination_amount_minor, t.fee_amount_minor, t.total_source_debit_minor, \
+         t.fee_bps, t.exchange_rate::text, t.exchange_rate_id, t.kind::text, t.reverses_transfer_id, \
+         t.created_at::text, source.currency_scale, destination.currency_scale \
+         FROM transfers t \
+         JOIN accounts source ON source.id = t.source_account_id \
+         JOIN accounts destination ON destination.id = t.destination_account_id \
+         WHERE t.id = $1 AND (source.owner_id = $2 OR destination.owner_id = $2)",
+    )
+    .bind(transfer_id)
+    .bind(client_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(AppError::internal)?
+    .ok_or_else(AppError::not_found)?;
+    Ok(Json(TransferDetailsResponse {
+        id: transfer_id,
+        source_account_id: row.0,
+        destination_account_id: row.1,
+        source_currency: row.2,
+        destination_currency: row.3,
+        source_amount: format_minor_units(row.4, row.14 as u8),
+        destination_amount: format_minor_units(row.5, row.15 as u8),
+        fee_amount: format_minor_units(row.6, row.14 as u8),
+        total_source_debit: format_minor_units(row.7, row.14 as u8),
+        fee_bps: row.8,
+        exchange_rate: row.9,
+        exchange_rate_id: row.10,
+        kind: row.11,
+        reverses_transfer_id: row.12,
+        created_at: row.13,
+    }))
 }
 
 #[derive(Serialize, ToSchema)]

@@ -44,12 +44,14 @@ async fn openapi_serves_documented_api_contract() {
     let document: Value = serde_json::from_slice(&body).unwrap();
     assert!(document["openapi"].as_str().unwrap().starts_with("3.1"));
     let paths = document["paths"].as_object().unwrap();
-    assert_eq!(paths.len(), 6);
+    assert_eq!(paths.len(), 8);
     assert!(paths.contains_key("/health"));
     assert!(paths.contains_key("/ready"));
     assert!(paths.contains_key("/accounts"));
     assert!(paths.contains_key("/accounts/{account_id}/balance"));
+    assert!(paths.contains_key("/accounts/{account_id}/entries"));
     assert!(paths.contains_key("/transfers"));
+    assert!(paths.contains_key("/transfers/{transfer_id}"));
     assert!(paths.contains_key("/transfers/{transfer_id}/reversal"));
     assert!(paths["/ready"]["get"]["responses"].get("200").is_some());
     assert!(paths["/ready"]["get"]["responses"].get("503").is_some());
@@ -65,6 +67,14 @@ async fn openapi_serves_documented_api_contract() {
     );
     assert_eq!(
         paths["/transfers"]["post"]["security"][0]["bearerAuth"],
+        json!([])
+    );
+    assert_eq!(
+        paths["/accounts/{account_id}/entries"]["get"]["security"][0]["bearerAuth"],
+        json!([])
+    );
+    assert_eq!(
+        paths["/transfers/{transfer_id}"]["get"]["security"][0]["bearerAuth"],
         json!([])
     );
     assert_eq!(
@@ -103,6 +113,9 @@ async fn openapi_serves_documented_api_contract() {
     assert!(schemas.contains_key("AccountBalanceResponse"));
     assert!(schemas.contains_key("CreateTransferRequest"));
     assert!(schemas.contains_key("TransferCreatedResponse"));
+    assert!(schemas.contains_key("TransferDetailsResponse"));
+    assert!(schemas.contains_key("AccountEntryResponse"));
+    assert!(schemas.contains_key("AccountHistoryResponse"));
     assert_local_schema_references_resolve(&document, schemas);
     assert!(!std::str::from_utf8(&body).unwrap().contains("postgres://"));
 }
