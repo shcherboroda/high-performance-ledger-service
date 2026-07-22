@@ -51,6 +51,7 @@ async fn openapi_serves_documented_api_contract() {
     assert!(paths.contains_key("/accounts/{account_id}/balance"));
     assert!(paths.contains_key("/accounts/{account_id}/entries"));
     assert!(paths.contains_key("/transfers"));
+    assert!(!paths.contains_key("/fx-transfers"));
     assert!(paths.contains_key("/transfers/{transfer_id}"));
     assert!(paths.contains_key("/transfers/{transfer_id}/reversal"));
     assert!(paths["/ready"]["get"]["responses"].get("200").is_some());
@@ -143,8 +144,13 @@ async fn openapi_serves_documented_api_contract() {
     assert!(schemas.contains_key("AccountHistoryResponse"));
     let transfer_response = &schemas["TransferCreatedResponse"];
     let transfer_properties = transfer_response["properties"].as_object().unwrap();
+    let required = transfer_response["required"].as_array().unwrap();
     for name in [
+        "id",
         "kind",
+        "status",
+        "source_account_id",
+        "destination_account_id",
         "source_currency",
         "source_amount",
         "destination_currency",
@@ -153,6 +159,10 @@ async fn openapi_serves_documented_api_contract() {
         "total_source_debit",
     ] {
         assert!(transfer_properties.contains_key(name), "missing {name}");
+        assert!(
+            required.iter().any(|field| field == name),
+            "not required: {name}"
+        );
     }
     for removed in [
         "currency",
@@ -164,12 +174,49 @@ async fn openapi_serves_documented_api_contract() {
             !transfer_properties.contains_key(removed),
             "deprecated {removed}"
         );
+        assert!(
+            !required.iter().any(|field| field == removed),
+            "deprecated required {removed}"
+        );
     }
     assert!(
         transfer_properties["fee_amount"]
             .to_string()
             .contains("null")
     );
+    assert!(
+        !transfer_properties["destination_currency"]
+            .to_string()
+            .contains("null")
+    );
+    assert!(
+        !transfer_properties["destination_amount"]
+            .to_string()
+            .contains("null")
+    );
+    let kind_schema = if let Some(reference) = transfer_properties["kind"]["$ref"].as_str() {
+        let name = reference.strip_prefix("#/components/schemas/").unwrap();
+        &schemas[name]
+    } else {
+        &transfer_properties["kind"]
+    };
+    assert_eq!(kind_schema["enum"], json!(["transfer", "fx_transfer"]));
+    let transfer_request = &schemas["CreateTransferRequest"];
+    assert_eq!(
+        transfer_request["required"],
+        json!(["source_account_id", "destination_account_id", "amount"])
+    );
+    assert_eq!(
+        paths["/transfers"]["post"]["responses"]["201"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/TransferCreatedResponse"
+    );
+    for status in ["400", "401", "404", "409", "422", "500"] {
+        assert!(
+            paths["/transfers"]["post"]["responses"]
+                .get(status)
+                .is_some()
+        );
+    }
     assert!(
         transfer_properties["total_source_debit"]
             .to_string()

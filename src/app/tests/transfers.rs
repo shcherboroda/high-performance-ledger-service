@@ -15,6 +15,24 @@ async fn transfer_details_response(
     .await
 }
 
+async fn history_response(pool: PgPool, token: &str, account_id: Uuid) -> axum::response::Response {
+    account_response(
+        pool,
+        "GET",
+        &format!("/accounts/{account_id}/entries"),
+        token,
+        None,
+    )
+    .await
+}
+
+async fn assert_business_failure(response: axum::response::Response, expected: &str) {
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], expected);
+}
+
 #[sqlx::test]
 async fn transfer_details_are_visible_to_participants_and_hide_foreign_rows(pool: PgPool) {
     let source = Uuid::new_v4();
@@ -121,6 +139,20 @@ async fn transfer_is_atomic_auditable_and_replayable(pool: PgPool) {
     assert!(body.get("resulting_source_balance").is_none());
     assert!(body.get("resulting_destination_balance").is_none());
     assert_eq!(body["status"], "completed");
+    for field in [
+        "id",
+        "kind",
+        "status",
+        "source_account_id",
+        "destination_account_id",
+        "source_currency",
+        "source_amount",
+        "destination_currency",
+        "destination_amount",
+        "created_at",
+    ] {
+        assert!(!body[field].is_null(), "missing common field {field}");
+    }
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT balance_minor FROM accounts WHERE id = $1")
             .bind(source)
@@ -171,6 +203,27 @@ async fn transfer_is_atomic_auditable_and_replayable(pool: PgPool) {
         1
     );
     assert_eq!(
+        sqlx::query_as::<_, (String, String, String, i64, i64, i64, i64, Option<i32>, Option<String>, Option<Uuid>)>(
+            "SELECT kind::text, source_currency, destination_currency, source_amount_minor, destination_amount_minor, fee_amount_minor, total_source_debit_minor, fee_bps, exchange_rate::text, exchange_rate_id FROM transfers",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        ("transfer".into(), "USD".into(), "USD".into(), 1_020, 1_020, 0, 1_020, None, None, None)
+    );
+    assert_eq!(
+        sqlx::query_as::<_, (String, String, i64, Option<i64>, Option<i64>, String)>(
+            "SELECT direction::text, currency, amount_minor, principal_amount_minor, fee_amount_minor, operation_kind::text FROM account_entries ORDER BY direction",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap(),
+        vec![
+            ("credit".into(), "USD".into(), 1_020, None, None, "transfer".into()),
+            ("debit".into(), "USD".into(), 1_020, None, None, "transfer".into()),
+        ]
+    );
+    assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM account_entries WHERE direction = 'credit'"
         )
@@ -200,12 +253,13 @@ async fn cross_currency_transfer_uses_persisted_rate_fee_and_replays(pool: PgPoo
     let source = Uuid::new_v4();
     let destination = Uuid::new_v4();
     let rate_id = Uuid::new_v4();
+    let fee_id = Uuid::new_v4();
     insert_test_account(&pool, source, "client-123", "EUR", 2, 20_000).await;
     insert_test_account(&pool, destination, "client-456", "PLN", 2, 0).await;
     sqlx::query("INSERT INTO exchange_rates (id, source_currency, destination_currency, rate, valid_from, valid_until) VALUES ($1, 'EUR', 'PLN', 4.3215, now() - interval '1 hour', now() + interval '1 hour')")
         .bind(rate_id).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO fx_fee_rules (id, fee_bps, valid_from, valid_until) VALUES ($1, 100, now() - interval '1 hour', now() + interval '1 hour')")
-        .bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+        .bind(fee_id).execute(&pool).await.unwrap();
     let owner_token = token(
         Some("client-123"),
         4_102_444_800,
@@ -226,17 +280,51 @@ async fn cross_currency_transfer_uses_persisted_rate_fee_and_replays(pool: PgPoo
     assert_eq!(sqlx::query_as::<_, (i64, i64, i64, i64, Option<i32>, Option<Uuid>, String)>(
         "SELECT source_amount_minor, destination_amount_minor, fee_amount_minor, total_source_debit_minor, fee_bps, exchange_rate_id, kind::text FROM transfers WHERE id = $1")
         .bind(id).fetch_one(&pool).await.unwrap(), (10_000, 43_215, 100, 10_100, Some(100), Some(rate_id), "fx_transfer".into()));
-    let replay = transfer_response(pool.clone(), &owner_token, "fx-transfer", request).await;
-    assert_eq!(replay.status(), StatusCode::CREATED);
     assert_eq!(
-        to_bytes(replay.into_body(), usize::MAX).await.unwrap(),
-        first_body
+        sqlx::query_as::<_, (String, String, i64, Option<i64>, Option<i64>, String)>(
+            "SELECT direction::text, currency, amount_minor, principal_amount_minor, fee_amount_minor, operation_kind::text FROM account_entries WHERE transfer_id = $1 ORDER BY direction",
+        )
+        .bind(id)
+        .fetch_all(&pool)
+        .await
+        .unwrap(),
+        vec![
+            ("credit".into(), "PLN".into(), 43_215, Some(43_215), None, "fx_transfer".into()),
+            ("debit".into(), "EUR".into(), 10_100, Some(10_000), Some(100), "fx_transfer".into()),
+        ]
     );
+    let details = transfer_details_response(pool.clone(), &owner_token, id).await;
+    let details: Value =
+        serde_json::from_slice(&to_bytes(details.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(details["exchange_rate"], "4.321500000000");
+    assert_eq!(details["exchange_rate_id"], rate_id.to_string());
+    assert_eq!(details["fee_bps"], 100);
+    assert_eq!(details["fee_amount"], "1.00");
+    assert_eq!(details["total_source_debit"], "101.00");
     let destination_token = token(
         Some("client-456"),
         4_102_444_800,
         "https://issuer.example",
         "ledger",
+    );
+    for (token, account_id, currency, amount, direction) in [
+        (&owner_token, source, "EUR", "101.00", "debit"),
+        (&destination_token, destination, "PLN", "432.15", "credit"),
+    ] {
+        let response = history_response(pool.clone(), token, account_id).await;
+        let history: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(history["items"][0]["currency"], currency);
+        assert_eq!(history["items"][0]["amount"], amount);
+        assert_eq!(history["items"][0]["direction"], direction);
+        assert_eq!(history["items"][0]["operation_kind"], "fx_transfer");
+    }
+    let replay = transfer_response(pool.clone(), &owner_token, "fx-transfer", request).await;
+    assert_eq!(replay.status(), StatusCode::CREATED);
+    assert_eq!(
+        to_bytes(replay.into_body(), usize::MAX).await.unwrap(),
+        first_body
     );
     sqlx::query(
         "UPDATE exchange_rates SET valid_until = now() - interval '1 minute' WHERE id = $1",
@@ -245,6 +333,11 @@ async fn cross_currency_transfer_uses_persisted_rate_fee_and_replays(pool: PgPoo
     .execute(&pool)
     .await
     .unwrap();
+    sqlx::query("UPDATE fx_fee_rules SET valid_until = now() - interval '1 minute' WHERE id = $1")
+        .bind(fee_id)
+        .execute(&pool)
+        .await
+        .unwrap();
     let reversal = reversal_response(pool.clone(), &destination_token, "fx-reversal", id).await;
     assert_eq!(reversal.status(), StatusCode::CREATED);
     assert_eq!(
@@ -263,6 +356,224 @@ async fn cross_currency_transfer_uses_persisted_rate_fee_and_replays(pool: PgPoo
             .unwrap(),
         0
     );
+}
+
+#[sqlx::test]
+async fn fx_configuration_failures_are_structured_and_rollback(pool: PgPool) {
+    let source = Uuid::new_v4();
+    let destination = Uuid::new_v4();
+    insert_test_account(&pool, source, "client-123", "EUR", 2, 10_000).await;
+    insert_test_account(&pool, destination, "client-456", "PLN", 2, 0).await;
+    let owner_token = token(
+        Some("client-123"),
+        4_102_444_800,
+        "https://issuer.example",
+        "ledger",
+    );
+    let request = json!({"source_account_id": source, "destination_account_id": destination, "amount": "1.00"});
+    assert_business_failure(
+        transfer_response(pool.clone(), &owner_token, "missing-rate", request.clone()).await,
+        "rate_unavailable",
+    )
+    .await;
+    sqlx::query("INSERT INTO exchange_rates (id, source_currency, destination_currency, rate, valid_from, valid_until) VALUES ($1, 'PLN', 'EUR', 1, now() - interval '1 hour', now() + interval '1 hour')")
+        .bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO fx_fee_rules (id, fee_bps, valid_from, valid_until) VALUES ($1, 0, now() - interval '1 hour', now() + interval '1 hour')")
+        .bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    assert_business_failure(
+        transfer_response(pool.clone(), &owner_token, "reverse-rate", request.clone()).await,
+        "rate_unavailable",
+    )
+    .await;
+    sqlx::query("DELETE FROM exchange_rates")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        sqlx::query("INSERT INTO exchange_rates (id, source_currency, destination_currency, rate, valid_from, valid_until) VALUES ($1, 'EUR', 'PLN', 1, now() - interval '1 hour', now() + interval '1 hour')")
+            .bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    }
+    assert_business_failure(
+        transfer_response(
+            pool.clone(),
+            &owner_token,
+            "ambiguous-rate",
+            request.clone(),
+        )
+        .await,
+        "rate_configuration_ambiguous",
+    )
+    .await;
+    sqlx::query("DELETE FROM exchange_rates")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO exchange_rates (id, source_currency, destination_currency, rate, valid_from, valid_until) VALUES ($1, 'EUR', 'PLN', 1, now() - interval '1 hour', now() + interval '1 hour')")
+        .bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM fx_fee_rules")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_business_failure(
+        transfer_response(pool.clone(), &owner_token, "missing-fee", request.clone()).await,
+        "fee_rule_unavailable",
+    )
+    .await;
+    sqlx::query("INSERT INTO fx_fee_rules (id, source_currency, destination_currency, fee_bps, valid_from, valid_until) VALUES ($1, 'PLN', 'EUR', 0, now() - interval '1 hour', now() + interval '1 hour')")
+        .bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    assert_business_failure(
+        transfer_response(pool.clone(), &owner_token, "reverse-fee", request.clone()).await,
+        "fee_rule_unavailable",
+    )
+    .await;
+    sqlx::query("DELETE FROM fx_fee_rules")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        sqlx::query("INSERT INTO fx_fee_rules (id, source_currency, destination_currency, fee_bps, valid_from, valid_until) VALUES ($1, 'EUR', 'PLN', 0, now() - interval '1 hour', now() + interval '1 hour')")
+            .bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    }
+    assert_business_failure(
+        transfer_response(
+            pool.clone(),
+            &owner_token,
+            "ambiguous-pair-fee",
+            request.clone(),
+        )
+        .await,
+        "fee_rule_configuration_ambiguous",
+    )
+    .await;
+    sqlx::query("DELETE FROM fx_fee_rules")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        sqlx::query("INSERT INTO fx_fee_rules (id, fee_bps, valid_from, valid_until) VALUES ($1, 0, now() - interval '1 hour', now() + interval '1 hour')")
+            .bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    }
+    assert_business_failure(
+        transfer_response(pool.clone(), &owner_token, "ambiguous-default-fee", request).await,
+        "fee_rule_configuration_ambiguous",
+    )
+    .await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT balance_minor FROM accounts WHERE id = $1")
+            .bind(source)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        10_000
+    );
+    assert_eq!(
+        sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT (SELECT count(*) FROM transfers), (SELECT count(*) FROM account_entries), (SELECT count(*) FROM idempotency_records)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        (0, 0, 0)
+    );
+}
+
+#[sqlx::test]
+async fn fx_arithmetic_and_funds_failures_rollback(pool: PgPool) {
+    let source = Uuid::new_v4();
+    let destination = Uuid::new_v4();
+    insert_test_account(&pool, source, "client-123", "EUR", 2, i64::MAX).await;
+    insert_test_account(&pool, destination, "client-456", "PLN", 2, 0).await;
+    let owner_token = token(
+        Some("client-123"),
+        4_102_444_800,
+        "https://issuer.example",
+        "ledger",
+    );
+    let rate_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO exchange_rates (id, source_currency, destination_currency, rate, valid_from, valid_until) VALUES ($1, 'EUR', 'PLN', 0.0001, now() - interval '1 hour', now() + interval '1 hour')")
+        .bind(rate_id).execute(&pool).await.unwrap();
+    let fee_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO fx_fee_rules (id, fee_bps, valid_from, valid_until) VALUES ($1, 0, now() - interval '1 hour', now() + interval '1 hour')")
+        .bind(fee_id).execute(&pool).await.unwrap();
+    assert_business_failure(transfer_response(pool.clone(), &owner_token, "rounds-zero", json!({"source_account_id":source,"destination_account_id":destination,"amount":"0.01"})).await, "destination_amount_too_small").await;
+    sqlx::query("UPDATE exchange_rates SET rate = 999999999999999999.999999999999 WHERE id = $1")
+        .bind(rate_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_business_failure(transfer_response(pool.clone(), &owner_token, "destination-overflow", json!({"source_account_id":source,"destination_account_id":destination,"amount":"92233720368547758.07"})).await, "arithmetic_overflow").await;
+    sqlx::query("UPDATE exchange_rates SET rate = 1 WHERE id = $1")
+        .bind(rate_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE fx_fee_rules SET fee_bps = 1 WHERE id = $1")
+        .bind(fee_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_business_failure(transfer_response(pool.clone(), &owner_token, "fee-overflow", json!({"source_account_id":source,"destination_account_id":destination,"amount":"92233720368547758.07"})).await, "arithmetic_overflow").await;
+    sqlx::query("UPDATE accounts SET balance_minor = $1 WHERE id = $2")
+        .bind(10_000_i64)
+        .bind(source)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE fx_fee_rules SET fee_bps = 100 WHERE id = $1")
+        .bind(fee_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_business_failure(transfer_response(pool.clone(), &owner_token, "fee-insufficient", json!({"source_account_id":source,"destination_account_id":destination,"amount":"100.00"})).await, "insufficient_funds").await;
+    assert_eq!(sqlx::query_as::<_, (i64, i64, i64, i64)>("SELECT (SELECT balance_minor FROM accounts WHERE id = $1), (SELECT balance_minor FROM accounts WHERE id = $2), (SELECT count(*) FROM transfers), (SELECT count(*) FROM idempotency_records)").bind(source).bind(destination).fetch_one(&pool).await.unwrap(), (10_000, 0, 0, 0));
+}
+
+#[sqlx::test]
+async fn concurrent_fx_debits_cannot_overspend(pool: PgPool) {
+    let source = Uuid::new_v4();
+    let first_destination = Uuid::new_v4();
+    let second_destination = Uuid::new_v4();
+    insert_test_account(&pool, source, "client-123", "EUR", 2, 10_000).await;
+    insert_test_account(&pool, first_destination, "client-456", "PLN", 2, 0).await;
+    insert_test_account(&pool, second_destination, "client-789", "PLN", 2, 0).await;
+    sqlx::query("INSERT INTO exchange_rates (id, source_currency, destination_currency, rate, valid_from, valid_until) VALUES ($1, 'EUR', 'PLN', 1, now() - interval '1 hour', now() + interval '1 hour')").bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO fx_fee_rules (id, fee_bps, valid_from, valid_until) VALUES ($1, 0, now() - interval '1 hour', now() + interval '1 hour')").bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    let owner_token = token(
+        Some("client-123"),
+        4_102_444_800,
+        "https://issuer.example",
+        "ledger",
+    );
+    let (first, second) = tokio::join!(
+        transfer_response(
+            pool.clone(),
+            &owner_token,
+            "fx-debit-one",
+            json!({"source_account_id":source,"destination_account_id":first_destination,"amount":"60.00"})
+        ),
+        transfer_response(
+            pool.clone(),
+            &owner_token,
+            "fx-debit-two",
+            json!({"source_account_id":source,"destination_account_id":second_destination,"amount":"60.00"})
+        ),
+    );
+    assert_eq!(
+        [first.status(), second.status()]
+            .into_iter()
+            .filter(|status| *status == StatusCode::CREATED)
+            .count(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT balance_minor FROM accounts WHERE id = $1")
+            .bind(source)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        4_000
+    );
+    assert_eq!(sqlx::query_as::<_, (i64, i64)>("SELECT (SELECT count(*) FROM transfers WHERE kind = 'fx_transfer'), (SELECT count(*) FROM account_entries WHERE operation_kind = 'fx_transfer')").fetch_one(&pool).await.unwrap(), (1, 2));
 }
 
 #[sqlx::test]

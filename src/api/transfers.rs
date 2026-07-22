@@ -34,7 +34,7 @@ pub(crate) struct CreateTransferRequest {
 #[derive(Serialize, ToSchema)]
 pub(crate) struct TransferCreatedResponse {
     id: Uuid,
-    kind: &'static str,
+    kind: TransferKind,
     status: &'static str,
     source_account_id: Uuid,
     destination_account_id: Uuid,
@@ -46,11 +46,27 @@ pub(crate) struct TransferCreatedResponse {
     destination_currency: String,
     #[schema(value_type = String, example = "10.25")]
     destination_amount: String,
-    #[schema(value_type = Option<String>, example = "0.25")]
+    #[schema(value_type = Option<String>, example = "0.25", required)]
     fee_amount: Option<String>,
-    #[schema(value_type = Option<String>, example = "10.50")]
+    #[schema(value_type = Option<String>, example = "10.50", required)]
     total_source_debit: Option<String>,
     created_at: String,
+}
+
+#[derive(Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TransferKind {
+    Transfer,
+    FxTransfer,
+}
+
+impl TransferKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Transfer => "transfer",
+            Self::FxTransfer => "fx_transfer",
+        }
+    }
 }
 
 #[derive(Serialize, ToSchema)]
@@ -353,7 +369,15 @@ pub(crate) async fn create_transfer(
         exchange_rate,
         exchange_rate_id,
     ) = match fx_configuration {
-        None => ("transfer", amount_minor, 0, amount_minor, None, None, None),
+        None => (
+            TransferKind::Transfer,
+            amount_minor,
+            0,
+            amount_minor,
+            None,
+            None,
+            None,
+        ),
         Some((rate, fee)) => {
             let fee_calculation =
                 calculate_fee(amount_minor, fee.fee_bps).map_err(transfer_arithmetic_error)?;
@@ -366,7 +390,7 @@ pub(crate) async fn create_transfer(
             )
             .map_err(transfer_arithmetic_error)?;
             (
-                "fx_transfer",
+                TransferKind::FxTransfer,
                 destination_amount,
                 fee_calculation.fee_minor,
                 fee_calculation.total_source_debit_minor,
@@ -399,7 +423,7 @@ pub(crate) async fn create_transfer(
         "INSERT INTO transfers (id, source_account_id, destination_account_id, source_currency, destination_currency, source_amount_minor, destination_amount_minor, fee_amount_minor, total_source_debit_minor, fee_bps, exchange_rate, exchange_rate_id, kind, initiated_by) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CAST($11 AS numeric), $12, $13::transfer_kind, $14) RETURNING created_at::text",
     )
-    .bind(transfer_id).bind(source_account_id).bind(destination_account_id).bind(&source.currency).bind(&destination.currency).bind(amount_minor).bind(destination_amount_minor).bind(fee_amount_minor).bind(total_source_debit_minor).bind(fee_bps).bind(exchange_rate).bind(exchange_rate_id).bind(kind).bind(&client_id)
+    .bind(transfer_id).bind(source_account_id).bind(destination_account_id).bind(&source.currency).bind(&destination.currency).bind(amount_minor).bind(destination_amount_minor).bind(fee_amount_minor).bind(total_source_debit_minor).bind(fee_bps).bind(exchange_rate).bind(exchange_rate_id).bind(kind.as_str()).bind(&client_id)
     .fetch_one(&mut *transaction).await.map_err(AppError::internal)?;
     for (id, balance) in [
         (source_account_id, source_balance),
@@ -408,9 +432,10 @@ pub(crate) async fn create_transfer(
         sqlx::query("UPDATE accounts SET balance_minor = $1, version = version + 1, updated_at = now() WHERE id = $2")
             .bind(balance).bind(id).execute(&mut *transaction).await.map_err(AppError::internal)?;
     }
-    let source_principal = (kind == "fx_transfer").then_some(amount_minor);
-    let source_fee = (kind == "fx_transfer").then_some(fee_amount_minor);
-    let destination_principal = (kind == "fx_transfer").then_some(destination_amount_minor);
+    let is_fx = matches!(kind, TransferKind::FxTransfer);
+    let source_principal = is_fx.then_some(amount_minor);
+    let source_fee = is_fx.then_some(fee_amount_minor);
+    let destination_principal = is_fx.then_some(destination_amount_minor);
     for (account_id, counterparty_account_id, direction, amount, currency, principal, fee) in [
         (
             source_account_id,
@@ -435,7 +460,7 @@ pub(crate) async fn create_transfer(
             "INSERT INTO account_entries (id, account_id, transfer_id, counterparty_account_id, direction, operation_kind, amount_minor, currency, principal_amount_minor, fee_amount_minor) \
              VALUES ($1, $2, $3, $4, $5::entry_direction, $6::transfer_kind, $7, $8, $9, $10)",
         )
-        .bind(Uuid::new_v4()).bind(account_id).bind(transfer_id).bind(counterparty_account_id).bind(direction).bind(kind).bind(amount).bind(currency).bind(principal).bind(fee)
+        .bind(Uuid::new_v4()).bind(account_id).bind(transfer_id).bind(counterparty_account_id).bind(direction).bind(kind.as_str()).bind(amount).bind(currency).bind(principal).bind(fee)
         .execute(&mut *transaction).await.map_err(AppError::internal)?;
     }
     let response_body = serde_json::to_value(TransferCreatedResponse {
@@ -448,9 +473,8 @@ pub(crate) async fn create_transfer(
         source_amount: format_minor_units(amount_minor, source.scale as u8),
         destination_currency: destination.currency.clone(),
         destination_amount: format_minor_units(destination_amount_minor, destination.scale as u8),
-        fee_amount: (kind == "fx_transfer")
-            .then(|| format_minor_units(fee_amount_minor, source.scale as u8)),
-        total_source_debit: (kind == "fx_transfer")
+        fee_amount: is_fx.then(|| format_minor_units(fee_amount_minor, source.scale as u8)),
+        total_source_debit: is_fx
             .then(|| format_minor_units(total_source_debit_minor, source.scale as u8)),
         created_at,
     })
