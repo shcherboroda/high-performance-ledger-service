@@ -18,6 +18,9 @@ sqlx = { version = "0.9", default-features = false, features = ["chrono", "macro
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "signal", "net", "time"] }
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.17"
 utoipa = { version = "5.4", features = ["axum_extras", "uuid"] }
 uuid = { version = "1.19", features = ["serde", "v4"] }

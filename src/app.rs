@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use axum::{
-    Router,
+    Router, middleware,
     routing::{get, post},
 };
 use sqlx::PgPool;
@@ -25,6 +25,7 @@ pub fn router_with_idempotency_retention(
     idempotency_retention: Duration,
 ) -> Router {
     let router = Router::new()
+        .route("/metrics", get(crate::observability::metrics))
         .route("/health", get(crate::api::health::health))
         .route("/ready", get(crate::api::health::ready))
         .route("/openapi.json", get(crate::openapi::openapi))
@@ -49,11 +50,14 @@ pub fn router_with_idempotency_retention(
 
     #[cfg(test)]
     let router = router.route("/_test/authenticated", get(test_authenticated));
-    router.with_state(AppState {
-        pool,
-        auth,
-        idempotency_retention,
-    })
+    crate::observability::metrics_handle();
+    router
+        .with_state(AppState {
+            pool,
+            auth,
+            idempotency_retention,
+        })
+        .layer(middleware::from_fn(crate::observability::observe_request))
 }
 
 #[cfg(test)]

@@ -598,26 +598,19 @@ Internal database details are logged but not returned.
 
 ## 17. Observability
 
-Structured logs and traces include:
+Runtime logs are JSON structured and retain `RUST_LOG` filtering. Output uses a bounded,
+lossy non-blocking queue; its worker guard remains alive through normal shutdown so queued
+events can flush. Each HTTP request has one `x-request-id`: one valid caller value is kept,
+otherwise a UUID v4 is generated and returned on every response. Request spans and completion
+events record only the request ID, method, matched route template (or `unmatched`), status, and
+latency. They never record headers, query strings, raw URIs, JWTs, financial identifiers, or
+request/response bodies.
 
-* request and correlation IDs;
-* endpoint and operation type;
-* authenticated client ID where appropriate;
-* operation result;
-* latency;
-* database error category;
-* idempotency reservation, replay and conflict outcomes.
-
-JWTs and full financial request bodies are not logged.
-
-Metrics may include:
-
-* request count and latency;
-* transfer success and rejection counts;
-* transaction duration;
-* pool utilization;
-* deadlock and retry counts;
-* idempotency replay and conflict counts.
+`GET /metrics` exposes process-local Prometheus text without business authentication. It reports
+`ledger_http_requests_total{method,route,status_class}` and
+`ledger_http_request_duration_seconds{method,route}` using bounded route templates and explicit
+histogram buckets. It performs no network export; deployments must protect access to this endpoint
+at their network boundary when appropriate.
 
 ## 18. Testing strategy
 
