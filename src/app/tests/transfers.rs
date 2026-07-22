@@ -513,6 +513,103 @@ async fn idempotency_keys_are_separate_for_normal_and_fx_transfers(pool: PgPool)
 }
 
 #[sqlx::test]
+async fn fx_validity_boundaries_use_the_transaction_timestamp(pool: PgPool) {
+    sqlx::query("CREATE FUNCTION set_fx_boundary() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.idempotency_key = 'rate-start' THEN UPDATE exchange_rates SET valid_from = transaction_timestamp(), valid_until = transaction_timestamp() + interval '1 hour'; UPDATE fx_fee_rules SET valid_from = transaction_timestamp(), valid_until = transaction_timestamp() + interval '1 hour'; ELSIF NEW.idempotency_key = 'rate-end' THEN UPDATE exchange_rates SET valid_from = transaction_timestamp() - interval '1 hour', valid_until = transaction_timestamp(); UPDATE fx_fee_rules SET valid_from = transaction_timestamp() - interval '1 hour', valid_until = transaction_timestamp() + interval '1 hour'; ELSIF NEW.idempotency_key = 'fee-start' THEN UPDATE exchange_rates SET valid_from = transaction_timestamp(), valid_until = transaction_timestamp() + interval '1 hour'; UPDATE fx_fee_rules SET valid_from = transaction_timestamp(), valid_until = transaction_timestamp() + interval '1 hour'; ELSIF NEW.idempotency_key = 'fee-end' THEN UPDATE exchange_rates SET valid_from = transaction_timestamp() - interval '1 hour', valid_until = transaction_timestamp() + interval '1 hour'; UPDATE fx_fee_rules SET valid_from = transaction_timestamp() - interval '1 hour', valid_until = transaction_timestamp(); END IF; RETURN NEW; END; $$").execute(&pool).await.unwrap();
+    sqlx::query("CREATE TRIGGER set_fx_boundary BEFORE INSERT ON idempotency_records FOR EACH ROW WHEN (NEW.operation_type = 'fx_transfer') EXECUTE FUNCTION set_fx_boundary()")
+        .execute(&pool).await.unwrap();
+    let token = token(
+        Some("client-123"),
+        4_102_444_800,
+        "https://issuer.example",
+        "ledger",
+    );
+    let pairs = [
+        ("EUA", "PLA"),
+        ("EUB", "PLB"),
+        ("EUC", "PLC"),
+        ("EUD", "PLD"),
+    ];
+    for (index, key, expected) in [
+        (0, "rate-start", Some("created")),
+        (1, "rate-end", Some("rate_unavailable")),
+        (2, "fee-start", Some("created")),
+        (3, "fee-end", Some("fee_rule_unavailable")),
+    ] {
+        let (source_currency, destination_currency) = pairs[index];
+        let source = Uuid::new_v4();
+        let destination = Uuid::new_v4();
+        insert_test_account(&pool, source, "client-123", source_currency, 2, 100).await;
+        insert_test_account(&pool, destination, "client-456", destination_currency, 2, 0).await;
+        sqlx::query("INSERT INTO exchange_rates (id, source_currency, destination_currency, rate, valid_from, valid_until) VALUES ($1, $2, $3, 1, now() - interval '1 day', now() + interval '1 day')").bind(Uuid::new_v4()).bind(source_currency).bind(destination_currency).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO fx_fee_rules (id, source_currency, destination_currency, fee_bps, valid_from, valid_until) VALUES ($1, $2, $3, 0, now() - interval '1 day', now() + interval '1 day')").bind(Uuid::new_v4()).bind(source_currency).bind(destination_currency).execute(&pool).await.unwrap();
+        let response = transfer_response(pool.clone(), &token, key, json!({"source_account_id":source,"destination_account_id":destination,"amount":"1.00"})).await;
+        match expected {
+            Some("created") => assert_eq!(response.status(), StatusCode::CREATED, "case {index}"),
+            Some(code) => {
+                assert_business_failure(response, code).await;
+                assert_eq!(sqlx::query_as::<_, (i64, i64, i64, i64)>("SELECT (SELECT balance_minor FROM accounts WHERE id = $1), (SELECT count(*) FROM transfers WHERE source_account_id = $1), (SELECT count(*) FROM account_entries e JOIN transfers t ON t.id = e.transfer_id WHERE t.source_account_id = $1), (SELECT count(*) FROM idempotency_records WHERE idempotency_key = $2)").bind(source).bind(key).fetch_one(&pool).await.unwrap(), (100, 0, 0, 0));
+            }
+            None => unreachable!(),
+        }
+    }
+    sqlx::query("DROP TRIGGER set_fx_boundary ON idempotency_records")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP FUNCTION set_fx_boundary()")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[sqlx::test]
+async fn failed_fx_configuration_can_retry_with_the_same_key(pool: PgPool) {
+    let source = Uuid::new_v4();
+    let destination = Uuid::new_v4();
+    insert_test_account(&pool, source, "client-123", "EUR", 2, 1_000).await;
+    insert_test_account(&pool, destination, "client-456", "PLN", 2, 0).await;
+    let token = token(
+        Some("client-123"),
+        4_102_444_800,
+        "https://issuer.example",
+        "ledger",
+    );
+    let request =
+        json!({"source_account_id":source,"destination_account_id":destination,"amount":"1.00"});
+    assert_business_failure(
+        transfer_response(pool.clone(), &token, "retry-config", request.clone()).await,
+        "rate_unavailable",
+    )
+    .await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM idempotency_records WHERE idempotency_key = 'retry-config'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        0
+    );
+    sqlx::query("INSERT INTO exchange_rates (id, source_currency, destination_currency, rate, valid_from, valid_until) VALUES ($1, 'EUR', 'PLN', 1, now() - interval '1 hour', now() + interval '1 hour')").bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO fx_fee_rules (id, fee_bps, valid_from, valid_until) VALUES ($1, 0, now() - interval '1 hour', now() + interval '1 hour')").bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    let first = transfer_response(pool.clone(), &token, "retry-config", request).await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+    let replay = transfer_response(
+        pool.clone(),
+        &token,
+        "retry-config",
+        json!({"source_account_id":source,"destination_account_id":destination,"amount":"1.00"}),
+    )
+    .await;
+    assert_eq!(
+        to_bytes(replay.into_body(), usize::MAX).await.unwrap(),
+        first_body
+    );
+    assert_eq!(sqlx::query_as::<_, (i64, i64)>("SELECT (SELECT count(*) FROM transfers), (SELECT count(*) FROM idempotency_records WHERE idempotency_key = 'retry-config')").fetch_one(&pool).await.unwrap(), (1, 1));
+}
+
+#[sqlx::test]
 async fn locked_metadata_mismatch_rolls_back_the_entire_fx_attempt(pool: PgPool) {
     let source = Uuid::new_v4();
     let destination = Uuid::new_v4();
