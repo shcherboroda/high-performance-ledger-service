@@ -15,8 +15,8 @@ pub const SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(OpenApi)]
 #[openapi(
     info(title = SERVICE_TITLE, version = SERVICE_VERSION),
-    paths(crate::api::health::health, crate::api::health::ready, crate::api::accounts::create_account, crate::api::accounts::get_balance, crate::api::transfers::create_transfer, crate::api::reversals::reverse_transfer),
-    components(schemas(crate::api::health::StatusResponse, crate::api::accounts::CreateAccountRequest, crate::api::accounts::AccountCreatedResponse, crate::api::accounts::AccountBalanceResponse, crate::api::transfers::CreateTransferRequest, crate::api::transfers::TransferCreatedResponse, crate::api::reversals::ReversalCreatedResponse, ErrorEnvelope, ApiErrorBody)),
+    paths(crate::api::health::health, crate::api::health::ready, crate::api::accounts::create_account, crate::api::accounts::get_balance, crate::api::history::get_account_history, crate::api::transfers::create_transfer, crate::api::transfers::get_transfer, crate::api::reversals::reverse_transfer),
+    components(schemas(crate::api::health::StatusResponse, crate::api::accounts::CreateAccountRequest, crate::api::accounts::AccountCreatedResponse, crate::api::accounts::AccountBalanceResponse, crate::api::history::AccountEntryResponse, crate::api::history::AccountHistoryResponse, crate::api::transfers::CreateTransferRequest, crate::api::transfers::TransferCreatedResponse, crate::api::transfers::TransferDetailsResponse, crate::api::reversals::ReversalCreatedResponse, ErrorEnvelope, ApiErrorBody)),
     modifiers(&SecuritySchemeAddon)
 )]
 struct ApiDoc;

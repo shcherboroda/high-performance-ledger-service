@@ -33,7 +33,15 @@ pub fn router_with_idempotency_retention(
             "/accounts/{account_id}/balance",
             get(crate::api::accounts::get_balance),
         )
+        .route(
+            "/accounts/{account_id}/entries",
+            get(crate::api::history::get_account_history),
+        )
         .route("/transfers", post(crate::api::transfers::create_transfer))
+        .route(
+            "/transfers/{transfer_id}",
+            get(crate::api::transfers::get_transfer),
+        )
         .route(
             "/transfers/{transfer_id}/reversal",
             post(crate::api::reversals::reverse_transfer),
