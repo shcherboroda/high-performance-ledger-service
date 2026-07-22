@@ -409,6 +409,11 @@ service. The Ledger Service reads those PostgreSQL records directly and exposes 
 administration or provider API. Rates are strictly directional: a EUR-to-PLN record neither
 authorizes PLN-to-EUR nor permits inversion or triangulation.
 
+Published exchange-rate and fee-rule rows are immutable. Configuration changes create new rows
+and validity intervals; published rate values, currency pairs, fee values, and intervals are not
+modified. A completed transfer retains its exact rate and fee snapshots, and its restrictive rate
+foreign key prevents deletion of the referenced audit record.
+
 Both rates and fee rules use half-open validity intervals (`valid_from <= operation_time <
 valid_until`). A future financial transaction supplies one operation timestamp (preferably
 PostgreSQL transaction time) to all lookups. Missing configuration and multiple applicable rows
