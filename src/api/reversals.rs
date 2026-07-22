@@ -4,6 +4,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
+use std::time::Instant;
 
 use serde::Serialize;
 
@@ -17,6 +18,7 @@ use crate::{
     auth::AuthenticatedClient,
     idempotency::{self, IdempotencyKey, Reservation},
     money::format_minor_units,
+    observability::{FinancialOperation, TransactionObservation},
 };
 
 #[derive(Serialize, ToSchema)]
@@ -80,6 +82,8 @@ pub(crate) async fn reverse_transfer(
         .map_err(|_| AppError::validation("malformed_transfer_id", "The transfer ID is invalid"))?;
     let fingerprint = idempotency::reversal_fingerprint(original_transfer_id);
     let mut transaction = state.pool.begin().await.map_err(AppError::internal)?;
+    let mut observation =
+        TransactionObservation::started(FinancialOperation::Reversal, Instant::now());
 
     if let Some((stored_fingerprint, http_status, response_body)) = idempotency::completed_success(
         &mut transaction,
@@ -91,10 +95,14 @@ pub(crate) async fn reverse_transfer(
     .map_err(AppError::internal)?
     {
         if stored_fingerprint != fingerprint {
+            observation.idempotency("conflict");
+            observation.complete("rejected", "idempotency_conflict");
             return Err(AppError::idempotency_conflict());
         }
+        observation.idempotency("replay");
         transaction.commit().await.map_err(AppError::internal)?;
         let status = StatusCode::from_u16(http_status as u16).map_err(AppError::internal)?;
+        observation.complete("success", "none");
         return Ok((status, Json(response_body)).into_response());
     }
     match idempotency::reserve(
@@ -112,12 +120,18 @@ pub(crate) async fn reverse_transfer(
             http_status,
             response_body,
         } => {
+            observation.idempotency("replay");
             transaction.commit().await.map_err(AppError::internal)?;
             let status = StatusCode::from_u16(http_status as u16).map_err(AppError::internal)?;
+            observation.complete("success", "none");
             return Ok((status, Json(response_body)).into_response());
         }
-        Reservation::Conflict => return Err(AppError::idempotency_conflict()),
-        Reservation::Owned => {}
+        Reservation::Conflict => {
+            observation.idempotency("conflict");
+            observation.complete("rejected", "idempotency_conflict");
+            return Err(AppError::idempotency_conflict());
+        }
+        Reservation::Owned => observation.idempotency("owner"),
     }
 
     let original = sqlx::query_as::<_, (Uuid, Uuid, String, String, i64, i64, i64, i64, Option<i32>, String, Option<String>, Option<Uuid>, String)>(
@@ -125,10 +139,9 @@ pub(crate) async fn reverse_transfer(
     ).bind(original_transfer_id).fetch_optional(&mut *transaction).await.map_err(AppError::internal)?
         .ok_or_else(AppError::not_found)?;
     if original.9 == "reversal" {
-        return Err(AppError::business(
-            "reversal_of_reversal",
-            "A reversal cannot be reversed",
-        ));
+        let error = AppError::business("reversal_of_reversal", "A reversal cannot be reversed");
+        observation.reject(&error);
+        return Err(error);
     }
     let authorized: Option<String> =
         sqlx::query_scalar("SELECT owner_id FROM accounts WHERE id = $1")
@@ -137,7 +150,9 @@ pub(crate) async fn reverse_transfer(
             .await
             .map_err(AppError::internal)?;
     if authorized.as_deref() != Some(&client_id) {
-        return Err(AppError::not_found());
+        let error = AppError::not_found();
+        observation.reject(&error);
+        return Err(error);
     }
     let already_reversed: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM transfers WHERE reverses_transfer_id = $1)",
@@ -147,10 +162,12 @@ pub(crate) async fn reverse_transfer(
     .await
     .map_err(AppError::internal)?;
     if already_reversed {
-        return Err(AppError::business(
+        let error = AppError::business(
             "transfer_already_reversed",
             "The transfer has already been reversed",
-        ));
+        );
+        observation.reject(&error);
+        return Err(error);
     }
 
     let source_account_id = original.1;
@@ -159,7 +176,9 @@ pub(crate) async fn reverse_transfer(
         "SELECT id, owner_id, currency, currency_scale, balance_minor, status::text FROM accounts WHERE id = ANY($1) ORDER BY id FOR UPDATE",
     ).bind(vec![source_account_id, destination_account_id]).fetch_all(&mut *transaction).await.map_err(AppError::internal)?;
     if accounts.len() != 2 {
-        return Err(AppError::account_unavailable());
+        let error = AppError::account_unavailable();
+        observation.reject(&error);
+        return Err(error);
     }
     let locked = accounts
         .into_iter()
@@ -182,7 +201,9 @@ pub(crate) async fn reverse_transfer(
         .find(|account| account.id == destination_account_id)
         .expect("both locked accounts returned");
     if source.status != "active" || destination.status != "active" {
-        return Err(AppError::account_unavailable());
+        let error = AppError::account_unavailable();
+        observation.reject(&error);
+        return Err(error);
     }
     if source.currency != original.3 || destination.currency != original.2 {
         return Err(AppError::internal(anyhow::anyhow!(
@@ -262,5 +283,6 @@ pub(crate) async fn reverse_transfer(
     .await
     .map_err(AppError::internal)?;
     transaction.commit().await.map_err(AppError::internal)?;
+    observation.complete("success", "none");
     Ok((StatusCode::CREATED, Json(response_body)).into_response())
 }

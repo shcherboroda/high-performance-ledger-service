@@ -67,6 +67,22 @@ pub enum AppError {
 }
 
 impl AppError {
+    pub fn financial_metric_outcome(&self) -> (&'static str, &'static str) {
+        match self {
+            Self::Internal { .. } => ("internal_error", "internal_error"),
+            Self::IdempotencyConflict => ("rejected", "idempotency_conflict"),
+            Self::AccountUnavailable => ("rejected", "account_unavailable"),
+            Self::Business { code, .. } | Self::Validation { code, .. } => {
+                ("rejected", financial_reason(code))
+            }
+            Self::NotFound => ("rejected", "not_found"),
+            Self::BadRequest { .. } => ("rejected", "bad_request"),
+            Self::Unauthorized => ("rejected", "unauthorized"),
+            Self::Forbidden => ("rejected", "forbidden"),
+            Self::Conflict => ("rejected", "conflict"),
+            Self::ServiceUnavailable => ("rejected", "service_unavailable"),
+        }
+    }
     pub fn bad_request(details: Option<Value>) -> Self {
         Self::BadRequest { details }
     }
@@ -172,6 +188,31 @@ impl AppError {
     }
 }
 
+fn financial_reason(code: &'static str) -> &'static str {
+    match code {
+        "same_source_and_destination"
+        | "account_unavailable"
+        | "insufficient_funds"
+        | "rate_unavailable"
+        | "rate_configuration_ambiguous"
+        | "fee_rule_unavailable"
+        | "fee_rule_configuration_ambiguous"
+        | "destination_amount_too_small"
+        | "idempotency_conflict"
+        | "reversal_of_reversal"
+        | "transfer_already_reversed"
+        | "arithmetic_overflow"
+        | "malformed_amount"
+        | "too_many_fractional_digits"
+        | "non_positive_amount"
+        | "amount_overflow"
+        | "malformed_account_id"
+        | "malformed_transfer_id"
+        | "invalid_json" => code,
+        _ => "invalid_request",
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         if let Self::Internal { source } = &self {
@@ -179,5 +220,24 @@ impl IntoResponse for AppError {
         }
         let (status, body) = self.response_parts();
         (status, Json(body)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn financial_metrics_never_use_error_text_as_a_reason() {
+        let error = AppError::business("insufficient_funds", "sensitive balance is 101.23");
+        assert_eq!(
+            error.financial_metric_outcome(),
+            ("rejected", "insufficient_funds")
+        );
+        assert_eq!(
+            AppError::validation("unrecognized_code", "arbitrary detail")
+                .financial_metric_outcome(),
+            ("rejected", "invalid_request")
+        );
     }
 }

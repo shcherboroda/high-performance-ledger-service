@@ -14,6 +14,8 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{EnvFilter, fmt::writer::BoxMakeWriter, prelude::*};
 use uuid::Uuid;
 
+use crate::api_error::AppError;
+
 const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
 const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 const BUCKETS: &[f64] = &[
@@ -22,6 +24,82 @@ const BUCKETS: &[f64] = &[
 
 #[derive(Clone, Debug)]
 pub struct RequestId(pub String);
+
+#[derive(Clone, Copy)]
+pub enum FinancialOperation {
+    Transfer,
+    FxTransfer,
+    Reversal,
+}
+
+impl FinancialOperation {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Transfer => "transfer",
+            Self::FxTransfer => "fx_transfer",
+            Self::Reversal => "reversal",
+        }
+    }
+}
+
+pub struct TransactionObservation {
+    operation: FinancialOperation,
+    started: Instant,
+    completed: bool,
+}
+
+impl TransactionObservation {
+    pub fn new(operation: FinancialOperation) -> Self {
+        Self::started(operation, Instant::now())
+    }
+
+    pub fn started(operation: FinancialOperation, started: Instant) -> Self {
+        Self {
+            operation,
+            started,
+            completed: false,
+        }
+    }
+
+    pub fn idempotency(&self, outcome: &'static str) {
+        counter!("ledger_idempotency_outcomes_total", "operation" => self.operation.as_str(), "outcome" => outcome).increment(1);
+        tracing::info!(
+            operation = self.operation.as_str(),
+            outcome,
+            "ledger idempotency outcome"
+        );
+    }
+
+    pub fn complete(&mut self, outcome: &'static str, reason: &'static str) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        let duration = self.started.elapsed().as_secs_f64();
+        counter!("ledger_operations_total", "operation" => self.operation.as_str(), "outcome" => outcome, "reason" => reason).increment(1);
+        histogram!("ledger_database_transaction_duration_seconds", "operation" => self.operation.as_str(), "outcome" => outcome).record(duration);
+        tracing::info!(
+            operation = self.operation.as_str(),
+            outcome,
+            reason,
+            transaction_duration_seconds = duration,
+            "ledger operation completed"
+        );
+    }
+
+    pub fn reject(&mut self, error: &AppError) {
+        let (outcome, reason) = error.financial_metric_outcome();
+        self.complete(outcome, reason);
+    }
+}
+
+impl Drop for TransactionObservation {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.complete("internal_error", "internal_error");
+        }
+    }
+}
 
 static METRICS: OnceLock<PrometheusHandle> = OnceLock::new();
 
@@ -215,5 +293,23 @@ mod tests {
         assert!(!logs.contains("sensitive-secret"));
         assert!(!logs.contains("token=discard"));
         assert!(!logs.contains(&resource_id.to_string()));
+    }
+
+    #[test]
+    fn financial_metrics_use_only_bounded_labels() {
+        let secret = Uuid::new_v4().to_string();
+        let mut observation = TransactionObservation::new(FinancialOperation::Transfer);
+        observation.idempotency("owner");
+        observation.complete("rejected", "insufficient_funds");
+
+        let metrics = metrics_handle().render();
+        assert!(metrics.contains("ledger_operations_total"));
+        assert!(metrics.contains("operation=\"transfer\""));
+        assert!(metrics.contains("outcome=\"rejected\""));
+        assert!(metrics.contains("reason=\"insufficient_funds\""));
+        assert!(metrics.contains("ledger_idempotency_outcomes_total"));
+        assert!(metrics.contains("outcome=\"owner\""));
+        assert!(metrics.contains("ledger_database_transaction_duration_seconds"));
+        assert!(!metrics.contains(&secret));
     }
 }
