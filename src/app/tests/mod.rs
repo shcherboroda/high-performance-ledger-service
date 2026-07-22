@@ -2,6 +2,7 @@ mod accounts;
 mod auth;
 mod health;
 mod history;
+mod observability;
 mod openapi;
 mod reversals;
 mod support;

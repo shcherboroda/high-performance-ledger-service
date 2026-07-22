@@ -4,7 +4,6 @@ use std::future::pending;
 use anyhow::Result;
 use rust_backend_technical_assessment::{app, auth::AuthVerifier, config::Config, db};
 use tracing::{error, info};
-use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() {
@@ -17,10 +16,9 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let config = Config::from_env()?;
+    let _log_guard =
+        rust_backend_technical_assessment::observability::init_logging(&config.log_filter)?;
     let auth = AuthVerifier::new(&config.auth)?;
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_new(&config.log_filter)?)
-        .init();
 
     let pool = db::create_pool(&config.database_url, &config.pool).await?;
     let listener = tokio::net::TcpListener::bind(config.bind_address).await?;
