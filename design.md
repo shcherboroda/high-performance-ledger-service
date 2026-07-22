@@ -402,6 +402,29 @@ The transaction contains no remote network calls, event publishing or expensive 
 
 ## 11. FX transfer
 
+### FX configuration foundation
+
+Exchange rates and fee rules are written by an external configuration component, not by this
+service. The Ledger Service reads those PostgreSQL records directly and exposes no configuration
+administration or provider API. Rates are strictly directional: a EUR-to-PLN record neither
+authorizes PLN-to-EUR nor permits inversion or triangulation.
+
+Both rates and fee rules use half-open validity intervals (`valid_from <= operation_time <
+valid_until`). A future financial transaction supplies one operation timestamp (preferably
+PostgreSQL transaction time) to all lookups. Missing configuration and multiple applicable rows
+fail closed; an overlapping row is never resolved by choosing a newest, oldest, or otherwise
+preferred record. Pair-specific fee rules take precedence over defaults, while ambiguity is
+evaluated only within the selected specificity level.
+
+Rates are stored as `NUMERIC(30,12)` and parsed as an exact decimal coefficient and scale.
+Conversion uses arbitrary-precision integer intermediates because schema-valid source amounts,
+rate coefficients, and scale factors can exceed `i128`; only final ledger values are checked
+`i64`. The destination amount is rounded half-up once, at the final destination minor-unit
+division. Fees are calculated from source principal with half-up integer division, must be
+between 0 and 10,000 basis points inclusive, and cannot exceed 100% of principal. The resulting
+fee and total source debit are checked `i64` values. A transfer's rate reference is restrictive,
+so a rate used by a completed transfer remains available for audit even after it expires.
+
 The optional FX operation uses a client-supplied source amount. The system calculates the destination amount.
 
 ```text
