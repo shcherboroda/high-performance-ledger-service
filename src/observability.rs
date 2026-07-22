@@ -3,7 +3,7 @@ use std::{sync::OnceLock, time::Instant};
 use anyhow::Result;
 use axum::{
     extract::Request,
-    http::{HeaderName, HeaderValue, StatusCode},
+    http::{HeaderName, HeaderValue, Method, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -63,19 +63,19 @@ pub async fn observe_request(mut request: Request, next: Next) -> Response {
     request
         .extensions_mut()
         .insert(RequestId(request_id.clone()));
-    let method = request.method().to_string();
+    let method = normalized_method(request.method());
     let route = request
         .extensions()
         .get::<axum::extract::MatchedPath>()
         .map(|matched| matched.as_str().to_owned())
         .unwrap_or_else(|| "unmatched".to_owned());
-    let span = request_span(&request_id, &method, &route);
+    let span = request_span(&request_id, method, &route);
     let started = Instant::now();
     let mut response = next.run(request).instrument(span.clone()).await;
     let elapsed = started.elapsed().as_secs_f64();
     let status_class = status_class(response.status());
 
-    counter!("ledger_http_requests_total", "method" => method.clone(), "route" => route.clone(), "status_class" => status_class).increment(1);
+    counter!("ledger_http_requests_total", "method" => method, "route" => route.clone(), "status_class" => status_class).increment(1);
     histogram!("ledger_http_request_duration_seconds", "method" => method, "route" => route)
         .record(elapsed);
     tracing::info!(parent: &span, status = %response.status(), latency_seconds = elapsed, "HTTP request completed");
@@ -120,5 +120,100 @@ fn status_class(status: StatusCode) -> &'static str {
         3 => "3xx",
         4 => "4xx",
         _ => "5xx",
+    }
+}
+
+fn normalized_method(method: &Method) -> &'static str {
+    match method.as_str() {
+        "GET" => "GET",
+        "POST" => "POST",
+        "PUT" => "PUT",
+        "PATCH" => "PATCH",
+        "DELETE" => "DELETE",
+        "HEAD" => "HEAD",
+        "OPTIONS" => "OPTIONS",
+        "CONNECT" => "CONNECT",
+        "TRACE" => "TRACE",
+        _ => "OTHER",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{self, Write},
+        sync::{Arc, Mutex},
+    };
+
+    use axum::{Router, body::Body, http::Request, middleware, routing::get};
+    use tower::ServiceExt;
+
+    use super::*;
+
+    #[derive(Clone)]
+    struct TestWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for TestWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn completion_logs_are_json_and_exclude_sensitive_request_data() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_current_span(true)
+            .with_span_list(true)
+            .with_writer(move || TestWriter(writer.clone()))
+            .finish();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let resource_id = Uuid::new_v4();
+        let request_id = "safe-request-id";
+
+        tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(async {
+                let app = Router::new()
+                    .route(
+                        "/accounts/{account_id}/balance",
+                        get(|| async { StatusCode::OK }),
+                    )
+                    .layer(middleware::from_fn(observe_request));
+                let response = app
+                    .oneshot(
+                        Request::get(format!("/accounts/{resource_id}/balance?token=discard"))
+                            .header("authorization", "Bearer sensitive-secret")
+                            .header("x-request-id", request_id)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+            });
+        });
+
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        let event = logs
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|value| value["fields"]["message"] == "HTTP request completed")
+            .expect("completion event is emitted");
+        assert_eq!(event["span"]["request_id"], request_id);
+        assert_eq!(event["span"]["method"], "GET");
+        assert_eq!(event["span"]["route"], "/accounts/{account_id}/balance");
+        assert!(!logs.contains("sensitive-secret"));
+        assert!(!logs.contains("token=discard"));
+        assert!(!logs.contains(&resource_id.to_string()));
     }
 }

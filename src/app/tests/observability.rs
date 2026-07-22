@@ -118,3 +118,37 @@ async fn metrics_use_bounded_route_labels_and_prometheus_text() {
     assert!(!metrics.contains(&resource_id.to_string()));
     assert!(!metrics.contains("secret-value"));
 }
+
+#[tokio::test]
+async fn custom_http_methods_use_the_other_metric_label() {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/ledger")
+        .unwrap();
+    let custom_method = "CUSTOM-METHOD-27";
+    let app = router(pool, test_auth());
+    let _ = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(custom_method)
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let response = app
+        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let metrics = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+
+    assert!(metrics.contains("method=\"OTHER\""));
+    assert!(!metrics.contains(custom_method));
+}

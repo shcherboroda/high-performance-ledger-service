@@ -21,6 +21,6 @@ tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 metrics = "0.24"
-metrics-exporter-prometheus = "0.17"
+metrics-exporter-prometheus = { version = "0.17", default-features = false }
 utoipa = { version = "5.4", features = ["axum_extras", "uuid"] }
 uuid = { version = "1.19", features = ["serde", "v4"] }

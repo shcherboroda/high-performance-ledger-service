@@ -598,9 +598,10 @@ Internal database details are logged but not returned.
 
 ## 17. Observability
 
-Runtime logs are JSON structured and retain `RUST_LOG` filtering. Output uses a bounded,
-lossy non-blocking queue; its worker guard remains alive through normal shutdown so queued
-events can flush. Each HTTP request has one `x-request-id`: one valid caller value is kept,
+Runtime logs are JSON structured and retain `RUST_LOG` filtering. After configuration is parsed,
+logging is initialized before authentication, database, and listener startup. Output uses a bounded,
+lossy non-blocking queue; its worker guard remains alive through normal shutdown so queued events
+can flush. Each HTTP request has one `x-request-id`: one valid caller value is kept,
 otherwise a UUID v4 is generated and returned on every response. Request spans and completion
 events record only the request ID, method, matched route template (or `unmatched`), status, and
 latency. They never record headers, query strings, raw URIs, JWTs, financial identifiers, or
