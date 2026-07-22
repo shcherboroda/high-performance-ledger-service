@@ -77,6 +77,31 @@ async fn openapi_serves_documented_api_contract() {
         paths["/transfers/{transfer_id}"]["get"]["security"][0]["bearerAuth"],
         json!([])
     );
+    for path in ["/accounts/{account_id}/entries", "/transfers/{transfer_id}"] {
+        let operation = &paths[path]["get"];
+        assert_eq!(operation["security"][0]["bearerAuth"], json!([]));
+        for status in ["200", "400", "401", "404", "500"] {
+            assert!(
+                operation["responses"].get(status).is_some(),
+                "{path} is missing {status}"
+            );
+        }
+    }
+    let history = &paths["/accounts/{account_id}/entries"]["get"];
+    let parameters = history["parameters"].as_array().unwrap();
+    let parameter = |name: &str| {
+        parameters
+            .iter()
+            .find(|value| value["name"] == name)
+            .unwrap()
+    };
+    assert_eq!(parameter("account_id")["in"], "path");
+    assert_eq!(parameter("counterparty_account_id")["in"], "query");
+    assert_eq!(parameter("limit")["in"], "query");
+    assert_eq!(parameter("cursor")["in"], "query");
+    assert_eq!(parameter("limit")["schema"]["default"], 50);
+    assert_eq!(parameter("limit")["schema"]["minimum"], 1);
+    assert_eq!(parameter("limit")["schema"]["maximum"], 100);
     assert_eq!(
         paths["/transfers/{transfer_id}/reversal"]["post"]["security"][0]["bearerAuth"],
         json!([])
