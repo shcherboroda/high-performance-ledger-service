@@ -109,9 +109,17 @@ async fn transfer_is_atomic_auditable_and_replayable(pool: PgPool) {
     assert_eq!(first.status(), StatusCode::CREATED);
     let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
     let body: Value = serde_json::from_slice(&first_body).unwrap();
-    assert_eq!(body["amount"], "10.20");
-    assert_eq!(body["resulting_source_balance"], "9.80");
-    assert_eq!(body["resulting_destination_balance"], "15.20");
+    assert_eq!(body["kind"], "transfer");
+    assert_eq!(body["source_currency"], "USD");
+    assert_eq!(body["source_amount"], "10.20");
+    assert_eq!(body["destination_currency"], "USD");
+    assert_eq!(body["destination_amount"], "10.20");
+    assert!(body["fee_amount"].is_null());
+    assert!(body["total_source_debit"].is_null());
+    assert!(body.get("amount").is_none());
+    assert!(body.get("currency").is_none());
+    assert!(body.get("resulting_source_balance").is_none());
+    assert!(body.get("resulting_destination_balance").is_none());
     assert_eq!(body["status"], "completed");
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT balance_minor FROM accounts WHERE id = $1")
@@ -185,6 +193,76 @@ async fn transfer_is_atomic_auditable_and_replayable(pool: PgPool) {
     );
     let conflict = transfer_response(pool.clone(), &owner_token, "transfer-key", json!({"source_account_id": source, "destination_account_id": destination, "amount": "10.21"})).await;
     assert_eq!(conflict.status(), StatusCode::CONFLICT);
+}
+
+#[sqlx::test]
+async fn cross_currency_transfer_uses_persisted_rate_fee_and_replays(pool: PgPool) {
+    let source = Uuid::new_v4();
+    let destination = Uuid::new_v4();
+    let rate_id = Uuid::new_v4();
+    insert_test_account(&pool, source, "client-123", "EUR", 2, 20_000).await;
+    insert_test_account(&pool, destination, "client-456", "PLN", 2, 0).await;
+    sqlx::query("INSERT INTO exchange_rates (id, source_currency, destination_currency, rate, valid_from, valid_until) VALUES ($1, 'EUR', 'PLN', 4.3215, now() - interval '1 hour', now() + interval '1 hour')")
+        .bind(rate_id).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO fx_fee_rules (id, fee_bps, valid_from, valid_until) VALUES ($1, 100, now() - interval '1 hour', now() + interval '1 hour')")
+        .bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    let owner_token = token(
+        Some("client-123"),
+        4_102_444_800,
+        "https://issuer.example",
+        "ledger",
+    );
+    let request = json!({"source_account_id": source, "destination_account_id": destination, "amount": "100.00"});
+    let first = transfer_response(pool.clone(), &owner_token, "fx-transfer", request.clone()).await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&first_body).unwrap();
+    assert_eq!(body["kind"], "fx_transfer");
+    assert_eq!(body["source_amount"], "100.00");
+    assert_eq!(body["destination_amount"], "432.15");
+    assert_eq!(body["fee_amount"], "1.00");
+    assert_eq!(body["total_source_debit"], "101.00");
+    let id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(sqlx::query_as::<_, (i64, i64, i64, i64, Option<i32>, Option<Uuid>, String)>(
+        "SELECT source_amount_minor, destination_amount_minor, fee_amount_minor, total_source_debit_minor, fee_bps, exchange_rate_id, kind::text FROM transfers WHERE id = $1")
+        .bind(id).fetch_one(&pool).await.unwrap(), (10_000, 43_215, 100, 10_100, Some(100), Some(rate_id), "fx_transfer".into()));
+    let replay = transfer_response(pool.clone(), &owner_token, "fx-transfer", request).await;
+    assert_eq!(replay.status(), StatusCode::CREATED);
+    assert_eq!(
+        to_bytes(replay.into_body(), usize::MAX).await.unwrap(),
+        first_body
+    );
+    let destination_token = token(
+        Some("client-456"),
+        4_102_444_800,
+        "https://issuer.example",
+        "ledger",
+    );
+    sqlx::query(
+        "UPDATE exchange_rates SET valid_until = now() - interval '1 minute' WHERE id = $1",
+    )
+    .bind(rate_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let reversal = reversal_response(pool.clone(), &destination_token, "fx-reversal", id).await;
+    assert_eq!(reversal.status(), StatusCode::CREATED);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT balance_minor FROM accounts WHERE id = $1")
+            .bind(source)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        20_000
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT balance_minor FROM accounts WHERE id = $1")
+            .bind(destination)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
 }
 
 #[sqlx::test]

@@ -141,6 +141,40 @@ async fn openapi_serves_documented_api_contract() {
     assert!(schemas.contains_key("TransferDetailsResponse"));
     assert!(schemas.contains_key("AccountEntryResponse"));
     assert!(schemas.contains_key("AccountHistoryResponse"));
+    let transfer_response = &schemas["TransferCreatedResponse"];
+    let transfer_properties = transfer_response["properties"].as_object().unwrap();
+    for name in [
+        "kind",
+        "source_currency",
+        "source_amount",
+        "destination_currency",
+        "destination_amount",
+        "fee_amount",
+        "total_source_debit",
+    ] {
+        assert!(transfer_properties.contains_key(name), "missing {name}");
+    }
+    for removed in [
+        "currency",
+        "amount",
+        "resulting_source_balance",
+        "resulting_destination_balance",
+    ] {
+        assert!(
+            !transfer_properties.contains_key(removed),
+            "deprecated {removed}"
+        );
+    }
+    assert!(
+        transfer_properties["fee_amount"]
+            .to_string()
+            .contains("null")
+    );
+    assert!(
+        transfer_properties["total_source_debit"]
+            .to_string()
+            .contains("null")
+    );
     assert_local_schema_references_resolve(&document, schemas);
     assert!(!std::str::from_utf8(&body).unwrap().contains("postgres://"));
 }

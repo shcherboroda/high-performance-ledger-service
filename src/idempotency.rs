@@ -9,6 +9,7 @@ use crate::api_error::AppError;
 
 pub const ACCOUNT_CREATION_OPERATION: &str = "account_creation";
 pub const TRANSFER_OPERATION: &str = "transfer";
+pub const FX_TRANSFER_OPERATION: &str = "fx_transfer";
 pub const REVERSAL_OPERATION: &str = "reversal";
 pub const IDEMPOTENCY_KEY_HEADER: HeaderName = HeaderName::from_static("idempotency-key");
 const MAX_KEY_LENGTH: usize = 255;
