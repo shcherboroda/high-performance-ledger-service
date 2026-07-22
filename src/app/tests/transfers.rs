@@ -128,14 +128,21 @@ async fn transfer_is_atomic_auditable_and_replayable(pool: PgPool) {
     let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
     let body: Value = serde_json::from_slice(&first_body).unwrap();
     assert_eq!(body["kind"], "transfer");
-    assert_eq!(body["source_currency"], "USD");
-    assert_eq!(body["source_amount"], "10.20");
-    assert_eq!(body["destination_currency"], "USD");
-    assert_eq!(body["destination_amount"], "10.20");
-    assert!(body["fee_amount"].is_null());
-    assert!(body["total_source_debit"].is_null());
-    assert!(body.get("amount").is_none());
-    assert!(body.get("currency").is_none());
+    assert_eq!(body["currency"], "USD");
+    assert_eq!(body["amount"], "10.20");
+    for absent in [
+        "source_currency",
+        "source_amount",
+        "destination_currency",
+        "destination_amount",
+        "fee_amount",
+        "total_source_debit",
+    ] {
+        assert!(
+            body.get(absent).is_none(),
+            "ordinary response contains {absent}"
+        );
+    }
     assert!(body.get("resulting_source_balance").is_none());
     assert!(body.get("resulting_destination_balance").is_none());
     assert_eq!(body["status"], "completed");
@@ -145,10 +152,8 @@ async fn transfer_is_atomic_auditable_and_replayable(pool: PgPool) {
         "status",
         "source_account_id",
         "destination_account_id",
-        "source_currency",
-        "source_amount",
-        "destination_currency",
-        "destination_amount",
+        "currency",
+        "amount",
         "created_at",
     ] {
         assert!(!body[field].is_null(), "missing common field {field}");
@@ -272,10 +277,30 @@ async fn cross_currency_transfer_uses_persisted_rate_fee_and_replays(pool: PgPoo
     let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
     let body: Value = serde_json::from_slice(&first_body).unwrap();
     assert_eq!(body["kind"], "fx_transfer");
+    assert_eq!(body["source_currency"], "EUR");
     assert_eq!(body["source_amount"], "100.00");
+    assert_eq!(body["destination_currency"], "PLN");
     assert_eq!(body["destination_amount"], "432.15");
     assert_eq!(body["fee_amount"], "1.00");
     assert_eq!(body["total_source_debit"], "101.00");
+    for field in [
+        "id",
+        "kind",
+        "status",
+        "source_account_id",
+        "destination_account_id",
+        "source_currency",
+        "source_amount",
+        "destination_currency",
+        "destination_amount",
+        "fee_amount",
+        "total_source_debit",
+        "created_at",
+    ] {
+        assert!(!body[field].is_null(), "missing FX field {field}");
+    }
+    assert!(body.get("currency").is_none());
+    assert!(body.get("amount").is_none());
     let id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
     assert_eq!(sqlx::query_as::<_, (i64, i64, i64, i64, Option<i32>, Option<Uuid>, String)>(
         "SELECT source_amount_minor, destination_amount_minor, fee_amount_minor, total_source_debit_minor, fee_bps, exchange_rate_id, kind::text FROM transfers WHERE id = $1")

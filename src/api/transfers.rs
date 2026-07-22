@@ -32,25 +32,38 @@ pub(crate) struct CreateTransferRequest {
 }
 
 #[derive(Serialize, ToSchema)]
-pub(crate) struct TransferCreatedResponse {
-    id: Uuid,
-    kind: TransferKind,
-    status: &'static str,
-    source_account_id: Uuid,
-    destination_account_id: Uuid,
-    #[schema(example = "USD")]
-    source_currency: String,
-    #[schema(value_type = String, example = "10.25")]
-    source_amount: String,
-    #[schema(example = "USD")]
-    destination_currency: String,
-    #[schema(value_type = String, example = "10.25")]
-    destination_amount: String,
-    #[schema(value_type = Option<String>, example = "0.25", required)]
-    fee_amount: Option<String>,
-    #[schema(value_type = Option<String>, example = "10.50", required)]
-    total_source_debit: Option<String>,
-    created_at: String,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum TransferCreatedResponse {
+    Transfer {
+        id: Uuid,
+        status: &'static str,
+        source_account_id: Uuid,
+        destination_account_id: Uuid,
+        #[schema(example = "EUR")]
+        currency: String,
+        #[schema(value_type = String, example = "100.00")]
+        amount: String,
+        created_at: String,
+    },
+    FxTransfer {
+        id: Uuid,
+        status: &'static str,
+        source_account_id: Uuid,
+        destination_account_id: Uuid,
+        #[schema(example = "EUR")]
+        source_currency: String,
+        #[schema(value_type = String, example = "100.00")]
+        source_amount: String,
+        #[schema(example = "PLN")]
+        destination_currency: String,
+        #[schema(value_type = String, example = "432.15")]
+        destination_amount: String,
+        #[schema(value_type = String, example = "1.00")]
+        fee_amount: String,
+        #[schema(value_type = String, example = "101.00")]
+        total_source_debit: String,
+        created_at: String,
+    },
 }
 
 #[derive(Clone, Copy, Serialize, ToSchema)]
@@ -463,22 +476,34 @@ pub(crate) async fn create_transfer(
         .bind(Uuid::new_v4()).bind(account_id).bind(transfer_id).bind(counterparty_account_id).bind(direction).bind(kind.as_str()).bind(amount).bind(currency).bind(principal).bind(fee)
         .execute(&mut *transaction).await.map_err(AppError::internal)?;
     }
-    let response_body = serde_json::to_value(TransferCreatedResponse {
-        id: transfer_id,
-        kind,
-        status: "completed",
-        source_account_id,
-        destination_account_id,
-        source_currency: source.currency.clone(),
-        source_amount: format_minor_units(amount_minor, source.scale as u8),
-        destination_currency: destination.currency.clone(),
-        destination_amount: format_minor_units(destination_amount_minor, destination.scale as u8),
-        fee_amount: is_fx.then(|| format_minor_units(fee_amount_minor, source.scale as u8)),
-        total_source_debit: is_fx
-            .then(|| format_minor_units(total_source_debit_minor, source.scale as u8)),
-        created_at,
-    })
-    .map_err(AppError::internal)?;
+    let response = match kind {
+        TransferKind::Transfer => TransferCreatedResponse::Transfer {
+            id: transfer_id,
+            status: "completed",
+            source_account_id,
+            destination_account_id,
+            currency: source.currency.clone(),
+            amount: format_minor_units(amount_minor, source.scale as u8),
+            created_at,
+        },
+        TransferKind::FxTransfer => TransferCreatedResponse::FxTransfer {
+            id: transfer_id,
+            status: "completed",
+            source_account_id,
+            destination_account_id,
+            source_currency: source.currency.clone(),
+            source_amount: format_minor_units(amount_minor, source.scale as u8),
+            destination_currency: destination.currency.clone(),
+            destination_amount: format_minor_units(
+                destination_amount_minor,
+                destination.scale as u8,
+            ),
+            fee_amount: format_minor_units(fee_amount_minor, source.scale as u8),
+            total_source_debit: format_minor_units(total_source_debit_minor, source.scale as u8),
+            created_at,
+        },
+    };
+    let response_body = serde_json::to_value(response).map_err(AppError::internal)?;
     idempotency::store_success(
         &mut transaction,
         &client_id,
@@ -546,5 +571,48 @@ fn transfer_arithmetic_error(error: ArithmeticError) -> AppError {
         | ArithmeticError::InvalidAmount => {
             AppError::internal(anyhow::anyhow!("invalid persisted FX configuration"))
         }
+    }
+}
+
+#[cfg(test)]
+mod response_tests {
+    use super::*;
+
+    #[test]
+    fn create_response_variants_are_internally_tagged() {
+        let id = Uuid::nil();
+        let ordinary = serde_json::to_value(TransferCreatedResponse::Transfer {
+            id,
+            status: "completed",
+            source_account_id: id,
+            destination_account_id: id,
+            currency: "EUR".into(),
+            amount: "100.00".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        })
+        .unwrap();
+        assert_eq!(ordinary["kind"], "transfer");
+        assert!(ordinary.get("transfer").is_none());
+        assert!(ordinary.get("Transfer").is_none());
+        assert!(ordinary.get("source_currency").is_none());
+
+        let fx = serde_json::to_value(TransferCreatedResponse::FxTransfer {
+            id,
+            status: "completed",
+            source_account_id: id,
+            destination_account_id: id,
+            source_currency: "EUR".into(),
+            source_amount: "100.00".into(),
+            destination_currency: "PLN".into(),
+            destination_amount: "432.15".into(),
+            fee_amount: "1.00".into(),
+            total_source_debit: "101.00".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        })
+        .unwrap();
+        assert_eq!(fx["kind"], "fx_transfer");
+        assert!(fx.get("fx_transfer").is_none());
+        assert!(fx.get("FxTransfer").is_none());
+        assert!(fx.get("currency").is_none());
     }
 }

@@ -143,8 +143,52 @@ async fn openapi_serves_documented_api_contract() {
     assert!(schemas.contains_key("AccountEntryResponse"));
     assert!(schemas.contains_key("AccountHistoryResponse"));
     let transfer_response = &schemas["TransferCreatedResponse"];
-    let transfer_properties = transfer_response["properties"].as_object().unwrap();
-    let required = transfer_response["required"].as_array().unwrap();
+    let variants = transfer_response["oneOf"].as_array().unwrap();
+    assert_eq!(variants.len(), 2);
+    let variant = |kind: &str| {
+        variants
+            .iter()
+            .find(|schema| schema["properties"]["kind"]["enum"] == json!([kind]))
+            .unwrap()
+    };
+    let ordinary = variant("transfer");
+    let ordinary_properties = ordinary["properties"].as_object().unwrap();
+    let ordinary_required = ordinary["required"].as_array().unwrap();
+    for name in [
+        "id",
+        "kind",
+        "status",
+        "source_account_id",
+        "destination_account_id",
+        "currency",
+        "amount",
+        "created_at",
+    ] {
+        assert!(
+            ordinary_properties.contains_key(name),
+            "ordinary missing {name}"
+        );
+        assert!(ordinary_required.iter().any(|field| field == name));
+    }
+    for absent in [
+        "source_currency",
+        "source_amount",
+        "destination_currency",
+        "destination_amount",
+        "fee_amount",
+        "total_source_debit",
+        "resulting_source_balance",
+        "resulting_destination_balance",
+    ] {
+        assert!(
+            !ordinary_properties.contains_key(absent),
+            "ordinary contains {absent}"
+        );
+        assert!(!ordinary_required.iter().any(|field| field == absent));
+    }
+    let fx = variant("fx_transfer");
+    let fx_properties = fx["properties"].as_object().unwrap();
+    let fx_required = fx["required"].as_array().unwrap();
     for name in [
         "id",
         "kind",
@@ -157,50 +201,21 @@ async fn openapi_serves_documented_api_contract() {
         "destination_amount",
         "fee_amount",
         "total_source_debit",
+        "created_at",
     ] {
-        assert!(transfer_properties.contains_key(name), "missing {name}");
-        assert!(
-            required.iter().any(|field| field == name),
-            "not required: {name}"
-        );
+        assert!(fx_properties.contains_key(name), "FX missing {name}");
+        assert!(fx_required.iter().any(|field| field == name));
+        assert!(!fx_properties[name].to_string().contains("null"));
     }
-    for removed in [
+    for absent in [
         "currency",
         "amount",
         "resulting_source_balance",
         "resulting_destination_balance",
     ] {
-        assert!(
-            !transfer_properties.contains_key(removed),
-            "deprecated {removed}"
-        );
-        assert!(
-            !required.iter().any(|field| field == removed),
-            "deprecated required {removed}"
-        );
+        assert!(!fx_properties.contains_key(absent), "FX contains {absent}");
+        assert!(!fx_required.iter().any(|field| field == absent));
     }
-    assert!(
-        transfer_properties["fee_amount"]
-            .to_string()
-            .contains("null")
-    );
-    assert!(
-        !transfer_properties["destination_currency"]
-            .to_string()
-            .contains("null")
-    );
-    assert!(
-        !transfer_properties["destination_amount"]
-            .to_string()
-            .contains("null")
-    );
-    let kind_schema = if let Some(reference) = transfer_properties["kind"]["$ref"].as_str() {
-        let name = reference.strip_prefix("#/components/schemas/").unwrap();
-        &schemas[name]
-    } else {
-        &transfer_properties["kind"]
-    };
-    assert_eq!(kind_schema["enum"], json!(["transfer", "fx_transfer"]));
     let transfer_request = &schemas["CreateTransferRequest"];
     assert_eq!(
         transfer_request["required"],
@@ -217,11 +232,6 @@ async fn openapi_serves_documented_api_contract() {
                 .is_some()
         );
     }
-    assert!(
-        transfer_properties["total_source_debit"]
-            .to_string()
-            .contains("null")
-    );
     assert_local_schema_references_resolve(&document, schemas);
     assert!(!std::str::from_utf8(&body).unwrap().contains("postgres://"));
 }
