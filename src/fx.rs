@@ -255,8 +255,11 @@ mod tests {
         assert_eq!(ExactRate::parse("1.230000000000").unwrap().scale, 12);
         assert!(ExactRate::parse("0").is_err());
         assert!(ExactRate::parse("-1").is_err());
+        assert!(ExactRate::parse("").is_err());
+        assert!(ExactRate::parse("1.2.3").is_err());
         assert!(ExactRate::parse("9999999999999999999").is_err());
         assert!(ExactRate::parse("1.0000000000001").is_err());
+        assert!(ExactRate::parse("999999999999999999.999999999999").is_ok());
         assert_eq!(
             calculate_destination(100, 2, 2, &ExactRate::parse("1.25").unwrap()),
             Ok(125)
@@ -270,6 +273,10 @@ mod tests {
             Err(ArithmeticError::DestinationTooSmall)
         );
         assert_eq!(
+            calculate_destination(1, 0, 0, &ExactRate::parse("0.51").unwrap()),
+            Ok(1)
+        );
+        assert_eq!(
             calculate_destination(100, 2, 0, &ExactRate::parse("1.25").unwrap()),
             Ok(1)
         );
@@ -281,12 +288,32 @@ mod tests {
             calculate_destination(1, 19, 2, &ExactRate::parse("1").unwrap()),
             Err(ArithmeticError::InvalidScale)
         );
+        assert_eq!(
+            calculate_destination(1, 18, 18, &ExactRate::parse("1").unwrap()),
+            Ok(1)
+        );
+        assert_eq!(
+            calculate_destination(0, 2, 2, &ExactRate::parse("1").unwrap()),
+            Err(ArithmeticError::InvalidAmount)
+        );
+        assert_eq!(
+            calculate_destination(-1, 2, 2, &ExactRate::parse("1").unwrap()),
+            Err(ArithmeticError::InvalidAmount)
+        );
     }
     #[test]
     fn fees_round_half_up_and_check_total() {
         assert_eq!(calculate_fee(1, 5).unwrap().fee_minor, 0);
         assert_eq!(calculate_fee(1, 5_000).unwrap().fee_minor, 1);
+        assert_eq!(calculate_fee(3, 5_000).unwrap().fee_minor, 2);
         assert_eq!(calculate_fee(1, 10_000).unwrap().fee_minor, 1);
+        assert_eq!(calculate_fee(1, -1), Err(ArithmeticError::InvalidAmount));
+        assert_eq!(
+            calculate_fee(1, 10_001),
+            Err(ArithmeticError::InvalidAmount)
+        );
+        assert_eq!(calculate_fee(0, 1), Err(ArithmeticError::InvalidAmount));
+        assert_eq!(calculate_fee(-1, 1), Err(ArithmeticError::InvalidAmount));
         assert_eq!(calculate_fee(i64::MAX, 1), Err(ArithmeticError::Overflow));
     }
     #[test]

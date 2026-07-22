@@ -285,12 +285,111 @@ async fn fee_selection_prioritizes_pairs_and_detects_default_ambiguity(
 }
 
 #[sqlx::test]
+async fn fee_selection_ignores_non_applicable_rules_and_detects_many_overlaps(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let at = Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap();
+    let mut connection = pool.acquire().await?;
+    assert!(matches!(
+        select_fee_rule(&mut connection, "EUR", "PLN", at).await,
+        Err(ConfigurationError::FeeRuleUnavailable)
+    ));
+    drop(connection);
+    for (source, destination, from, until) in [
+        (
+            Some("PLN"),
+            Some("EUR"),
+            "2029-01-01 00:00:00+00",
+            "2031-01-01 00:00:00+00",
+        ),
+        (
+            Some("EUR"),
+            Some("PLN"),
+            "2020-01-01 00:00:00+00",
+            "2021-01-01 00:00:00+00",
+        ),
+        (
+            Some("EUR"),
+            Some("PLN"),
+            "2040-01-01 00:00:00+00",
+            "2041-01-01 00:00:00+00",
+        ),
+        (
+            None,
+            None,
+            "2020-01-01 00:00:00+00",
+            "2021-01-01 00:00:00+00",
+        ),
+        (
+            None,
+            None,
+            "2040-01-01 00:00:00+00",
+            "2041-01-01 00:00:00+00",
+        ),
+    ] {
+        fee(&pool, source, destination, 100, from, until).await;
+    }
+    let mut connection = pool.acquire().await?;
+    assert!(matches!(
+        select_fee_rule(&mut connection, "EUR", "PLN", at).await,
+        Err(ConfigurationError::FeeRuleUnavailable)
+    ));
+    drop(connection);
+    for month in 1..=3 {
+        fee(
+            &pool,
+            Some("EUR"),
+            Some("PLN"),
+            100,
+            &format!("2029-{month:02}-01 00:00:00+00"),
+            "2031-01-01 00:00:00+00",
+        )
+        .await;
+    }
+    let mut connection = pool.acquire().await?;
+    assert!(matches!(
+        select_fee_rule(&mut connection, "EUR", "PLN", at).await,
+        Err(ConfigurationError::FeeRuleAmbiguous)
+    ));
+    drop(connection);
+    for month in 1..=3 {
+        fee(
+            &pool,
+            None,
+            None,
+            100,
+            &format!("2029-{month:02}-01 00:00:00+00"),
+            "2031-01-01 00:00:00+00",
+        )
+        .await;
+    }
+    let mut connection = pool.acquire().await?;
+    assert!(matches!(
+        select_fee_rule(&mut connection, "USD", "JPY", at).await,
+        Err(ConfigurationError::FeeRuleAmbiguous)
+    ));
+    Ok(())
+}
+
+#[sqlx::test]
 async fn fx_schema_constraints_indexes_and_rate_references_hold(pool: PgPool) -> sqlx::Result<()> {
     for statement in [
         "INSERT INTO exchange_rates (id, source_currency, destination_currency, rate, valid_from, valid_until) VALUES ('10000000-0000-0000-0000-000000000001', 'eur', 'PLN', 1, now(), now() + interval '1 hour')",
-        "INSERT INTO exchange_rates (id, source_currency, destination_currency, rate, valid_from, valid_until) VALUES ('10000000-0000-0000-0000-000000000002', 'EUR', 'EUR', 0, now(), now())",
-        "INSERT INTO fx_fee_rules (id, source_currency, destination_currency, fee_bps, valid_from, valid_until) VALUES ('10000000-0000-0000-0000-000000000003', 'EUR', NULL, -1, now(), now() + interval '1 hour')",
-        "INSERT INTO fx_fee_rules (id, source_currency, destination_currency, fee_bps, valid_from, valid_until) VALUES ('10000000-0000-0000-0000-000000000004', 'EUR', 'EUR', 10001, now(), now())",
+        "INSERT INTO exchange_rates (id, source_currency, destination_currency, rate, valid_from, valid_until) VALUES ('10000000-0000-0000-0000-000000000002', 'EUR', 'pln', 1, now(), now() + interval '1 hour')",
+        "INSERT INTO exchange_rates (id, source_currency, destination_currency, rate, valid_from, valid_until) VALUES ('10000000-0000-0000-0000-000000000003', 'EUR', 'EUR', 1, now(), now() + interval '1 hour')",
+        "INSERT INTO exchange_rates (id, source_currency, destination_currency, rate, valid_from, valid_until) VALUES ('10000000-0000-0000-0000-000000000004', 'EUR', 'PLN', 0, now(), now() + interval '1 hour')",
+        "INSERT INTO exchange_rates (id, source_currency, destination_currency, rate, valid_from, valid_until) VALUES ('10000000-0000-0000-0000-000000000005', 'EUR', 'PLN', -1, now(), now() + interval '1 hour')",
+        "INSERT INTO exchange_rates (id, source_currency, destination_currency, rate, valid_from, valid_until) VALUES ('10000000-0000-0000-0000-000000000006', 'EUR', 'PLN', 1, now(), now())",
+        "INSERT INTO exchange_rates (id, source_currency, destination_currency, rate, valid_from, valid_until) VALUES ('10000000-0000-0000-0000-000000000007', 'EUR', 'PLN', 1, now(), now() - interval '1 hour')",
+        "INSERT INTO fx_fee_rules (id, source_currency, destination_currency, fee_bps, valid_from, valid_until) VALUES ('10000000-0000-0000-0000-000000000008', NULL, 'PLN', 1, now(), now() + interval '1 hour')",
+        "INSERT INTO fx_fee_rules (id, source_currency, destination_currency, fee_bps, valid_from, valid_until) VALUES ('10000000-0000-0000-0000-000000000009', 'EUR', NULL, 1, now(), now() + interval '1 hour')",
+        "INSERT INTO fx_fee_rules (id, source_currency, destination_currency, fee_bps, valid_from, valid_until) VALUES ('10000000-0000-0000-0000-000000000010', 'eur', 'PLN', 1, now(), now() + interval '1 hour')",
+        "INSERT INTO fx_fee_rules (id, source_currency, destination_currency, fee_bps, valid_from, valid_until) VALUES ('10000000-0000-0000-0000-000000000011', 'EUR', 'pln', 1, now(), now() + interval '1 hour')",
+        "INSERT INTO fx_fee_rules (id, source_currency, destination_currency, fee_bps, valid_from, valid_until) VALUES ('10000000-0000-0000-0000-000000000012', 'EUR', 'EUR', 1, now(), now() + interval '1 hour')",
+        "INSERT INTO fx_fee_rules (id, source_currency, destination_currency, fee_bps, valid_from, valid_until) VALUES ('10000000-0000-0000-0000-000000000013', 'EUR', 'PLN', -1, now(), now() + interval '1 hour')",
+        "INSERT INTO fx_fee_rules (id, source_currency, destination_currency, fee_bps, valid_from, valid_until) VALUES ('10000000-0000-0000-0000-000000000014', 'EUR', 'PLN', 10001, now(), now() + interval '1 hour')",
+        "INSERT INTO fx_fee_rules (id, source_currency, destination_currency, fee_bps, valid_from, valid_until) VALUES ('10000000-0000-0000-0000-000000000015', 'EUR', 'PLN', 1, now(), now())",
+        "INSERT INTO fx_fee_rules (id, source_currency, destination_currency, fee_bps, valid_from, valid_until) VALUES ('10000000-0000-0000-0000-000000000016', 'EUR', 'PLN', 1, now(), now() - interval '1 hour')",
     ] {
         assert!(sqlx::query(statement).execute(&pool).await.is_err());
     }
@@ -341,6 +440,12 @@ async fn fx_schema_constraints_indexes_and_rate_references_hold(pool: PgPool) ->
         .bind(source)
         .bind(destination)
         .bind(rate_id)
+        .execute(&pool)
+        .await?;
+    sqlx::query("INSERT INTO transfers (id, source_account_id, destination_account_id, source_currency, destination_currency, source_amount_minor, destination_amount_minor, total_source_debit_minor, kind, initiated_by) VALUES ($1, $2, $3, 'EUR', 'EUR', 1, 1, 1, 'transfer', 'owner')")
+        .bind(Uuid::new_v4())
+        .bind(source)
+        .bind(destination)
         .execute(&pool)
         .await?;
     assert!(
