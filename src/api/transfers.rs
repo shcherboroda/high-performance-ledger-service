@@ -15,8 +15,12 @@ use crate::{
     api_error::{AppError, ErrorEnvelope},
     app::AppState,
     auth::AuthenticatedClient,
+    fx::{
+        ArithmeticError, ConfigurationError, ExactRate, calculate_destination, calculate_fee,
+        select_exchange_rate, select_fee_rule,
+    },
     idempotency::{self, IdempotencyKey, Reservation},
-    money::{MoneyError, currency, format_minor_units, parse_minor_units},
+    money::{MoneyError, format_minor_units, parse_minor_units},
 };
 
 #[derive(Deserialize, ToSchema)]
@@ -28,18 +32,54 @@ pub(crate) struct CreateTransferRequest {
 }
 
 #[derive(Serialize, ToSchema)]
-pub(crate) struct TransferCreatedResponse {
-    id: Uuid,
-    source_account_id: Uuid,
-    destination_account_id: Uuid,
-    #[schema(example = "USD")]
-    currency: String,
-    #[schema(value_type = String, example = "10.25")]
-    amount: String,
-    status: &'static str,
-    resulting_source_balance: String,
-    resulting_destination_balance: String,
-    created_at: String,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum TransferCreatedResponse {
+    Transfer {
+        id: Uuid,
+        status: &'static str,
+        source_account_id: Uuid,
+        destination_account_id: Uuid,
+        #[schema(example = "EUR")]
+        currency: String,
+        #[schema(value_type = String, example = "100.00")]
+        amount: String,
+        created_at: String,
+    },
+    FxTransfer {
+        id: Uuid,
+        status: &'static str,
+        source_account_id: Uuid,
+        destination_account_id: Uuid,
+        #[schema(example = "EUR")]
+        source_currency: String,
+        #[schema(value_type = String, example = "100.00")]
+        source_amount: String,
+        #[schema(example = "PLN")]
+        destination_currency: String,
+        #[schema(value_type = String, example = "432.15")]
+        destination_amount: String,
+        #[schema(value_type = String, example = "1.00")]
+        fee_amount: String,
+        #[schema(value_type = String, example = "101.00")]
+        total_source_debit: String,
+        created_at: String,
+    },
+}
+
+#[derive(Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TransferKind {
+    Transfer,
+    FxTransfer,
+}
+
+impl TransferKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Transfer => "transfer",
+            Self::FxTransfer => "fx_transfer",
+        }
+    }
 }
 
 #[derive(Serialize, ToSchema)]
@@ -185,52 +225,29 @@ pub(crate) async fn create_transfer(
     }
 
     let mut transaction = state.pool.begin().await.map_err(AppError::internal)?;
-    if let Some((stored_fingerprint, http_status, response_body)) = idempotency::completed_success(
-        &mut transaction,
-        &client_id,
-        idempotency::TRANSFER_OPERATION,
-        &idempotency_key,
+    let preliminary = sqlx::query_as::<_, (String, i16, String, i16)>(
+        "SELECT source.currency, source.currency_scale, destination.currency, destination.currency_scale \
+         FROM accounts source JOIN accounts destination ON destination.id = $2 WHERE source.id = $1",
     )
+    .bind(source_account_id)
+    .bind(destination_account_id)
+    .fetch_optional(&mut *transaction)
     .await
     .map_err(AppError::internal)?
-    {
-        let currency_code = response_body
-            .get("currency")
-            .and_then(serde_json::Value::as_str)
-            .and_then(currency)
-            .ok_or_else(|| {
-                AppError::internal(anyhow::anyhow!("stored transfer response is invalid"))
-            })?;
-        let amount_minor = parse_minor_units(&request.amount, currency_code.scale())
-            .map_err(transfer_money_error)?;
-        if amount_minor <= 0 {
-            return Err(AppError::validation(
-                "non_positive_amount",
-                "The amount must be greater than zero",
-            ));
+    .ok_or_else(AppError::account_unavailable)?;
+    let operation_type = if preliminary.0 == preliminary.2 {
+        if preliminary.1 != preliminary.3 {
+            return Err(AppError::internal(anyhow::anyhow!(
+                "same currency accounts have different scales"
+            )));
         }
-        let fingerprint = idempotency::transfer_fingerprint(
-            source_account_id,
-            destination_account_id,
-            currency_code.code(),
-            amount_minor,
-        );
-        if fingerprint != stored_fingerprint {
-            return Err(AppError::idempotency_conflict());
-        }
-        transaction.commit().await.map_err(AppError::internal)?;
-        let status = StatusCode::from_u16(http_status as u16).map_err(AppError::internal)?;
-        return Ok((status, Json(response_body)).into_response());
-    }
-    let (fingerprint_currency, source_scale): (String, i16) =
-        sqlx::query_as("SELECT currency, currency_scale FROM accounts WHERE id = $1")
-            .bind(source_account_id)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(AppError::internal)?
-            .ok_or_else(AppError::account_unavailable)?;
-    let scale = u8::try_from(source_scale).map_err(AppError::internal)?;
-    let amount_minor = parse_minor_units(&request.amount, scale).map_err(transfer_money_error)?;
+        idempotency::TRANSFER_OPERATION
+    } else {
+        idempotency::FX_TRANSFER_OPERATION
+    };
+    let source_scale = u8::try_from(preliminary.1).map_err(AppError::internal)?;
+    let amount_minor =
+        parse_minor_units(&request.amount, source_scale).map_err(transfer_money_error)?;
     if amount_minor <= 0 {
         return Err(AppError::validation(
             "non_positive_amount",
@@ -240,13 +257,29 @@ pub(crate) async fn create_transfer(
     let fingerprint = idempotency::transfer_fingerprint(
         source_account_id,
         destination_account_id,
-        &fingerprint_currency,
+        &preliminary.0,
         amount_minor,
     );
+    if let Some((stored_fingerprint, http_status, response_body)) = idempotency::completed_success(
+        &mut transaction,
+        &client_id,
+        operation_type,
+        &idempotency_key,
+    )
+    .await
+    .map_err(AppError::internal)?
+    {
+        if fingerprint != stored_fingerprint {
+            return Err(AppError::idempotency_conflict());
+        }
+        transaction.commit().await.map_err(AppError::internal)?;
+        let status = StatusCode::from_u16(http_status as u16).map_err(AppError::internal)?;
+        return Ok((status, Json(response_body)).into_response());
+    }
     match idempotency::reserve(
         &mut transaction,
         &client_id,
-        idempotency::TRANSFER_OPERATION,
+        operation_type,
         &idempotency_key,
         &fingerprint,
         state.idempotency_retention,
@@ -265,6 +298,31 @@ pub(crate) async fn create_transfer(
         Reservation::Conflict => return Err(AppError::idempotency_conflict()),
         Reservation::Owned => {}
     }
+    let operation_time = sqlx::query_scalar("SELECT transaction_timestamp()")
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(AppError::internal)?;
+    let fx_configuration = if operation_type == idempotency::FX_TRANSFER_OPERATION {
+        let rate = select_exchange_rate(
+            &mut transaction,
+            &preliminary.0,
+            &preliminary.2,
+            operation_time,
+        )
+        .await
+        .map_err(transfer_configuration_error)?;
+        let fee = select_fee_rule(
+            &mut transaction,
+            &preliminary.0,
+            &preliminary.2,
+            operation_time,
+        )
+        .await
+        .map_err(transfer_configuration_error)?;
+        Some((rate, fee))
+    } else {
+        None
+    };
     let accounts = sqlx::query_as::<_, (Uuid, String, String, i16, i64, String)>(
         "SELECT id, owner_id, currency, currency_scale, balance_minor, status::text \
          FROM accounts WHERE id = ANY($1) ORDER BY id FOR UPDATE",
@@ -300,18 +358,62 @@ pub(crate) async fn create_transfer(
     if source.owner_id != client_id || source.status != "active" || destination.status != "active" {
         return Err(AppError::account_unavailable());
     }
-    if source.currency != destination.currency || source.scale != destination.scale {
-        return Err(AppError::business(
-            "currency_mismatch",
-            "The account currencies do not match",
-        ));
-    }
-    if source.currency != fingerprint_currency || source.scale != source_scale {
+    if (
+        source.currency.as_str(),
+        source.scale,
+        destination.currency.as_str(),
+        destination.scale,
+    ) != (
+        preliminary.0.as_str(),
+        preliminary.1,
+        preliminary.2.as_str(),
+        preliminary.3,
+    ) {
         return Err(AppError::internal(anyhow::anyhow!(
             "account currency metadata changed during transfer"
         )));
     }
-    if source.balance_minor < amount_minor {
+    let (
+        kind,
+        destination_amount_minor,
+        fee_amount_minor,
+        total_source_debit_minor,
+        fee_bps,
+        exchange_rate,
+        exchange_rate_id,
+    ) = match fx_configuration {
+        None => (
+            TransferKind::Transfer,
+            amount_minor,
+            0,
+            amount_minor,
+            None,
+            None,
+            None,
+        ),
+        Some((rate, fee)) => {
+            let fee_calculation =
+                calculate_fee(amount_minor, fee.fee_bps).map_err(transfer_arithmetic_error)?;
+            let exact_rate = ExactRate::parse(&rate.rate).map_err(transfer_arithmetic_error)?;
+            let destination_amount = calculate_destination(
+                amount_minor,
+                source.scale as u8,
+                destination.scale as u8,
+                &exact_rate,
+            )
+            .map_err(transfer_arithmetic_error)?;
+            (
+                TransferKind::FxTransfer,
+                destination_amount,
+                fee_calculation.fee_minor,
+                fee_calculation.total_source_debit_minor,
+                Some(fee.fee_bps),
+                Some(rate.rate),
+                Some(rate.id),
+            )
+        }
+    };
+    if source.balance_minor < total_source_debit_minor {
         return Err(AppError::business(
             "insufficient_funds",
             "The source account has insufficient funds",
@@ -319,20 +421,22 @@ pub(crate) async fn create_transfer(
     }
     let source_balance = source
         .balance_minor
-        .checked_sub(amount_minor)
-        .ok_or_else(|| AppError::internal(anyhow::anyhow!("source balance overflow")))?;
+        .checked_sub(total_source_debit_minor)
+        .ok_or_else(|| {
+            AppError::business("arithmetic_overflow", "The transfer amount is out of range")
+        })?;
     let destination_balance = destination
         .balance_minor
-        .checked_add(amount_minor)
-        .ok_or_else(|| AppError::internal(anyhow::anyhow!("destination balance overflow")))?;
+        .checked_add(destination_amount_minor)
+        .ok_or_else(|| {
+            AppError::business("arithmetic_overflow", "The transfer amount is out of range")
+        })?;
     let transfer_id = Uuid::new_v4();
-    // Fee and rate fields preserve the original operation snapshot for auditability;
-    // they are not an additional fee charged by the reversal.
     let created_at: String = sqlx::query_scalar(
-        "INSERT INTO transfers (id, source_account_id, destination_account_id, source_currency, destination_currency, source_amount_minor, destination_amount_minor, total_source_debit_minor, kind, initiated_by) \
-         VALUES ($1, $2, $3, $4, $4, $5, $5, $5, 'transfer', $6) RETURNING created_at::text",
+        "INSERT INTO transfers (id, source_account_id, destination_account_id, source_currency, destination_currency, source_amount_minor, destination_amount_minor, fee_amount_minor, total_source_debit_minor, fee_bps, exchange_rate, exchange_rate_id, kind, initiated_by) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CAST($11 AS numeric), $12, $13::transfer_kind, $14) RETURNING created_at::text",
     )
-    .bind(transfer_id).bind(source_account_id).bind(destination_account_id).bind(&source.currency).bind(amount_minor).bind(&client_id)
+    .bind(transfer_id).bind(source_account_id).bind(destination_account_id).bind(&source.currency).bind(&destination.currency).bind(amount_minor).bind(destination_amount_minor).bind(fee_amount_minor).bind(total_source_debit_minor).bind(fee_bps).bind(exchange_rate).bind(exchange_rate_id).bind(kind.as_str()).bind(&client_id)
     .fetch_one(&mut *transaction).await.map_err(AppError::internal)?;
     for (id, balance) in [
         (source_account_id, source_balance),
@@ -341,33 +445,69 @@ pub(crate) async fn create_transfer(
         sqlx::query("UPDATE accounts SET balance_minor = $1, version = version + 1, updated_at = now() WHERE id = $2")
             .bind(balance).bind(id).execute(&mut *transaction).await.map_err(AppError::internal)?;
     }
-    for (account_id, counterparty_account_id, direction) in [
-        (source_account_id, destination_account_id, "debit"),
-        (destination_account_id, source_account_id, "credit"),
+    let is_fx = matches!(kind, TransferKind::FxTransfer);
+    let source_principal = is_fx.then_some(amount_minor);
+    let source_fee = is_fx.then_some(fee_amount_minor);
+    let destination_principal = is_fx.then_some(destination_amount_minor);
+    for (account_id, counterparty_account_id, direction, amount, currency, principal, fee) in [
+        (
+            source_account_id,
+            destination_account_id,
+            "debit",
+            total_source_debit_minor,
+            &source.currency,
+            source_principal,
+            source_fee,
+        ),
+        (
+            destination_account_id,
+            source_account_id,
+            "credit",
+            destination_amount_minor,
+            &destination.currency,
+            destination_principal,
+            None,
+        ),
     ] {
         sqlx::query(
-            "INSERT INTO account_entries (id, account_id, transfer_id, counterparty_account_id, direction, operation_kind, amount_minor, currency) \
-             VALUES ($1, $2, $3, $4, $5::entry_direction, 'transfer', $6, $7)",
+            "INSERT INTO account_entries (id, account_id, transfer_id, counterparty_account_id, direction, operation_kind, amount_minor, currency, principal_amount_minor, fee_amount_minor) \
+             VALUES ($1, $2, $3, $4, $5::entry_direction, $6::transfer_kind, $7, $8, $9, $10)",
         )
-        .bind(Uuid::new_v4()).bind(account_id).bind(transfer_id).bind(counterparty_account_id).bind(direction).bind(amount_minor).bind(&source.currency)
+        .bind(Uuid::new_v4()).bind(account_id).bind(transfer_id).bind(counterparty_account_id).bind(direction).bind(kind.as_str()).bind(amount).bind(currency).bind(principal).bind(fee)
         .execute(&mut *transaction).await.map_err(AppError::internal)?;
     }
-    let response_body = serde_json::to_value(TransferCreatedResponse {
-        id: transfer_id,
-        source_account_id,
-        destination_account_id,
-        currency: source.currency.clone(),
-        amount: format_minor_units(amount_minor, scale),
-        status: "completed",
-        resulting_source_balance: format_minor_units(source_balance, scale),
-        resulting_destination_balance: format_minor_units(destination_balance, scale),
-        created_at,
-    })
-    .map_err(AppError::internal)?;
+    let response = match kind {
+        TransferKind::Transfer => TransferCreatedResponse::Transfer {
+            id: transfer_id,
+            status: "completed",
+            source_account_id,
+            destination_account_id,
+            currency: source.currency.clone(),
+            amount: format_minor_units(amount_minor, source.scale as u8),
+            created_at,
+        },
+        TransferKind::FxTransfer => TransferCreatedResponse::FxTransfer {
+            id: transfer_id,
+            status: "completed",
+            source_account_id,
+            destination_account_id,
+            source_currency: source.currency.clone(),
+            source_amount: format_minor_units(amount_minor, source.scale as u8),
+            destination_currency: destination.currency.clone(),
+            destination_amount: format_minor_units(
+                destination_amount_minor,
+                destination.scale as u8,
+            ),
+            fee_amount: format_minor_units(fee_amount_minor, source.scale as u8),
+            total_source_debit: format_minor_units(total_source_debit_minor, source.scale as u8),
+            created_at,
+        },
+    };
+    let response_body = serde_json::to_value(response).map_err(AppError::internal)?;
     idempotency::store_success(
         &mut transaction,
         &client_id,
-        idempotency::TRANSFER_OPERATION,
+        operation_type,
         &idempotency_key,
         StatusCode::CREATED.as_u16().into(),
         &response_body,
@@ -394,5 +534,85 @@ fn transfer_money_error(error: MoneyError) -> AppError {
         MoneyError::Overflow => {
             AppError::validation("amount_overflow", "The amount is out of range")
         }
+    }
+}
+
+fn transfer_configuration_error(error: ConfigurationError) -> AppError {
+    match error {
+        ConfigurationError::RateUnavailable => {
+            AppError::business("rate_unavailable", "An FX rate is unavailable")
+        }
+        ConfigurationError::RateAmbiguous => AppError::business(
+            "rate_configuration_ambiguous",
+            "FX rate configuration is ambiguous",
+        ),
+        ConfigurationError::FeeRuleUnavailable => {
+            AppError::business("fee_rule_unavailable", "An FX fee rule is unavailable")
+        }
+        ConfigurationError::FeeRuleAmbiguous => AppError::business(
+            "fee_rule_configuration_ambiguous",
+            "FX fee rule configuration is ambiguous",
+        ),
+        ConfigurationError::Database(error) => AppError::internal(error),
+    }
+}
+
+fn transfer_arithmetic_error(error: ArithmeticError) -> AppError {
+    match error {
+        ArithmeticError::DestinationTooSmall => AppError::business(
+            "destination_amount_too_small",
+            "The converted destination amount rounds to zero",
+        ),
+        ArithmeticError::Overflow => {
+            AppError::business("arithmetic_overflow", "The transfer amount is out of range")
+        }
+        ArithmeticError::InvalidRate
+        | ArithmeticError::InvalidScale
+        | ArithmeticError::InvalidAmount => {
+            AppError::internal(anyhow::anyhow!("invalid persisted FX configuration"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod response_tests {
+    use super::*;
+
+    #[test]
+    fn create_response_variants_are_internally_tagged() {
+        let id = Uuid::nil();
+        let ordinary = serde_json::to_value(TransferCreatedResponse::Transfer {
+            id,
+            status: "completed",
+            source_account_id: id,
+            destination_account_id: id,
+            currency: "EUR".into(),
+            amount: "100.00".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        })
+        .unwrap();
+        assert_eq!(ordinary["kind"], "transfer");
+        assert!(ordinary.get("transfer").is_none());
+        assert!(ordinary.get("Transfer").is_none());
+        assert!(ordinary.get("source_currency").is_none());
+
+        let fx = serde_json::to_value(TransferCreatedResponse::FxTransfer {
+            id,
+            status: "completed",
+            source_account_id: id,
+            destination_account_id: id,
+            source_currency: "EUR".into(),
+            source_amount: "100.00".into(),
+            destination_currency: "PLN".into(),
+            destination_amount: "432.15".into(),
+            fee_amount: "1.00".into(),
+            total_source_debit: "101.00".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        })
+        .unwrap();
+        assert_eq!(fx["kind"], "fx_transfer");
+        assert!(fx.get("fx_transfer").is_none());
+        assert!(fx.get("FxTransfer").is_none());
+        assert!(fx.get("currency").is_none());
     }
 }

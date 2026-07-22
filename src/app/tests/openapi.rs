@@ -51,6 +51,7 @@ async fn openapi_serves_documented_api_contract() {
     assert!(paths.contains_key("/accounts/{account_id}/balance"));
     assert!(paths.contains_key("/accounts/{account_id}/entries"));
     assert!(paths.contains_key("/transfers"));
+    assert!(!paths.contains_key("/fx-transfers"));
     assert!(paths.contains_key("/transfers/{transfer_id}"));
     assert!(paths.contains_key("/transfers/{transfer_id}/reversal"));
     assert!(paths["/ready"]["get"]["responses"].get("200").is_some());
@@ -141,6 +142,96 @@ async fn openapi_serves_documented_api_contract() {
     assert!(schemas.contains_key("TransferDetailsResponse"));
     assert!(schemas.contains_key("AccountEntryResponse"));
     assert!(schemas.contains_key("AccountHistoryResponse"));
+    let transfer_response = &schemas["TransferCreatedResponse"];
+    let variants = transfer_response["oneOf"].as_array().unwrap();
+    assert_eq!(variants.len(), 2);
+    let variant = |kind: &str| {
+        variants
+            .iter()
+            .find(|schema| schema["properties"]["kind"]["enum"] == json!([kind]))
+            .unwrap()
+    };
+    let ordinary = variant("transfer");
+    let ordinary_properties = ordinary["properties"].as_object().unwrap();
+    let ordinary_required = ordinary["required"].as_array().unwrap();
+    for name in [
+        "id",
+        "kind",
+        "status",
+        "source_account_id",
+        "destination_account_id",
+        "currency",
+        "amount",
+        "created_at",
+    ] {
+        assert!(
+            ordinary_properties.contains_key(name),
+            "ordinary missing {name}"
+        );
+        assert!(ordinary_required.iter().any(|field| field == name));
+    }
+    for absent in [
+        "source_currency",
+        "source_amount",
+        "destination_currency",
+        "destination_amount",
+        "fee_amount",
+        "total_source_debit",
+        "resulting_source_balance",
+        "resulting_destination_balance",
+    ] {
+        assert!(
+            !ordinary_properties.contains_key(absent),
+            "ordinary contains {absent}"
+        );
+        assert!(!ordinary_required.iter().any(|field| field == absent));
+    }
+    let fx = variant("fx_transfer");
+    let fx_properties = fx["properties"].as_object().unwrap();
+    let fx_required = fx["required"].as_array().unwrap();
+    for name in [
+        "id",
+        "kind",
+        "status",
+        "source_account_id",
+        "destination_account_id",
+        "source_currency",
+        "source_amount",
+        "destination_currency",
+        "destination_amount",
+        "fee_amount",
+        "total_source_debit",
+        "created_at",
+    ] {
+        assert!(fx_properties.contains_key(name), "FX missing {name}");
+        assert!(fx_required.iter().any(|field| field == name));
+        assert!(!fx_properties[name].to_string().contains("null"));
+    }
+    for absent in [
+        "currency",
+        "amount",
+        "resulting_source_balance",
+        "resulting_destination_balance",
+    ] {
+        assert!(!fx_properties.contains_key(absent), "FX contains {absent}");
+        assert!(!fx_required.iter().any(|field| field == absent));
+    }
+    let transfer_request = &schemas["CreateTransferRequest"];
+    assert_eq!(
+        transfer_request["required"],
+        json!(["source_account_id", "destination_account_id", "amount"])
+    );
+    assert_eq!(
+        paths["/transfers"]["post"]["responses"]["201"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/TransferCreatedResponse"
+    );
+    for status in ["400", "401", "404", "409", "422", "500"] {
+        assert!(
+            paths["/transfers"]["post"]["responses"]
+                .get(status)
+                .is_some()
+        );
+    }
     assert_local_schema_references_resolve(&document, schemas);
     assert!(!std::str::from_utf8(&body).unwrap().contains("postgres://"));
 }
