@@ -31,7 +31,12 @@ pub struct Config {
     )]
     pub output: PathBuf,
     /// Required acknowledgement: this benchmark migrates and removes benchmark-owned data.
-    #[arg(long, env = "BENCHMARK_ALLOW_DESTRUCTIVE", default_value_t = false)]
+    #[arg(
+        long,
+        env = "BENCHMARK_ALLOW_DESTRUCTIVE",
+        default_value_t = false,
+        value_parser = parse_destructive_acknowledgement
+    )]
     pub allow_destructive: bool,
     #[arg(long, env = "BENCHMARK_JWT_ISSUER")]
     pub jwt_issuer: String,
@@ -47,6 +52,14 @@ pub struct Config {
     /// Operator-supplied telemetry/logging mode; never inferred.
     #[arg(long, env = "BENCHMARK_TELEMETRY_MODE")]
     pub telemetry_mode: Option<String>,
+}
+
+fn parse_destructive_acknowledgement(value: &str) -> std::result::Result<bool, String> {
+    match value {
+        "1" | "true" | "TRUE" | "True" => Ok(true),
+        "0" | "false" | "FALSE" | "False" => Ok(false),
+        _ => Err("must be one of 1, 0, true, or false".into()),
+    }
 }
 
 impl Config {
@@ -164,5 +177,14 @@ mod tests {
         let mut config = valid();
         config.jwt_lifetime_secs = 1;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn destructive_acknowledgement_accepts_documented_environment_values() {
+        assert!(parse_destructive_acknowledgement("1").unwrap());
+        assert!(parse_destructive_acknowledgement("true").unwrap());
+        assert!(!parse_destructive_acknowledgement("0").unwrap());
+        assert!(!parse_destructive_acknowledgement("false").unwrap());
+        assert!(parse_destructive_acknowledgement("yes").is_err());
     }
 }

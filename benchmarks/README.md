@@ -6,7 +6,7 @@ This package is a reproducible HTTP/PostgreSQL harness. Its only scenario is a s
 
 Use a release-built service started separately from this package. PostgreSQL must contain a dedicated database whose ASCII name ends in `_benchmark` (normally `ledger_benchmark`). The benchmark role needs permission to create/use the schema migrations and to delete only its benchmark-owned rows. Never point it at `ledger` or any shared database.
 
-The command refuses all destructive setup unless both conditions hold: `BENCHMARK_ALLOW_DESTRUCTIVE=1` (or `--allow-destructive`) and a safely parsed database name ending in `_benchmark`. Preparation applies the repository migrations and removes data owned by the deterministic `benchmark-<seed>-*` subjects only. Migrations, setup, cleanup, token generation, warm-up, snapshots, verification, and report writing are outside measured latency.
+The command refuses all destructive setup unless both conditions hold: `BENCHMARK_ALLOW_DESTRUCTIVE=1` (or `--allow-destructive`) and a safely parsed database name ending in `_benchmark`. The environment acknowledgement accepts `1`/`0` and `true`/`false`; the CLI flag remains a normal valueless boolean flag. Preparation applies the repository migrations and removes data owned by the deterministic `benchmark-<seed>-*` subjects only. Migrations, setup, cleanup, token generation, warm-up, snapshots, verification, and report writing are outside measured latency.
 
 Create the database and role according to local PostgreSQL policy, for example:
 
