@@ -24,9 +24,16 @@ pub struct ReplaySnapshot {
 pub struct AccountPoolSnapshot {
     pub transfers: i64,
     pub entries: i64,
-    pub idempotency_records: i64,
-    pub duplicate_side_effects: i64,
+    pub key_mappings: Vec<AccountPoolKeyMapping>,
     pub balances: BTreeMap<Uuid, i64>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountPoolKeyMapping {
+    pub key: String,
+    pub record_count: i64,
+    pub resulting_transfer_id: Option<Uuid>,
+    pub transfer_count: i64,
+    pub entry_count: i64,
 }
 fn check(name: &str, passed: bool, detail: String) -> Check {
     Check {
@@ -245,20 +252,41 @@ pub async fn account_pool(
     pool: &sqlx::PgPool,
     account_ids: &[Uuid],
     expected_balances: &[i64],
-    measured_keys: &[String],
+    measured_plans: &[crate::dataset::TransferPlan],
     expected_transfers: usize,
 ) -> anyhow::Result<Verification> {
     let balances = balances(pool, account_ids).await?;
-    let transfers: i64 = sqlx::query_scalar("SELECT count(*) FROM transfers WHERE id IN (SELECT resulting_resource_id FROM idempotency_records WHERE operation_type='transfer' AND idempotency_key=ANY($1))").bind(measured_keys).fetch_one(pool).await?;
-    let entries: i64 = sqlx::query_scalar("SELECT count(*) FROM account_entries WHERE transfer_id IN (SELECT resulting_resource_id FROM idempotency_records WHERE operation_type='transfer' AND idempotency_key=ANY($1))").bind(measured_keys).fetch_one(pool).await?;
-    let records: i64 = sqlx::query_scalar("SELECT count(*) FROM idempotency_records WHERE operation_type='transfer' AND idempotency_key=ANY($1)").bind(measured_keys).fetch_one(pool).await?;
-    let duplicate_side_effects: i64 = sqlx::query_scalar("SELECT count(*) FROM (SELECT resulting_resource_id FROM idempotency_records WHERE operation_type='transfer' AND idempotency_key=ANY($1) GROUP BY resulting_resource_id HAVING count(*) > 1) duplicates").bind(measured_keys).fetch_one(pool).await?;
+    let client_ids = measured_plans
+        .iter()
+        .map(|plan| plan.owner.clone())
+        .collect::<Vec<_>>();
+    let keys = measured_plans
+        .iter()
+        .map(|plan| plan.key.clone())
+        .collect::<Vec<_>>();
+    let key_mappings: Vec<AccountPoolKeyMapping> = sqlx::query_as::<_, (String, i64, Option<Uuid>, i64, i64)>(
+        "SELECT planned.idempotency_key, record.record_count, record.resulting_transfer_id, \
+         count(DISTINCT transfer.id), count(entry.id) \
+         FROM unnest($1::text[], $2::text[]) AS planned(client_id, idempotency_key) \
+         LEFT JOIN LATERAL (SELECT count(*)::bigint AS record_count, max(resulting_resource_id) AS resulting_transfer_id \
+             FROM idempotency_records WHERE client_id=planned.client_id AND operation_type='transfer' AND idempotency_key=planned.idempotency_key) record ON true \
+         LEFT JOIN transfers transfer ON transfer.id=record.resulting_transfer_id \
+         LEFT JOIN account_entries entry ON entry.transfer_id=record.resulting_transfer_id \
+         GROUP BY planned.idempotency_key, record.record_count, record.resulting_transfer_id",
+    ).bind(&client_ids).bind(&keys).fetch_all(pool).await?
+        .into_iter()
+        .map(|(key, record_count, resulting_transfer_id, transfer_count, entry_count)| AccountPoolKeyMapping { key, record_count, resulting_transfer_id, transfer_count, entry_count })
+        .collect();
+    let transfers = key_mappings
+        .iter()
+        .map(|mapping| mapping.transfer_count)
+        .sum();
+    let entries = key_mappings.iter().map(|mapping| mapping.entry_count).sum();
     Ok(evaluate_account_pool(
         AccountPoolSnapshot {
             transfers,
             entries,
-            idempotency_records: records,
-            duplicate_side_effects,
+            key_mappings,
             balances,
         },
         account_ids,
@@ -289,20 +317,36 @@ pub fn evaluate_account_pool(
             format!("expected {}, found {}", expected * 2, snapshot.entries),
         ),
         check(
-            "one_idempotency_record_per_planned_key",
-            snapshot.idempotency_records == expected as i64,
+            "every_planned_key_has_exactly_one_idempotency_record",
+            snapshot.key_mappings.len() == expected
+                && snapshot
+                    .key_mappings
+                    .iter()
+                    .all(|mapping| mapping.record_count == 1),
             format!(
-                "expected {expected}, found {}",
-                snapshot.idempotency_records
+                "expected {expected} key mappings, found {}",
+                snapshot.key_mappings.len()
             ),
         ),
         check(
+            "every_planned_key_maps_to_one_transfer_with_two_entries",
+            snapshot.key_mappings.iter().all(|mapping| {
+                mapping.resulting_transfer_id.is_some()
+                    && mapping.transfer_count == 1
+                    && mapping.entry_count == 2
+            }),
+            "each planned key must map to one committed transfer and two entries".into(),
+        ),
+        check(
             "no_duplicate_transfer_side_effects",
-            snapshot.duplicate_side_effects == 0,
-            format!(
-                "duplicate transfer side-effect groups: {}",
-                snapshot.duplicate_side_effects
-            ),
+            snapshot
+                .key_mappings
+                .iter()
+                .filter_map(|mapping| mapping.resulting_transfer_id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                == expected,
+            "every planned key must map to a distinct transfer".into(),
         ),
         check(
             "entire_account_pool_exists",
@@ -367,18 +411,26 @@ mod tests {
         }
     }
     fn pool_snapshot(
-        transfers: i64,
-        entries: i64,
-        records: i64,
-        duplicates: i64,
+        key_mappings: Vec<AccountPoolKeyMapping>,
         balances: BTreeMap<Uuid, i64>,
     ) -> AccountPoolSnapshot {
         AccountPoolSnapshot {
-            transfers,
-            entries,
-            idempotency_records: records,
-            duplicate_side_effects: duplicates,
+            transfers: key_mappings
+                .iter()
+                .map(|mapping| mapping.transfer_count)
+                .sum(),
+            entries: key_mappings.iter().map(|mapping| mapping.entry_count).sum(),
+            key_mappings,
             balances,
+        }
+    }
+    fn mapping(key: &str, transfer: Option<Uuid>) -> AccountPoolKeyMapping {
+        AccountPoolKeyMapping {
+            key: key.into(),
+            record_count: 1,
+            resulting_transfer_id: transfer,
+            transfer_count: i64::from(transfer.is_some()),
+            entry_count: if transfer.is_some() { 2 } else { 0 },
         }
     }
     #[test]
@@ -419,13 +471,16 @@ mod tests {
     #[test]
     fn account_pool_rejects_missing_balances_counts_and_conservation_failures() {
         let ids = [Uuid::nil(), Uuid::max()];
+        let mappings = || {
+            vec![
+                mapping("key-1", Some(Uuid::new_v4())),
+                mapping("key-2", Some(Uuid::new_v4())),
+            ]
+        };
         let valid = || {
             evaluate_account_pool(
                 pool_snapshot(
-                    2,
-                    4,
-                    2,
-                    0,
+                    mappings(),
                     BTreeMap::from([(ids[0], 10_000), (ids[1], 10_000)]),
                 ),
                 &ids,
@@ -437,10 +492,7 @@ mod tests {
         assert!(
             !evaluate_account_pool(
                 pool_snapshot(
-                    1,
-                    4,
-                    2,
-                    0,
+                    vec![mapping("key-1", Some(Uuid::new_v4()))],
                     BTreeMap::from([(ids[0], 10_000), (ids[1], 10_000)])
                 ),
                 &ids,
@@ -452,10 +504,10 @@ mod tests {
         assert!(
             !evaluate_account_pool(
                 pool_snapshot(
-                    2,
-                    4,
-                    2,
-                    1,
+                    vec![
+                        mapping("key-1", Some(Uuid::nil())),
+                        mapping("key-2", Some(Uuid::nil()))
+                    ],
                     BTreeMap::from([(ids[0], 10_000), (ids[1], 10_000)])
                 ),
                 &ids,
@@ -467,10 +519,13 @@ mod tests {
         assert!(
             !evaluate_account_pool(
                 pool_snapshot(
-                    2,
-                    3,
-                    2,
-                    0,
+                    vec![
+                        mapping("key-1", Some(Uuid::new_v4())),
+                        AccountPoolKeyMapping {
+                            entry_count: 1,
+                            ..mapping("key-2", Some(Uuid::new_v4()))
+                        }
+                    ],
                     BTreeMap::from([(ids[0], 10_000), (ids[1], 10_000)])
                 ),
                 &ids,
@@ -482,10 +537,13 @@ mod tests {
         assert!(
             !evaluate_account_pool(
                 pool_snapshot(
-                    2,
-                    4,
-                    1,
-                    0,
+                    vec![
+                        mapping("key-1", Some(Uuid::new_v4())),
+                        AccountPoolKeyMapping {
+                            record_count: 0,
+                            ..mapping("key-2", Some(Uuid::new_v4()))
+                        }
+                    ],
                     BTreeMap::from([(ids[0], 10_000), (ids[1], 10_000)])
                 ),
                 &ids,
@@ -496,7 +554,7 @@ mod tests {
         );
         assert!(
             !evaluate_account_pool(
-                pool_snapshot(2, 4, 2, 0, BTreeMap::from([(ids[0], -1)])),
+                pool_snapshot(mappings(), BTreeMap::from([(ids[0], -1)])),
                 &ids,
                 &[10_000, 10_000],
                 2
@@ -506,10 +564,7 @@ mod tests {
         assert!(
             !evaluate_account_pool(
                 pool_snapshot(
-                    2,
-                    4,
-                    2,
-                    0,
+                    mappings(),
                     BTreeMap::from([(ids[0], 10_001), (ids[1], 10_000)])
                 ),
                 &ids,

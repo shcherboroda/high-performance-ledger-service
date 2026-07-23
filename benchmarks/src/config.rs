@@ -134,6 +134,9 @@ impl Config {
         {
             bail!("account pool size must be between 2 and {MAX_ACCOUNT_POOL_SIZE}")
         }
+        if self.scenario == Scenario::AccountPool && self.operations <= self.account_pool_size {
+            bail!("account-pool operations must exceed account pool size to reuse accounts")
+        }
         parse_concurrency_levels(&self.concurrency_levels)?;
         if self.request_timeout_secs == 0 || self.jwt_lifetime_secs == 0 {
             bail!("request timeout and JWT lifetime must be greater than zero")
@@ -297,6 +300,10 @@ mod tests {
         config.account_pool_size = MAX_ACCOUNT_POOL_SIZE + 1;
         assert!(config.validate().is_err());
         config.account_pool_size = 2;
+        config.operations = 2;
+        assert!(config.validate().is_err());
+        config.operations = 3;
+        config.jwt_lifetime_secs = 64;
         assert!(config.validate().is_ok());
         config.scenario = Scenario::Independent;
         config.account_pool_size = 1;

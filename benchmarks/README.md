@@ -66,7 +66,7 @@ Concurrency levels are sorted, must be unique and nonzero, and are conservativel
 
 ## Account-pool workload
 
-`account-pool` is for sustained same-currency transfer traffic over pre-created accounts; it is not a production capacity test. `--account-pool-size` defaults to 1000, has effect only for this scenario, and has a conservative local maximum of 10,000 accounts. `--operations` stays independent and can be larger than the pool size.
+`account-pool` is for sustained same-currency transfer traffic over pre-created accounts; it is not a production capacity test. `--account-pool-size` defaults to 1000, has effect only for this scenario, and has a conservative local maximum of 10,000 accounts. `--operations` stays independently configurable but must be strictly larger than the pool size, ensuring measured accounts are reused.
 
 Every account starts with $100.00 and has a deterministic owner selected from the bounded logical-client set. The plan uses a seed-derived ring offset. Each phase has at most one outgoing and one incoming transfer per account, then phases execute sequentially. Therefore concurrent requests inside a phase cannot overdraft an account; phase coordination is outside individual HTTP latency samples but inside the measured wall-clock interval. Account creation, plan generation, and warm-up remain outside the interval.
 

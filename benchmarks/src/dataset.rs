@@ -175,9 +175,40 @@ mod tests {
     }
     #[test]
     fn account_pool_options_do_not_change_existing_scenario_plans() {
-        assert_eq!(
-            plans(ScenarioPlan::Independent, 2, 2, 1, 3),
-            plans(ScenarioPlan::Independent, 2, 2, 1, 3)
-        );
+        let baseline = vec![
+            TransferPlan {
+                owner: "benchmark-2-0".into(),
+                client: 0,
+                phase: "warmup",
+                source: 0,
+                destination: 0,
+                key: "benchmark-2-warmup-0-0".into(),
+            },
+            TransferPlan {
+                owner: "benchmark-2-1".into(),
+                client: 1,
+                phase: "measured",
+                source: 1,
+                destination: 1,
+                key: "benchmark-2-measured-1-1".into(),
+            },
+            TransferPlan {
+                owner: "benchmark-2-0".into(),
+                client: 0,
+                phase: "measured",
+                source: 2,
+                destination: 2,
+                key: "benchmark-2-measured-2-0".into(),
+            },
+            TransferPlan {
+                owner: "benchmark-2-1".into(),
+                client: 1,
+                phase: "measured",
+                source: 3,
+                destination: 3,
+                key: "benchmark-2-measured-3-1".into(),
+            },
+        ];
+        assert_eq!(plans(ScenarioPlan::Independent, 2, 2, 1, 3), baseline);
     }
 }

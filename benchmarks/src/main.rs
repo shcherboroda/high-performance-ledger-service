@@ -231,10 +231,7 @@ async fn run_level(
                     .as_deref()
                     .expect("account-pool setup provides all pool IDs"),
                 &dataset::expected_pool_balances(config.account_pool_size, &plans),
-                &plans[config.warmup_operations..]
-                    .iter()
-                    .map(|plan| plan.key.clone())
-                    .collect::<Vec<_>>(),
+                &plans[config.warmup_operations..],
                 config.operations,
             )
             .await?
