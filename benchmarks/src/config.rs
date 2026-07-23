@@ -182,6 +182,21 @@ mod tests {
     #[test]
     fn database_guard_fails_closed() {
         assert!(database_name("postgres://localhost/ledger_benchmark").is_ok());
-        assert!(database_name("postgres://localhost/ledger").is_err())
+        for url in [
+            "postgres://localhost/ledger",
+            "postgres://localhost/ledger_benchmark/extra",
+            "not a url",
+            "postgres://localhost/%6cedger_benchmark",
+        ] {
+            assert!(database_name(url).is_err(), "{url}");
+        }
+    }
+    #[test]
+    fn destructive_acknowledgement_accepts_only_documented_values() {
+        assert!(parse_destructive_acknowledgement("1").unwrap());
+        assert!(parse_destructive_acknowledgement("true").unwrap());
+        assert!(!parse_destructive_acknowledgement("0").unwrap());
+        assert!(!parse_destructive_acknowledgement("false").unwrap());
+        assert!(parse_destructive_acknowledgement("yes").is_err());
     }
 }

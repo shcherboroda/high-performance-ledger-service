@@ -77,38 +77,42 @@ async fn run_level(
         config.operations,
     );
     let accounts = prepare(config, http, tokens, &plans).await?;
-    let warmup = if config.scenario == Scenario::IdempotentReplay {
-        Vec::new()
-    } else {
-        run_phase(
+    let (warmup, prepared_ids, replay_before) = if config.scenario == Scenario::IdempotentReplay {
+        let originals = run_phase(http, tokens, &plans, &accounts, concurrency).await;
+        let prepared_ids = transfer_ids_by_key(&originals)?;
+        let warmup = run_phase(
             http,
             tokens,
             &plans[..config.warmup_operations],
-            &accounts,
+            &accounts[..config.warmup_operations],
             concurrency,
         )
-        .await
-    };
-    let (prepared_ids, pre_balances) = if config.scenario == Scenario::IdempotentReplay {
-        let replay_plans = &plans[config.warmup_operations..];
-        let replay_accounts = &accounts[config.warmup_operations..];
-        let originals = run_phase(http, tokens, replay_plans, replay_accounts, concurrency).await;
-        let ids = originals
+        .await;
+        let keys = plans
             .iter()
-            .map(|op| {
-                op.transfer_id.ok_or_else(|| {
-                    anyhow::anyhow!("replay preparation did not return a transfer ID")
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let ids_to_query = replay_accounts
-            .iter()
-            .flat_map(|(s, d)| [*s, *d])
+            .map(|plan| plan.key.clone())
             .collect::<Vec<_>>();
-        let balances = balances(pool, &ids_to_query).await?;
-        (ids, balances)
+        let before = verify::replay_snapshot(
+            pool,
+            &accounts,
+            &format!("benchmark-{}-%", config.seed),
+            &keys,
+        )
+        .await?;
+        (warmup, prepared_ids, Some(before))
     } else {
-        (Vec::new(), BTreeMap::new())
+        (
+            run_phase(
+                http,
+                tokens,
+                &plans[..config.warmup_operations],
+                &accounts[..config.warmup_operations],
+                concurrency,
+            )
+            .await,
+            BTreeMap::new(),
+            None,
+        )
     };
     let metrics_before = metrics(http).await;
     let started = Instant::now();
@@ -152,24 +156,28 @@ async fn run_level(
             .await?
         }
         Scenario::IdempotentReplay => {
-            let replay_ids = measured
+            let replay_ids = transfer_ids_by_key(&measured)?;
+            let expected_replay_ids = plans[config.warmup_operations..]
                 .iter()
-                .map(|op| op.transfer_id)
-                .collect::<Option<Vec<_>>>();
-            let same_ids = replay_ids.as_ref().is_some_and(|ids| ids == &prepared_ids);
-            let mut v = verify::replay(
+                .map(|plan| (plan.key.clone(), prepared_ids[&plan.key]))
+                .collect::<BTreeMap<_, _>>();
+            let keys = plans
+                .iter()
+                .map(|plan| plan.key.clone())
+                .collect::<Vec<_>>();
+            let after = verify::replay_snapshot(
                 pool,
-                &prepared_ids,
-                &accounts[config.warmup_operations..]
-                    .iter()
-                    .flat_map(|(s, d)| [*s, *d])
-                    .collect::<Vec<_>>(),
-                &pre_balances,
+                &accounts,
+                &format!("benchmark-{}-%", config.seed),
+                &keys,
             )
             .await?;
-            v.checks.push(verify_id_check(same_ids));
-            v.valid = v.checks.iter().all(|check| check.passed);
-            v
+            verify::evaluate_replay(
+                replay_before.as_ref().expect("replay snapshot exists"),
+                &after,
+                plans.len(),
+                replay_ids == expected_replay_ids,
+            )
         }
     };
     Ok(LevelResult {
@@ -189,12 +197,21 @@ async fn run_level(
         verification,
     })
 }
-fn verify_id_check(passed: bool) -> verify::Check {
-    verify::Check {
-        name: "replays_return_original_transfer_ids".into(),
-        passed,
-        detail: "each replay must return its prepared transfer ID".into(),
+fn transfer_ids_by_key(operations: &[http::Operation]) -> Result<BTreeMap<String, Uuid>> {
+    let mut ids = BTreeMap::new();
+    for operation in operations {
+        let key = operation
+            .request_key
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("operation is missing its request key"))?;
+        let id = operation
+            .transfer_id
+            .ok_or_else(|| anyhow::anyhow!("operation did not return a transfer ID"))?;
+        if ids.insert(key, id).is_some() {
+            anyhow::bail!("operation request keys must be unique");
+        }
     }
+    Ok(ids)
 }
 async fn prepare(
     config: &Config,
@@ -276,8 +293,11 @@ async fn run_phase(
         let key = plan.key.clone();
         set.spawn(async move {
             let _permit = permit.acquire_owned().await.expect("semaphore open");
-            http.transfer(index, &token, source, destination, &key)
-                .await
+            let mut operation = http
+                .transfer(index, &token, source, destination, &key)
+                .await;
+            operation.request_key = Some(key);
+            operation
         });
     }
     let mut operations = Vec::with_capacity(plans.len());
@@ -285,16 +305,6 @@ async fn run_phase(
         operations.push(operation.expect("benchmark task must not panic"))
     }
     operations
-}
-async fn balances(pool: &sqlx::PgPool, ids: &[Uuid]) -> Result<BTreeMap<Uuid, i64>> {
-    Ok(
-        sqlx::query_as::<_, (Uuid, i64)>("SELECT id,balance_minor FROM accounts WHERE id=ANY($1)")
-            .bind(ids)
-            .fetch_all(pool)
-            .await?
-            .into_iter()
-            .collect(),
-    )
 }
 fn tokens(config: &Config, private_key: &[u8]) -> Result<Vec<String>> {
     let key = EncodingKey::from_rsa_pem(private_key)?;

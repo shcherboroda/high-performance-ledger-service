@@ -19,6 +19,7 @@ pub struct Operation {
     pub classification: Classifications,
     pub valid: bool,
     pub transfer_id: Option<uuid::Uuid>,
+    pub request_key: Option<String>,
 }
 
 #[derive(Clone)]
@@ -95,6 +96,7 @@ impl Http {
                                     .get("id")
                                     .and_then(serde_json::Value::as_str)
                                     .and_then(|id| uuid::Uuid::parse_str(id).ok()),
+                                request_key: None,
                             }
                         }
                         _ => {
@@ -104,6 +106,7 @@ impl Http {
                                 classification,
                                 valid: false,
                                 transfer_id: None,
+                                request_key: None,
                             }
                         }
                     }
@@ -114,6 +117,7 @@ impl Http {
                         classification,
                         valid: false,
                         transfer_id: None,
+                        request_key: None,
                     }
                 }
             }
@@ -128,6 +132,7 @@ impl Http {
                     classification,
                     valid: false,
                     transfer_id: None,
+                    request_key: None,
                 }
             }
         }
@@ -203,6 +208,7 @@ mod tests {
             },
             valid: false,
             transfer_id: None,
+            request_key: None,
         };
         let measured = Operation {
             latency_ns: Some(100),
@@ -212,6 +218,7 @@ mod tests {
             },
             valid: true,
             transfer_id: None,
+            request_key: None,
         };
         let (classifications, samples, valid) = summarize_measured(&PhaseOperations {
             warmup: vec![warmup],
