@@ -35,6 +35,32 @@ For hot-account runs the shared source is funded for every warm-up and measured 
 
 ## Local one-instance smoke runs
 
+For a one-command local smoke run, create your ignored machine-specific configuration once. The
+runner reads the public key file and passes its contents to the service; do not put a multiline PEM
+directly in the configuration file:
+
+```bash
+cp benchmarks/local.env.example benchmarks/local.env
+# edit benchmarks/local.env with the dedicated ledger_benchmark URL and local key paths
+./benchmarks/run-local.sh smoke independent
+./benchmarks/run-local.sh smoke account-pool
+```
+
+Use another configuration file when needed with
+`./benchmarks/run-local.sh --config /path/to/local.env smoke independent`. The runner starts and
+stops only its recorded local service, prints the raw JSON path, and renders a read-only terminal
+summary after a successful run. Summaries can also be rendered directly:
+
+```bash
+./benchmarks/summarize-results.py benchmark-results/smoke-independent.json
+```
+
+Raw JSON is written under `benchmark-results/`; local service logs and PID files are at
+`benchmark-results/local-service.log` and `benchmark-results/local-service.pid`. The low-level
+scripts and direct CLI workflows below remain supported. The local configuration, runner, and
+summarizer only improve operation and result presentation: they do not alter benchmark semantics
+or production configuration.
+
 The local scripts use only benchmark-specific configuration. Export the dedicated database, the
 benchmark issuer/audience and private key used by the harness, and the matching public key used by
 the service:
