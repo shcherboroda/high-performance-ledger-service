@@ -33,7 +33,7 @@ def result(valid=True):
 
 class SummarizerTests(unittest.TestCase):
     def test_local_config_example_is_sourceable(self):
-        completed = subprocess.run(["bash", "-c", 'source "$1" && [[ "$BENCHMARK_DB_POOL_ASSUMPTIONS" == "local default pool configuration" ]] && [[ "$BENCHMARK_TELEMETRY_MODE" == "local metrics endpoint" ]]', "bash", str(CONFIG_EXAMPLE)], capture_output=True, text=True, check=False)
+        completed = subprocess.run(["bash", "-c", 'source "$1" && [[ "$BENCHMARK_DB_POOL_ASSUMPTIONS" == "1 local service instance; application default DB pool configuration" ]] && [[ "$BENCHMARK_TELEMETRY_MODE" == "RUST_LOG=warn; process-local Prometheus snapshots before and after each measured level" ]]', "bash", str(CONFIG_EXAMPLE)], capture_output=True, text=True, check=False)
         self.assertEqual(completed.returncode, 0, completed.stderr)
     def test_schema_v4_summary(self): self.assertEqual(summarizer.summarize(result()), 0)
     def test_label_aware_metrics_delta(self):
@@ -58,3 +58,47 @@ class SummarizerTests(unittest.TestCase):
         self.assertIn("instances | concurrency | completed/expected", output.getvalue())
         self.assertIn("1 | 2 | 20/20", output.getvalue())
         self.assertIn("2 | 2 | 20/20", output.getvalue())
+
+    def test_comparison_table_renders_adjacent_throughput_ratios(self):
+        document = result()
+        levels = document["topology_levels"][0]["levels"]
+        next_level = copy.deepcopy(levels[0])
+        next_level["concurrency"] = 4
+        next_level["throughput_operations_per_second"] = 150.0
+        levels.append(next_level)
+        output = io.StringIO()
+        with redirect_stdout(output): self.assertEqual(summarizer.summarize(document), 0)
+        self.assertIn("throughput ratio", output.getvalue())
+        self.assertIn("1.000", output.getvalue())
+        self.assertIn("1.500", output.getvalue())
+
+    def test_comparison_table_handles_zero_or_missing_throughput(self):
+        document = result()
+        levels = document["topology_levels"][0]["levels"]
+        levels[0]["throughput_operations_per_second"] = 0.0
+        next_level = copy.deepcopy(levels[0])
+        next_level["concurrency"] = 4
+        next_level["throughput_operations_per_second"] = None
+        levels.append(next_level)
+        output = io.StringIO()
+        with redirect_stdout(output): self.assertEqual(summarizer.summarize(document), 0)
+        self.assertIn("unavailable", output.getvalue())
+
+    def test_comparison_ratios_are_independent_per_topology(self):
+        document = result()
+        first = document["topology_levels"][0]
+        first["levels"].append(copy.deepcopy(first["levels"][0]))
+        first["levels"][1]["concurrency"] = 4
+        first["levels"][1]["throughput_operations_per_second"] = 200.0
+        second = copy.deepcopy(first)
+        second["configured_instances"] = 2
+        second["levels"][0]["throughput_operations_per_second"] = 50.0
+        second["levels"][1]["throughput_operations_per_second"] = 100.0
+        document["topology_levels"].append(second)
+        output = io.StringIO()
+        with redirect_stdout(output): self.assertEqual(summarizer.summarize(document), 0)
+        lines = [line for line in output.getvalue().splitlines() if " | " in line and line[0].isdigit()]
+        self.assertTrue(lines[0].endswith("| 1.000"))
+        self.assertTrue(lines[1].endswith("| 2.000"))
+        self.assertTrue(lines[2].endswith("| 1.000"))
+        self.assertTrue(lines[3].endswith("| 2.000"))
