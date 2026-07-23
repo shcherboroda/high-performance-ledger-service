@@ -2,7 +2,7 @@ use crate::{http::Classifications, stats::Latency, verify::Verification};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::{collections::BTreeMap, path::Path};
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 #[derive(Debug, Serialize)]
 pub struct LevelResult {
     pub scenario: String,
@@ -15,6 +15,7 @@ pub struct LevelResult {
     pub throughput_operations_per_second: f64,
     pub latency: Option<Latency>,
     pub classifications: Classifications,
+    pub measured_requests_per_url: BTreeMap<String, usize>,
     pub metrics_before: BTreeMap<String, Result<String, String>>,
     pub metrics_after: BTreeMap<String, Result<String, String>>,
     pub verification: Verification,
@@ -26,21 +27,52 @@ pub struct MatrixSummary {
     pub adjacent_throughput_changes: Vec<f64>,
 }
 #[derive(Debug, Serialize)]
+pub struct TopologyLevelResult {
+    pub configured_instances: usize,
+    pub service_urls: Vec<String>,
+    pub readiness: BTreeMap<String, Result<(), String>>,
+    pub levels: Vec<LevelResult>,
+    pub valid: bool,
+}
+#[derive(Debug, Serialize)]
+pub struct TopologySummary {
+    pub adjacent_throughput_ratios: Vec<Option<f64>>,
+}
+#[derive(Debug, Serialize)]
 pub struct ResultDocument {
     pub schema_version: u32,
     pub generated_at_utc: DateTime<Utc>,
     pub commit_sha: Option<String>,
     pub scenario: String,
     pub seed: u64,
-    pub service_urls: Vec<String>,
+    pub topology_levels: Vec<TopologyLevelResult>,
     pub logical_clients: usize,
     pub request_timeout_secs: u64,
-    pub levels: Vec<LevelResult>,
-    pub summary: MatrixSummary,
+    pub summary: TopologySummary,
     pub database_pool_assumptions: Option<String>,
     pub telemetry_mode: Option<String>,
     pub environment: BTreeMap<String, String>,
     pub limitations: Vec<String>,
+}
+pub fn summarize_topologies(levels: &[TopologyLevelResult]) -> TopologySummary {
+    TopologySummary {
+        adjacent_throughput_ratios: levels
+            .windows(2)
+            .map(
+                |pair| match (pair[0].levels.first(), pair[1].levels.first()) {
+                    (Some(before), Some(after))
+                        if before.throughput_operations_per_second > 0.0 =>
+                    {
+                        Some(
+                            after.throughput_operations_per_second
+                                / before.throughput_operations_per_second,
+                        )
+                    }
+                    _ => None,
+                },
+            )
+            .collect(),
+    }
 }
 pub fn summarize(levels: &[LevelResult]) -> MatrixSummary {
     let adjacent_throughput_changes = levels
@@ -88,6 +120,7 @@ mod tests {
             throughput_operations_per_second: throughput,
             latency: None,
             classifications: Classifications::default(),
+            measured_requests_per_url: BTreeMap::new(),
             metrics_before: BTreeMap::new(),
             metrics_after: BTreeMap::new(),
             verification: Verification {
@@ -99,5 +132,21 @@ mod tests {
         let s = summarize(&[l(1, 10., true), l(2, 15., true)]);
         assert_eq!(s.highest_valid_tested_level, Some(2));
         assert_eq!(s.adjacent_throughput_changes, vec![0.5]);
+    }
+    #[test]
+    fn topology_summary_serializes_versioned_levels() {
+        let topology = TopologyLevelResult {
+            configured_instances: 2,
+            service_urls: vec!["http://a".into(), "http://b".into()],
+            readiness: BTreeMap::from([("http://a".into(), Ok(())), ("http://b".into(), Ok(()))]),
+            levels: vec![],
+            valid: true,
+        };
+        let summary = summarize_topologies(&[topology]);
+        assert_eq!(
+            summary.adjacent_throughput_ratios,
+            Vec::<Option<f64>>::new()
+        );
+        assert!(serde_json::to_value(summary).is_ok());
     }
 }

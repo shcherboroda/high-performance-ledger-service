@@ -20,6 +20,7 @@ pub struct Operation {
     pub valid: bool,
     pub transfer_id: Option<uuid::Uuid>,
     pub request_key: Option<String>,
+    pub service_url: String,
 }
 
 #[derive(Clone)]
@@ -37,6 +38,22 @@ impl Http {
     }
     pub fn url_for(&self, operation: usize) -> &str {
         &self.urls[operation % self.urls.len()]
+    }
+    pub fn urls(&self) -> &[String] {
+        &self.urls
+    }
+    pub async fn ready(&self, operation: usize) -> Result<(), String> {
+        self.client
+            .get(format!(
+                "{}/ready",
+                self.url_for(operation).trim_end_matches('/')
+            ))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?
+            .error_for_status()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
     pub async fn create_account(
         &self,
@@ -74,6 +91,7 @@ impl Http {
         key: &str,
     ) -> Operation {
         let started = Instant::now();
+        let service_url = self.url_for(operation).to_owned();
         let response = self.client.post(format!("{}/transfers", self.url_for(operation).trim_end_matches('/'))).bearer_auth(token).header("Idempotency-Key", key).json(&serde_json::json!({"source_account_id":source,"destination_account_id":destination,"amount":"1.00"})).send().await;
         let mut classification = Classifications::default();
         match response {
@@ -97,6 +115,7 @@ impl Http {
                                     .and_then(serde_json::Value::as_str)
                                     .and_then(|id| uuid::Uuid::parse_str(id).ok()),
                                 request_key: None,
+                                service_url,
                             }
                         }
                         _ => {
@@ -107,6 +126,7 @@ impl Http {
                                 valid: false,
                                 transfer_id: None,
                                 request_key: None,
+                                service_url,
                             }
                         }
                     }
@@ -118,6 +138,7 @@ impl Http {
                         valid: false,
                         transfer_id: None,
                         request_key: None,
+                        service_url,
                     }
                 }
             }
@@ -133,6 +154,7 @@ impl Http {
                     valid: false,
                     transfer_id: None,
                     request_key: None,
+                    service_url,
                 }
             }
         }
@@ -183,6 +205,20 @@ pub fn summarize_measured(phases: &PhaseOperations) -> (Classifications, Vec<u12
     }
     (classifications, samples, valid)
 }
+pub fn measured_requests_per_url(operations: &[Operation]) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for operation in operations {
+        *counts.entry(operation.service_url.clone()).or_default() += 1;
+    }
+    counts
+}
+pub fn every_instance_received_measured_traffic(
+    urls: &[String],
+    operations: usize,
+    counts: &BTreeMap<String, usize>,
+) -> bool {
+    operations < urls.len() || urls.iter().all(|url| counts.contains_key(url))
+}
 
 #[cfg(test)]
 mod tests {
@@ -209,6 +245,7 @@ mod tests {
             valid: false,
             transfer_id: None,
             request_key: None,
+            service_url: "http://warmup".into(),
         };
         let measured = Operation {
             latency_ns: Some(100),
@@ -219,6 +256,7 @@ mod tests {
             valid: true,
             transfer_id: None,
             request_key: None,
+            service_url: "http://measured".into(),
         };
         let (classifications, samples, valid) = summarize_measured(&PhaseOperations {
             warmup: vec![warmup],
@@ -228,5 +266,31 @@ mod tests {
         assert_eq!(classifications.http_statuses.get(&201), Some(&1));
         assert_eq!(classifications.unexpected_http_failures, 0);
         assert!(valid);
+    }
+    #[test]
+    fn aggregates_measured_requests_by_instance() {
+        let operation = |url: &str| Operation {
+            latency_ns: None,
+            classification: Classifications::default(),
+            valid: true,
+            transfer_id: None,
+            request_key: None,
+            service_url: url.into(),
+        };
+        assert_eq!(
+            measured_requests_per_url(&[
+                operation("http://a"),
+                operation("http://b"),
+                operation("http://a")
+            ]),
+            BTreeMap::from([("http://a".into(), 2), ("http://b".into(), 1)])
+        );
+    }
+    #[test]
+    fn rejects_a_missing_instance_when_operations_cover_the_topology() {
+        let urls = vec!["http://a".into(), "http://b".into()];
+        let counts = BTreeMap::from([("http://a".into(), 2)]);
+        assert!(!every_instance_received_measured_traffic(&urls, 2, &counts));
+        assert!(every_instance_received_measured_traffic(&urls, 1, &counts));
     }
 }
