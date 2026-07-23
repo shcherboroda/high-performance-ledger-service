@@ -1,11 +1,15 @@
 import importlib.util
+import copy
+import io
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 SCRIPT = Path(__file__).parents[1] / "summarize-results.py"
+CONFIG_EXAMPLE = Path(__file__).parents[1] / "local.env.example"
 SPEC = importlib.util.spec_from_file_location("summarizer", SCRIPT)
 summarizer = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(summarizer)
@@ -28,6 +32,9 @@ def result(valid=True):
     return {"schema_version": 4, "scenario": "independent", "seed": 1, "commit_sha": "abc", "topology_levels": [{"configured_instances": 1, "service_urls": ["http://a"], "valid": valid, "levels": [level]}]}
 
 class SummarizerTests(unittest.TestCase):
+    def test_local_config_example_is_sourceable(self):
+        completed = subprocess.run(["bash", "-c", 'source "$1" && [[ "$BENCHMARK_DB_POOL_ASSUMPTIONS" == "local default pool configuration" ]] && [[ "$BENCHMARK_TELEMETRY_MODE" == "local metrics endpoint" ]]', "bash", str(CONFIG_EXAMPLE)], capture_output=True, text=True, check=False)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
     def test_schema_v4_summary(self): self.assertEqual(summarizer.summarize(result()), 0)
     def test_label_aware_metrics_delta(self):
         deltas = summarizer.metric_deltas(METRICS_BEFORE, METRICS_AFTER)
@@ -40,3 +47,14 @@ class SummarizerTests(unittest.TestCase):
             source.write("{"); source.flush()
             completed = subprocess.run([sys.executable, str(SCRIPT), source.name], capture_output=True, text=True, check=False)
         self.assertEqual(completed.returncode, 2)
+    def test_comparison_table_identifies_each_topology(self):
+        document = result()
+        two_instances = copy.deepcopy(document["topology_levels"][0])
+        two_instances["configured_instances"] = 2
+        two_instances["service_urls"] = ["http://a", "http://b"]
+        document["topology_levels"].append(two_instances)
+        output = io.StringIO()
+        with redirect_stdout(output): self.assertEqual(summarizer.summarize(document), 0)
+        self.assertIn("instances | concurrency | completed/expected", output.getvalue())
+        self.assertIn("1 | 2 | 20/20", output.getvalue())
+        self.assertIn("2 | 2 | 20/20", output.getvalue())

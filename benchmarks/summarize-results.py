@@ -117,14 +117,14 @@ def summarize(document):
             print(f"level valid={valid}; metrics:")
             for url in sorted(set(level.get("metrics_before", {})) | set(level.get("metrics_after", {}))):
                 print(f"  {url}: " + ", ".join(f"{key}={unavailable(value)}" for key, value in metric_deltas(snapshot_value(level.get("metrics_before", {}).get(url)), snapshot_value(level.get("metrics_after", {}).get(url))).items()))
-            rows.append(level)
+            rows.append((topology.get("configured_instances"), level))
     if len(rows) > 1:
-        print("\nconcurrency | completed/expected | throughput | mean | p50 | p95 | p99 | failures | valid")
-        for level in rows:
+        print("\ninstances | concurrency | completed/expected | throughput | mean | p50 | p95 | p99 | failures | valid")
+        for instances, level in rows:
             latency = level.get("latency") or {}
             classification = level.get("classifications") or {}
             failure_count = sum(classification.get(key, 0) for key in ("expected_business_rejections", "transport_failures", "timeout_failures", "parsing_failures", "unexpected_http_failures"))
-            print(f"{level.get('concurrency')} | {level.get('completed_measured_operations')}/{level.get('measured_operations')} | {level.get('throughput_operations_per_second')} | " + " | ".join("unavailable" if latency.get(key) is None else f"{latency[key] / 1_000_000:.3f} ms" for key in ("mean_ns", "p50_ns", "p95_ns", "p99_ns")) + f" | {failure_count} | {level.get('valid')}")
+            print(f"{instances} | {level.get('concurrency')} | {level.get('completed_measured_operations')}/{level.get('measured_operations')} | {level.get('throughput_operations_per_second')} | " + " | ".join("unavailable" if latency.get(key) is None else f"{latency[key] / 1_000_000:.3f} ms" for key in ("mean_ns", "p50_ns", "p95_ns", "p99_ns")) + f" | {failure_count} | {level.get('valid')}")
     return 1 if invalid else 0
 
 def main(argv):
