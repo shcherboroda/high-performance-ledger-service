@@ -34,7 +34,24 @@ pub async fn verify(
             .bind(&ids)
             .fetch_all(pool)
             .await?;
-    let map = balances.into_iter().collect::<BTreeMap<_, _>>();
+    Ok(evaluate(
+        committed,
+        entries,
+        duplicates,
+        balances.into_iter().collect(),
+        measured,
+        expected,
+    ))
+}
+
+fn evaluate(
+    committed: i64,
+    entries: i64,
+    duplicates: i64,
+    map: BTreeMap<Uuid, i64>,
+    measured: &[(Uuid, Uuid)],
+    expected: usize,
+) -> Verification {
     let pair_balances = measured.iter().all(|(source, destination)| {
         map.get(source)
             .zip(map.get(destination))
@@ -68,10 +85,10 @@ pub async fn verify(
             "all measured account balances must be non-negative".into(),
         ),
     ];
-    Ok(Verification {
+    Verification {
         valid: checks.iter().all(|check| check.passed),
         checks,
-    })
+    }
 }
 fn check(name: &str, passed: bool, detail: String) -> Check {
     Check {
@@ -94,5 +111,29 @@ mod tests {
             }
             .valid
         );
+    }
+
+    #[test]
+    fn mismatched_counts_and_balances_make_verification_invalid() {
+        let source = Uuid::new_v4();
+        let destination = Uuid::new_v4();
+        let result = evaluate(
+            0,
+            0,
+            0,
+            BTreeMap::from([(source, 1_000), (destination, 1_000)]),
+            &[(source, destination)],
+            1,
+        );
+        assert!(!result.valid);
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|check| check.name == "committed_measured_transfers" && !check.passed)
+        );
+        assert!(result.checks.iter().any(|check| check.name
+            == "expected_final_balances_and_pair_conservation"
+            && !check.passed));
     }
 }

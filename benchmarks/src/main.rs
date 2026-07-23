@@ -57,7 +57,7 @@ async fn run() -> Result<()> {
     );
     let mut pairs = Vec::with_capacity(plans.len());
     for (index, plan) in plans.iter().enumerate() {
-        let token = &tokens[index % config.logical_clients];
+        let token = &tokens[plan.client];
         let source = http
             .create_account(
                 index * 2,
@@ -72,10 +72,7 @@ async fn run() -> Result<()> {
                 &format!("benchmark-{}-setup-{index}-destination", config.seed),
             )
             .await?;
-        let client = (0..config.logical_clients)
-            .find(|client| dataset::subject(config.seed, *client) == plan.owner)
-            .expect("plan owner is a benchmark client");
-        pairs.push((client, source, destination));
+        pairs.push((plan.client, source, destination));
     }
     let prepared: i64 = sqlx::query_scalar("SELECT count(*) FROM accounts WHERE owner_id LIKE $1")
         .bind(format!("benchmark-{}-%", config.seed))
@@ -131,7 +128,7 @@ async fn run() -> Result<()> {
         http::merge(&mut classifications, &operation.classification);
         workload_valid &= operation.valid;
     }
-    let latency = stats::calculate(&mut samples);
+    let latency = stats::calculate_measured(&[], &mut samples);
     let result = ResultDocument { schema_version: result::SCHEMA_VERSION, generated_at_utc: Utc::now(), commit_sha: git_sha(), scenario: "independent_normal_transfer_smoke", seed: config.seed, service_urls: config.service_urls.clone(), logical_clients: config.logical_clients, concurrency: config.concurrency, warmup_operations: config.warmup_operations, measured_operations: config.operations, request_timeout_secs: config.request_timeout_secs, elapsed_measured_ns: elapsed.as_nanos(), throughput_operations_per_second: config.operations as f64 / elapsed.as_secs_f64(), latency, classifications, metrics_before, metrics_after, verification: Some(verification.clone()), valid: warmup_valid && workload_valid && verification.valid, database_pool_assumptions: config.db_pool_assumptions, telemetry_mode: config.telemetry_mode, environment: environment(&pool).await, limitations: vec!["This smoke scenario is harness validation, not a performance claim.".into(), "Metrics are raw process-local snapshots and are not used for client latency percentiles.".into(), "Service pool size and telemetry mode are operator supplied when recorded.".into()] };
     result::write(&config.output, &result)?;
     if !result.valid {

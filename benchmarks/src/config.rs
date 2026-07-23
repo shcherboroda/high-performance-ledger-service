@@ -116,6 +116,27 @@ pub fn database_name(database_url: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn valid() -> Config {
+        Config {
+            service_urls: vec!["http://localhost:3000".into()],
+            database_url: "postgres://localhost/ledger_benchmark".into(),
+            logical_clients: 1,
+            concurrency: 1,
+            operations: 1,
+            warmup_operations: 0,
+            seed: 1,
+            request_timeout_secs: 1,
+            output: "out.json".into(),
+            allow_destructive: true,
+            jwt_issuer: "issuer".into(),
+            jwt_audience: "audience".into(),
+            jwt_private_key: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../tests/fixtures/jwt-test-private.pem"),
+            jwt_lifetime_secs: 61,
+            db_pool_assumptions: None,
+            telemetry_mode: None,
+        }
+    }
     #[test]
     fn database_guard_fails_closed() {
         assert_eq!(
@@ -130,5 +151,18 @@ mod tests {
         ] {
             assert!(database_name(url).is_err(), "{url}");
         }
+    }
+
+    #[test]
+    fn validation_rejects_unsafe_or_incomplete_configuration() {
+        let mut config = valid();
+        config.allow_destructive = false;
+        assert!(config.validate().is_err());
+        let mut config = valid();
+        config.concurrency = 0;
+        assert!(config.validate().is_err());
+        let mut config = valid();
+        config.jwt_lifetime_secs = 1;
+        assert!(config.validate().is_err());
     }
 }

@@ -72,7 +72,6 @@ impl Http {
     ) -> Operation {
         let started = Instant::now();
         let response = self.client.post(format!("{}/transfers", self.url_for(operation).trim_end_matches('/'))).bearer_auth(token).header("Idempotency-Key", key).json(&serde_json::json!({"source_account_id":source,"destination_account_id":destination,"amount":"1.00"})).send().await;
-        let elapsed = started.elapsed().as_nanos();
         let mut classification = Classifications::default();
         match response {
             Ok(response) => {
@@ -87,7 +86,7 @@ impl Http {
                             if body.get("id").and_then(serde_json::Value::as_str).is_some() =>
                         {
                             Operation {
-                                latency_ns: Some(elapsed),
+                                latency_ns: Some(started.elapsed().as_nanos()),
                                 classification,
                                 valid: true,
                             }
@@ -95,7 +94,7 @@ impl Http {
                         _ => {
                             classification.parsing_failures += 1;
                             Operation {
-                                latency_ns: Some(elapsed),
+                                latency_ns: Some(started.elapsed().as_nanos()),
                                 classification,
                                 valid: false,
                             }
@@ -104,14 +103,14 @@ impl Http {
                 } else if is_expected_business_rejection(status) {
                     classification.expected_business_rejections += 1;
                     Operation {
-                        latency_ns: Some(elapsed),
+                        latency_ns: Some(started.elapsed().as_nanos()),
                         classification,
                         valid: false,
                     }
                 } else {
                     classification.unexpected_http_failures += 1;
                     Operation {
-                        latency_ns: Some(elapsed),
+                        latency_ns: Some(started.elapsed().as_nanos()),
                         classification,
                         valid: false,
                     }
@@ -124,7 +123,7 @@ impl Http {
                     classification.transport_failures += 1;
                 }
                 Operation {
-                    latency_ns: Some(elapsed),
+                    latency_ns: Some(started.elapsed().as_nanos()),
                     classification,
                     valid: false,
                 }
