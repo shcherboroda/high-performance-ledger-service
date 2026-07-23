@@ -54,8 +54,6 @@ if [[ -f "$pid_file" ]]; then
   rm -f "$pid_file"
 fi
 
-cargo build --release -p rust-backend-technical-assessment
-
 bind_address="${BIND_ADDRESS:-127.0.0.1:3000}"
 ready_address="$bind_address"
 if [[ "$ready_address" == 0.0.0.0:* ]]; then
@@ -64,6 +62,12 @@ elif [[ "$ready_address" == \[::\]:* ]]; then
   ready_address="[::1]:${ready_address##*:}"
 fi
 ready_url="http://$ready_address/ready"
+if curl --fail --silent --show-error --max-time 2 "$ready_url" >/dev/null 2>&1; then
+  echo "error: a ready service already responds at $ready_url" >&2
+  exit 1
+fi
+
+cargo build --release -p rust-backend-technical-assessment
 
 echo "starting local benchmark service on $bind_address"
 RUST_LOG="${RUST_LOG:-warn}" BIND_ADDRESS="$bind_address" DATABASE_URL="$BENCHMARK_DATABASE_URL" \
@@ -73,11 +77,14 @@ service_pid=$!
 printf '%s\n' "$service_pid" >"$pid_file"
 
 for _ in $(seq 1 30); do
-  if curl --fail --silent --show-error --max-time 2 "$ready_url" >/dev/null 2>&1; then
-    echo "local benchmark service is ready (PID $service_pid); log: $log_file"
-    exit 0
-  fi
   if ! kill -0 "$service_pid" 2>/dev/null; then
+    break
+  fi
+  if curl --fail --silent --show-error --max-time 2 "$ready_url" >/dev/null 2>&1; then
+    if kill -0 "$service_pid" 2>/dev/null && is_recorded_service "$service_pid"; then
+      echo "local benchmark service is ready (PID $service_pid); log: $log_file"
+      exit 0
+    fi
     break
   fi
   sleep 1

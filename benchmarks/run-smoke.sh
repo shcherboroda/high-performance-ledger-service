@@ -2,6 +2,9 @@
 set -euo pipefail
 
 # Runs one documented small smoke scenario against an already-running service.
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
 scenario="${1:-}"
 case "$scenario" in
   independent)
