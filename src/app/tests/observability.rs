@@ -299,9 +299,20 @@ async fn financial_handlers_emit_bounded_operation_and_idempotency_metrics(pool:
         "reason=\"none\"",
     ];
     let reversal_before = metric_value("ledger_operations_total", &reversal_success);
+    let reversal_owner = ["operation=\"reversal\"", "outcome=\"owner\""];
+    let reversal_owner_before = metric_value("ledger_idempotency_outcomes_total", &reversal_owner);
     let reversal_replay = ["operation=\"reversal\"", "outcome=\"replay\""];
     let reversal_replay_before =
         metric_value("ledger_idempotency_outcomes_total", &reversal_replay);
+    let reversal_conflict = ["operation=\"reversal\"", "outcome=\"conflict\""];
+    let reversal_conflict_before =
+        metric_value("ledger_idempotency_outcomes_total", &reversal_conflict);
+    let reversal_rejection = [
+        "operation=\"reversal\"",
+        "outcome=\"rejected\"",
+        "reason=\"idempotency_conflict\"",
+    ];
+    let reversal_rejection_before = metric_value("ledger_operations_total", &reversal_rejection);
     let transfer_id: Uuid = sqlx::query_scalar(
         "SELECT id FROM transfers WHERE source_account_id = $1 ORDER BY created_at DESC LIMIT 1",
     )
@@ -320,6 +331,10 @@ async fn financial_handlers_emit_bounded_operation_and_idempotency_metrics(pool:
         reversal_before + 1.0
     );
     assert_eq!(
+        metric_value("ledger_idempotency_outcomes_total", &reversal_owner),
+        reversal_owner_before + 1.0
+    );
+    assert_eq!(
         reversal_response(pool.clone(), &recipient, "metrics-reversal", transfer_id)
             .await
             .status(),
@@ -329,7 +344,39 @@ async fn financial_handlers_emit_bounded_operation_and_idempotency_metrics(pool:
         metric_value("ledger_idempotency_outcomes_total", &reversal_replay),
         reversal_replay_before + 1.0
     );
+    let different_transfer_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM transfers WHERE source_account_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(fx_source)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        reversal_response(
+            pool.clone(),
+            &recipient,
+            "metrics-reversal",
+            different_transfer_id,
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        metric_value("ledger_idempotency_outcomes_total", &reversal_conflict),
+        reversal_conflict_before + 1.0
+    );
+    assert_eq!(
+        metric_value("ledger_operations_total", &reversal_rejection),
+        reversal_rejection_before + 1.0
+    );
 
+    let internal_operation = [
+        "operation=\"transfer\"",
+        "outcome=\"internal_error\"",
+        "reason=\"internal_error\"",
+    ];
+    let internal_operation_before = metric_value("ledger_operations_total", &internal_operation);
     let internal_duration_before = metric_value(
         "ledger_database_transaction_duration_seconds_count",
         &["operation=\"transfer\"", "outcome=\"internal_error\""],
@@ -354,7 +401,18 @@ async fn financial_handlers_emit_bounded_operation_and_idempotency_metrics(pool:
         ),
         internal_duration_before + 1.0
     );
+    assert_eq!(
+        metric_value("ledger_operations_total", &internal_operation),
+        internal_operation_before + 1.0
+    );
 
+    let reversal_internal_operation = [
+        "operation=\"reversal\"",
+        "outcome=\"internal_error\"",
+        "reason=\"internal_error\"",
+    ];
+    let reversal_internal_operation_before =
+        metric_value("ledger_operations_total", &reversal_internal_operation);
     let reversal_internal_duration_before = metric_value(
         "ledger_database_transaction_duration_seconds_count",
         &["operation=\"reversal\"", "outcome=\"internal_error\""],
@@ -380,5 +438,9 @@ async fn financial_handlers_emit_bounded_operation_and_idempotency_metrics(pool:
             &["operation=\"reversal\"", "outcome=\"internal_error\""],
         ),
         reversal_internal_duration_before
+    );
+    assert_eq!(
+        metric_value("ledger_operations_total", &reversal_internal_operation),
+        reversal_internal_operation_before + 1.0
     );
 }
