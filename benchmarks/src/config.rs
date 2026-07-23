@@ -4,6 +4,7 @@ use std::{path::PathBuf, time::Duration};
 use url::Url;
 
 pub const MAX_CONCURRENCY: usize = 256;
+pub const MAX_INSTANCES: usize = 16;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Scenario {
     Independent,
@@ -25,6 +26,8 @@ impl Scenario {
 pub struct Config {
     #[arg(long, env = "SERVICE_URLS", value_delimiter = ',', required = true)]
     pub service_urls: Vec<String>,
+    #[arg(long, env = "BENCHMARK_INSTANCE_LEVELS", value_delimiter = ',')]
+    pub instance_levels: Vec<usize>,
     #[arg(long, env = "BENCHMARK_DATABASE_URL")]
     pub database_url: String,
     #[arg(long, value_enum, env="BENCHMARK_SCENARIO", default_value_t=Scenario::Independent)]
@@ -72,16 +75,19 @@ fn parse_destructive_acknowledgement(value: &str) -> std::result::Result<bool, S
     }
 }
 pub fn parse_concurrency_levels(values: &[usize]) -> Result<Vec<usize>> {
+    parse_levels(values, MAX_CONCURRENCY, "concurrency")
+}
+pub fn parse_instance_levels(values: &[usize]) -> Result<Vec<usize>> {
+    parse_levels(values, MAX_INSTANCES, "instance")
+}
+fn parse_levels(values: &[usize], maximum: usize, name: &str) -> Result<Vec<usize>> {
     let mut levels = values.to_vec();
-    if levels
-        .iter()
-        .any(|level| *level == 0 || *level > MAX_CONCURRENCY)
-    {
-        bail!("concurrency levels must be between 1 and {MAX_CONCURRENCY}")
+    if levels.iter().any(|level| *level == 0 || *level > maximum) {
+        bail!("{name} levels must be between 1 and {maximum}")
     }
     levels.sort_unstable();
     if levels.windows(2).any(|pair| pair[0] == pair[1]) {
-        bail!("concurrency levels must not contain duplicates")
+        bail!("{name} levels must not contain duplicates")
     }
     Ok(levels)
 }
@@ -92,9 +98,22 @@ impl Config {
         }
         database_name(&self.database_url)?;
         if self.service_urls.is_empty()
-            || self.service_urls.iter().any(|url| Url::parse(url).is_err())
+            || self.service_urls.iter().any(|url| {
+                Url::parse(url).map_or(true, |parsed| !matches!(parsed.scheme(), "http" | "https"))
+            })
         {
             bail!("at least one valid service URL is required")
+        }
+        let mut urls = self.service_urls.clone();
+        urls.sort();
+        if urls.windows(2).any(|pair| pair[0] == pair[1]) {
+            bail!("service URLs must not contain duplicates")
+        }
+        let instance_levels = parse_instance_levels(&self.instance_levels)?;
+        if let Some(&largest) = instance_levels.last()
+            && self.service_urls.len() != largest
+        {
+            bail!("service URL count must equal the largest declared instance level")
         }
         if self.logical_clients == 0
             || self.concurrency == 0
@@ -143,6 +162,13 @@ impl Config {
     pub fn request_timeout(&self) -> Duration {
         Duration::from_secs(self.request_timeout_secs)
     }
+    pub fn instance_levels(&self) -> Result<Vec<usize>> {
+        if self.instance_levels.is_empty() {
+            Ok(vec![self.service_urls.len()])
+        } else {
+            parse_instance_levels(&self.instance_levels)
+        }
+    }
 }
 pub fn database_name(database_url: &str) -> Result<String> {
     let url = Url::parse(database_url)
@@ -172,6 +198,7 @@ mod tests {
     fn valid() -> Config {
         Config {
             service_urls: vec!["http://localhost:3000".into()],
+            instance_levels: vec![],
             database_url: "postgres://localhost/ledger_benchmark".into(),
             scenario: Scenario::Independent,
             logical_clients: 1,
@@ -198,6 +225,19 @@ mod tests {
         for values in [&[0][..], &[1, 1][..], &[MAX_CONCURRENCY + 1][..]] {
             assert!(parse_concurrency_levels(values).is_err())
         }
+    }
+    #[test]
+    fn instance_levels_sort_and_validate_url_count() {
+        assert_eq!(parse_instance_levels(&[2, 1]).unwrap(), vec![1, 2]);
+        assert!(parse_instance_levels(&[0]).is_err());
+        assert!(parse_instance_levels(&[1, 1]).is_err());
+        let mut config = valid();
+        config.instance_levels = vec![1, 2];
+        assert!(config.validate().is_err());
+        config.service_urls.push("http://localhost:3001".into());
+        assert!(config.validate().is_ok());
+        config.service_urls[1] = config.service_urls[0].clone();
+        assert!(config.validate().is_err());
     }
     #[test]
     fn clap_parses_scenarios_and_rejects_invalid_values() {

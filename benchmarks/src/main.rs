@@ -6,7 +6,7 @@ use ledger_benchmarks::{
     config::{Config, Scenario},
     dataset::{self, ScenarioPlan, TransferPlan},
     http,
-    result::{self, LevelResult, ResultDocument},
+    result::{self, LevelResult, ResultDocument, TopologyLevelResult},
     stats, verify,
 };
 use serde::Serialize;
@@ -34,27 +34,59 @@ async fn run() -> Result<()> {
     let private_key =
         std::fs::read(&config.jwt_private_key).context("read benchmark JWT private key")?;
     let tokens = tokens(&config, &private_key)?;
-    let http = Arc::new(http::Http::new(
-        config.service_urls.clone(),
-        config.request_timeout(),
-    )?);
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(5)
         .connect(&config.database_url)
         .await?;
-    let mut levels = Vec::new();
-    for concurrency in config.levels()? {
-        levels.push(run_level(&config, &pool, &http, &tokens, concurrency).await?)
+    let mut topology_levels = Vec::new();
+    for instances in config.instance_levels()? {
+        let urls = config.service_urls[..instances].to_vec();
+        let http = Arc::new(http::Http::new(urls.clone(), config.request_timeout())?);
+        let readiness = readiness(&http).await;
+        let ready = readiness.values().all(Result::is_ok);
+        if !ready {
+            topology_levels.push(TopologyLevelResult::readiness_failure(
+                instances, urls, readiness,
+            ));
+            continue;
+        }
+        let mut levels = Vec::new();
+        let mut workload_failures = Vec::new();
+        for concurrency in config.levels()? {
+            match run_level(&config, &pool, &http, &tokens, concurrency).await {
+                Ok(level) => levels.push(level),
+                Err(error) => workload_failures.push(result::WorkloadFailure {
+                    concurrency,
+                    reason: format!("{error:#}"),
+                }),
+            }
+        }
+        topology_levels.push(TopologyLevelResult {
+            configured_instances: instances,
+            service_urls: urls,
+            readiness,
+            workload_skipped_reason: None,
+            valid: workload_failures.is_empty() && levels.iter().all(|level| level.valid),
+            workload_failures,
+            levels,
+        });
     }
-    let document=ResultDocument{schema_version:result::SCHEMA_VERSION,generated_at_utc:Utc::now(),commit_sha:git_sha(),scenario:config.scenario.name().into(),seed:config.seed,service_urls:config.service_urls.clone(),logical_clients:config.logical_clients,request_timeout_secs:config.request_timeout_secs,summary:result::summarize(&levels),levels,database_pool_assumptions:config.db_pool_assumptions.clone(),telemetry_mode:config.telemetry_mode.clone(),environment:environment(&pool).await,limitations:vec!["Results are environment-specific and are not production performance guarantees.".into(),"Metrics are raw process-local snapshots and are not used for client latency percentiles.".into()]};
+    let document=ResultDocument{schema_version:result::SCHEMA_VERSION,generated_at_utc:Utc::now(),commit_sha:git_sha(),scenario:config.scenario.name().into(),seed:config.seed,logical_clients:config.logical_clients,request_timeout_secs:config.request_timeout_secs,summary:result::summarize_topologies(&topology_levels),topology_levels,database_pool_assumptions:config.db_pool_assumptions.clone(),telemetry_mode:config.telemetry_mode.clone(),environment:environment(&pool).await,limitations:vec!["Results are environment-specific and are not production performance guarantees.".into(),"Metrics are raw process-local snapshots and are not used for client latency percentiles.".into()]};
     result::write(&config.output, &document)?;
-    if document.levels.iter().any(|level| !level.valid) {
+    if document.topology_levels.iter().any(|level| !level.valid) {
         anyhow::bail!(
             "benchmark completed but is invalid; inspect {}",
             config.output.display()
         )
     }
     Ok(())
+}
+async fn readiness(http: &http::Http) -> BTreeMap<String, Result<(), String>> {
+    let mut results = BTreeMap::new();
+    for (index, url) in http.urls().iter().enumerate() {
+        results.insert(url.clone(), http.ready(index).await);
+    }
+    results
 }
 async fn run_level(
     config: &Config,
@@ -180,6 +212,12 @@ async fn run_level(
             )
         }
     };
+    let measured_requests_per_url = http::measured_requests_per_url(&measured);
+    let distribution_valid = http::every_instance_received_measured_traffic(
+        http.urls(),
+        config.operations,
+        &measured_requests_per_url,
+    );
     Ok(LevelResult {
         scenario: config.scenario.name().into(),
         seed: config.seed,
@@ -191,9 +229,14 @@ async fn run_level(
         throughput_operations_per_second: config.operations as f64 / elapsed.as_secs_f64(),
         latency: stats::calculate(&mut samples),
         classifications,
+        measured_requests_per_url,
         metrics_before,
         metrics_after,
-        valid: warmup_valid && workload_valid && metrics_valid && verification.valid,
+        valid: warmup_valid
+            && workload_valid
+            && metrics_valid
+            && distribution_valid
+            && verification.valid,
         verification,
     })
 }
@@ -329,24 +372,11 @@ fn tokens(config: &Config, private_key: &[u8]) -> Result<Vec<String>> {
 }
 async fn metrics(http: &http::Http) -> BTreeMap<String, Result<String, String>> {
     let mut snapshots = BTreeMap::new();
-    for index in 0..http_urls(http).len() {
-        let url = http.url_for(index).to_owned();
+    for (index, url) in http.urls().iter().enumerate() {
+        let url = url.clone();
         snapshots.insert(url, http.metrics(index).await);
     }
     snapshots
-}
-fn http_urls(http: &http::Http) -> Vec<&str> {
-    let mut urls = Vec::new();
-    let mut index = 0;
-    loop {
-        let url = http.url_for(index);
-        if urls.contains(&url) {
-            break;
-        }
-        urls.push(url);
-        index += 1
-    }
-    urls
 }
 async fn environment(pool: &sqlx::PgPool) -> BTreeMap<String, String> {
     let mut values = BTreeMap::new();
