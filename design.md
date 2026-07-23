@@ -594,7 +594,7 @@ Expected categories include:
 * transfer already reversed;
 * internal error.
 
-Internal database details are logged but not returned.
+Internal database details are not returned or logged; logs use bounded error categories instead.
 
 ## 17. Observability
 
@@ -612,6 +612,13 @@ request/response bodies.
 `ledger_http_request_duration_seconds{method,route}` using bounded route templates and explicit
 histogram buckets. It performs no network export; deployments must protect access to this endpoint
 at their network boundary when appropriate.
+
+Readiness checks additionally report exactly one
+`ledger_readiness_checks_total{outcome,reason}` and one
+`ledger_readiness_check_duration_seconds{outcome}` observation after check execution starts.
+Readiness outcomes are exactly `ready` and `not_ready`; reasons are exactly `none`,
+`database_unavailable`, and `internal_error`. Each readiness request emits one terminal structured
+event with those bounded fields and readiness duration. No raw database error text is recorded.
 
 Financial writes additionally report `ledger_operations_total{operation,outcome,reason}`,
 `ledger_idempotency_outcomes_total{operation,outcome}`, and
@@ -634,6 +641,14 @@ idempotency work, locking, validation, SQL execution, and commit or rollback aba
 exclude HTTP handling, authentication, request parsing, and failed transaction acquisition. The
 metrics and terminal structured events exclude client, account, transfer, and idempotency
 identifiers, financial values, currencies, rates, fees, fingerprints, and error text.
+
+Application-owned internal, readiness, and startup failure events use stable bounded component,
+operation, outcome/reason, and error-category fields. They exclude configuration values and
+credentials, authentication key material and tokens, SQL or bind values, identifiers, financial
+values, idempotency material, request/response bodies, raw database errors, and raw error chains.
+Failures before successful logging initialization, including configuration parsing and logger
+initialization itself, are limited to the fixed process-stderr startup message and cannot produce
+structured logs. Bounded structured startup events apply only after logging initialization succeeds.
 
 ## 18. Testing strategy
 
@@ -673,6 +688,14 @@ Concurrency tests verify:
 * safe opposing transfers;
 * one committed reversal under concurrent attempts;
 * one committed side effect for concurrent duplicate successful requests.
+
+Observability tests cover:
+
+* request-ID validation, propagation, and replacement of invalid caller values;
+* bounded HTTP metric method, route, and status labels;
+* bounded financial-operation, idempotency, and transaction-duration outcomes;
+* readiness success and PostgreSQL-failure metric deltas;
+* structured-log sanitization for request, internal, readiness, and startup failure paths.
 
 ## 19. Key invariants
 

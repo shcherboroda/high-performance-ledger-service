@@ -229,8 +229,13 @@ fn financial_reason(code: &'static str) -> FinancialReason {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        if let Self::Internal { source } = &self {
-            error!(error = %source, "internal API error");
+        if matches!(self, Self::Internal { .. }) {
+            error!(
+                component = "api",
+                operation = "request",
+                error_category = "internal_error",
+                "internal API error"
+            );
         }
         let (status, body) = self.response_parts();
         (status, Json(body)).into_response()
