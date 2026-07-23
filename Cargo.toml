@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 
+[workspace]
+members = ["benchmarks"]
+resolver = "3"
+
 [dependencies]
 anyhow = "1.0"
 axum = "0.8"

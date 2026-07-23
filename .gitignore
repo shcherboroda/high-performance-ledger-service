@@ -31,3 +31,6 @@ target
 
 # Added by cargo
 /target
+
+# Benchmark output is intentionally local unless explicitly selected for review.
+/benchmark-results/
