@@ -32,7 +32,10 @@ pub fn plans(
     (0..(warmup + measured))
         .map(|index| {
             let phase = if index < warmup { "warmup" } else { "measured" };
-            let client = index % clients;
+            let client = match scenario {
+                ScenarioPlan::HotAccount => 0,
+                ScenarioPlan::Independent | ScenarioPlan::IdempotentReplay => index % clients,
+            };
             let (source, destination) = match scenario {
                 ScenarioPlan::Independent | ScenarioPlan::IdempotentReplay => (index, index),
                 ScenarioPlan::HotAccount => (if phase == "warmup" { 0 } else { 1 }, index),
@@ -98,6 +101,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0, 1, 2]
         );
+        assert!(plans.iter().all(|plan| plan.client == 0));
     }
     #[test]
     fn replay_plans_are_stable() {

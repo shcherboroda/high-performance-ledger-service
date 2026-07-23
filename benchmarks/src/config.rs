@@ -167,6 +167,31 @@ pub fn database_name(database_url: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    fn valid() -> Config {
+        Config {
+            service_urls: vec!["http://localhost:3000".into()],
+            database_url: "postgres://localhost/ledger_benchmark".into(),
+            scenario: Scenario::Independent,
+            logical_clients: 1,
+            concurrency: 1,
+            concurrency_levels: vec![],
+            operations: 1,
+            warmup_operations: 0,
+            seed: 1,
+            request_timeout_secs: 1,
+            output: "out.json".into(),
+            allow_destructive: true,
+            jwt_issuer: "issuer".into(),
+            jwt_audience: "audience".into(),
+            jwt_private_key: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../tests/fixtures/jwt-test-private.pem"),
+            jwt_lifetime_secs: 61,
+            db_pool_assumptions: None,
+            telemetry_mode: None,
+        }
+    }
     #[test]
     fn levels_sort_and_reject_invalid_values() {
         assert_eq!(parse_concurrency_levels(&[8, 1, 4]).unwrap(), vec![1, 4, 8]);
@@ -175,9 +200,42 @@ mod tests {
         }
     }
     #[test]
-    fn scenario_values_are_stable() {
-        assert_eq!(Scenario::HotAccount.name(), "hot-account");
-        assert_eq!(Scenario::IdempotentReplay.name(), "idempotent-replay")
+    fn clap_parses_scenarios_and_rejects_invalid_values() {
+        let parsed = Config::try_parse_from([
+            "ledger-benchmark",
+            "--service-urls",
+            "http://localhost:3000",
+            "--database-url",
+            "postgres://localhost/ledger_benchmark",
+            "--jwt-issuer",
+            "issuer",
+            "--jwt-audience",
+            "audience",
+            "--jwt-private-key",
+            "key.pem",
+            "--scenario",
+            "hot-account",
+        ])
+        .unwrap();
+        assert_eq!(parsed.scenario, Scenario::HotAccount);
+        assert!(
+            Config::try_parse_from([
+                "ledger-benchmark",
+                "--service-urls",
+                "http://localhost:3000",
+                "--database-url",
+                "postgres://localhost/ledger_benchmark",
+                "--jwt-issuer",
+                "issuer",
+                "--jwt-audience",
+                "audience",
+                "--jwt-private-key",
+                "key.pem",
+                "--scenario",
+                "not-a-scenario",
+            ])
+            .is_err()
+        );
     }
     #[test]
     fn database_guard_fails_closed() {
@@ -198,5 +256,23 @@ mod tests {
         assert!(!parse_destructive_acknowledgement("0").unwrap());
         assert!(!parse_destructive_acknowledgement("false").unwrap());
         assert!(parse_destructive_acknowledgement("yes").is_err());
+    }
+    #[test]
+    fn validation_fails_closed_for_unsafe_or_incomplete_configuration() {
+        let mut config = valid();
+        config.allow_destructive = false;
+        assert!(config.validate().is_err());
+
+        let mut config = valid();
+        config.concurrency = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = valid();
+        config.concurrency = MAX_CONCURRENCY + 1;
+        assert!(config.validate().is_err());
+
+        let mut config = valid();
+        config.jwt_lifetime_secs = 1;
+        assert!(config.validate().is_err());
     }
 }

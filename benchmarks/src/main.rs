@@ -228,7 +228,7 @@ async fn prepare(
             source_ids.push(
                 http.create_account(
                     index,
-                    &tokens[index % tokens.len()],
+                    &tokens[0],
                     &format!("benchmark-{}-source-{index}", config.seed),
                     &format!(
                         "{}.00",
