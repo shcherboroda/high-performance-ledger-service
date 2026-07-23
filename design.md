@@ -618,6 +618,11 @@ Financial writes additionally report `ledger_operations_total{operation,outcome,
 `ledger_database_transaction_duration_seconds{operation,outcome}`. Operations are the persisted
 business classifications `transfer`, `fx_transfer`, and `reversal`; the unified transfer handler
 selects transfer versus FX only after reading the participating account currency metadata.
+Consequently, a unified-transfer failure before that authoritative lookup (including transaction
+acquisition failure or an unavailable preliminary account lookup) is intentionally unclassified:
+it does not emit an operation metric or transaction-duration observation. This avoids guessing an
+operation label from request fields; once classification succeeds, every transaction attempt emits
+one terminal operation outcome.
 Terminal operation outcomes are `success`, `rejected`, and `internal_error`, with `none` for a
 success reason and `internal_error` for an internal failure. Rejections use a fixed mapping of
 stable API codes (including account availability, funding, FX configuration, arithmetic, reversal,

@@ -5,6 +5,16 @@ use axum::{
 
 use super::support::*;
 
+fn metric_value(name: &str, labels: &[&str]) -> f64 {
+    crate::observability::metrics_handle()
+        .render()
+        .lines()
+        .find(|line| line.starts_with(name) && labels.iter().all(|label| line.contains(label)))
+        .and_then(|line| line.rsplit_once(' '))
+        .and_then(|(_, value)| value.parse().ok())
+        .unwrap_or(0.0)
+}
+
 #[tokio::test]
 async fn request_ids_are_generated_preserved_and_replaced_when_invalid() {
     let pool = PgPoolOptions::new()
@@ -151,4 +161,136 @@ async fn custom_http_methods_use_the_other_metric_label() {
 
     assert!(metrics.contains("method=\"OTHER\""));
     assert!(!metrics.contains(custom_method));
+}
+
+#[sqlx::test]
+async fn financial_handlers_emit_bounded_operation_and_idempotency_metrics(pool: PgPool) {
+    let owner = token(
+        Some("metric-owner"),
+        4_102_444_800,
+        "https://issuer.example",
+        "ledger",
+    );
+    let recipient = token(
+        Some("metric-recipient"),
+        4_102_444_800,
+        "https://issuer.example",
+        "ledger",
+    );
+    let source = Uuid::new_v4();
+    let destination = Uuid::new_v4();
+    insert_test_account(&pool, source, "metric-owner", "USD", 2, 10_000).await;
+    insert_test_account(&pool, destination, "metric-recipient", "USD", 2, 0).await;
+
+    let success = [
+        "operation=\"transfer\"",
+        "outcome=\"success\"",
+        "reason=\"none\"",
+    ];
+    let owner_label = ["operation=\"transfer\"", "outcome=\"owner\""];
+    let replay_label = ["operation=\"transfer\"", "outcome=\"replay\""];
+    let conflict_label = ["operation=\"transfer\"", "outcome=\"conflict\""];
+    let success_before = metric_value("ledger_operations_total", &success);
+    let owner_before = metric_value("ledger_idempotency_outcomes_total", &owner_label);
+    let replay_before = metric_value("ledger_idempotency_outcomes_total", &replay_label);
+    let conflict_before = metric_value("ledger_idempotency_outcomes_total", &conflict_label);
+    let rejection = [
+        "operation=\"transfer\"",
+        "outcome=\"rejected\"",
+        "reason=\"idempotency_conflict\"",
+    ];
+    let rejection_before = metric_value("ledger_operations_total", &rejection);
+
+    let request = json!({"source_account_id": source, "destination_account_id": destination, "amount": "10.00"});
+    let first = transfer_response(pool.clone(), &owner, "metrics-transfer", request.clone()).await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    assert_eq!(
+        metric_value("ledger_operations_total", &success),
+        success_before + 1.0
+    );
+    assert_eq!(
+        metric_value("ledger_idempotency_outcomes_total", &owner_label),
+        owner_before + 1.0
+    );
+
+    assert_eq!(
+        transfer_response(pool.clone(), &owner, "metrics-transfer", request.clone())
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        metric_value("ledger_idempotency_outcomes_total", &replay_label),
+        replay_before + 1.0
+    );
+    assert_eq!(
+        metric_value("ledger_operations_total", &success),
+        success_before + 2.0
+    );
+
+    assert_eq!(transfer_response(pool.clone(), &owner, "metrics-transfer", json!({"source_account_id": source, "destination_account_id": destination, "amount": "10.01"})).await.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        metric_value("ledger_idempotency_outcomes_total", &conflict_label),
+        conflict_before + 1.0
+    );
+    assert_eq!(
+        metric_value("ledger_operations_total", &rejection),
+        rejection_before + 1.0
+    );
+
+    let insufficient = [
+        "operation=\"transfer\"",
+        "outcome=\"rejected\"",
+        "reason=\"insufficient_funds\"",
+    ];
+    let insufficient_before = metric_value("ledger_operations_total", &insufficient);
+    assert_eq!(transfer_response(pool.clone(), &owner, "metrics-rejected-owner", json!({"source_account_id": source, "destination_account_id": destination, "amount": "1000.00"})).await.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        metric_value("ledger_operations_total", &insufficient),
+        insufficient_before + 1.0
+    );
+
+    let fx_source = Uuid::new_v4();
+    let fx_destination = Uuid::new_v4();
+    insert_test_account(&pool, fx_source, "metric-owner", "EUR", 2, 10_000).await;
+    insert_test_account(&pool, fx_destination, "metric-recipient", "PLN", 2, 0).await;
+    sqlx::query("INSERT INTO exchange_rates (id, source_currency, destination_currency, rate, valid_from, valid_until) VALUES ($1, 'EUR', 'PLN', 4, now() - interval '1 hour', now() + interval '1 hour')")
+        .bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO fx_fee_rules (id, fee_bps, valid_from, valid_until) VALUES ($1, 0, now() - interval '1 hour', now() + interval '1 hour')")
+        .bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    let fx_success = [
+        "operation=\"fx_transfer\"",
+        "outcome=\"success\"",
+        "reason=\"none\"",
+    ];
+    let fx_before = metric_value("ledger_operations_total", &fx_success);
+    assert_eq!(transfer_response(pool.clone(), &owner, "metrics-fx", json!({"source_account_id": fx_source, "destination_account_id": fx_destination, "amount": "10.00"})).await.status(), StatusCode::CREATED);
+    assert_eq!(
+        metric_value("ledger_operations_total", &fx_success),
+        fx_before + 1.0
+    );
+
+    let reversal_success = [
+        "operation=\"reversal\"",
+        "outcome=\"success\"",
+        "reason=\"none\"",
+    ];
+    let reversal_before = metric_value("ledger_operations_total", &reversal_success);
+    let transfer_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM transfers WHERE source_account_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(source)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        reversal_response(pool.clone(), &recipient, "metrics-reversal", transfer_id)
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        metric_value("ledger_operations_total", &reversal_success),
+        reversal_before + 1.0
+    );
 }
