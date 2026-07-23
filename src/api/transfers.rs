@@ -22,7 +22,10 @@ use crate::{
     },
     idempotency::{self, IdempotencyKey, Reservation},
     money::{MoneyError, format_minor_units, parse_minor_units},
-    observability::{FinancialOperation, TransactionObservation},
+    observability::{
+        FinancialOperation, FinancialReason, IdempotencyOutcome, TerminalOutcome,
+        TransactionObservation,
+    },
 };
 
 #[derive(Deserialize, ToSchema)]
@@ -286,14 +289,13 @@ pub(crate) async fn create_transfer(
     .map_err(AppError::internal)?
     {
         if fingerprint != stored_fingerprint {
-            observation.idempotency("conflict");
-            observation.complete("rejected", "idempotency_conflict");
+            observation.idempotency(IdempotencyOutcome::Conflict);
             return Err(AppError::idempotency_conflict());
         }
-        observation.idempotency("replay");
+        observation.idempotency(IdempotencyOutcome::Replay);
         transaction.commit().await.map_err(AppError::internal)?;
         let status = StatusCode::from_u16(http_status as u16).map_err(AppError::internal)?;
-        observation.complete("success", "none");
+        observation.complete(TerminalOutcome::Success, FinancialReason::None);
         return Ok((status, Json(response_body)).into_response());
     }
     match idempotency::reserve(
@@ -311,18 +313,17 @@ pub(crate) async fn create_transfer(
             http_status,
             response_body,
         } => {
-            observation.idempotency("replay");
+            observation.idempotency(IdempotencyOutcome::Replay);
             transaction.commit().await.map_err(AppError::internal)?;
             let status = StatusCode::from_u16(http_status as u16).map_err(AppError::internal)?;
-            observation.complete("success", "none");
+            observation.complete(TerminalOutcome::Success, FinancialReason::None);
             return Ok((status, Json(response_body)).into_response());
         }
         Reservation::Conflict => {
-            observation.idempotency("conflict");
-            observation.complete("rejected", "idempotency_conflict");
+            observation.idempotency(IdempotencyOutcome::Conflict);
             return Err(AppError::idempotency_conflict());
         }
-        Reservation::Owned => observation.idempotency("owner"),
+        Reservation::Owned => observation.idempotency(IdempotencyOutcome::Owner),
     }
     let operation_time = sqlx::query_scalar("SELECT transaction_timestamp()")
         .fetch_one(&mut *transaction)
@@ -567,7 +568,7 @@ pub(crate) async fn create_transfer(
     .await
     .map_err(AppError::internal)?;
     transaction.commit().await.map_err(AppError::internal)?;
-    observation.complete("success", "none");
+    observation.complete(TerminalOutcome::Success, FinancialReason::None);
     Ok((StatusCode::CREATED, Json(response_body)).into_response())
 }
 fn transfer_money_error(error: MoneyError) -> AppError {

@@ -32,6 +32,57 @@ pub enum FinancialOperation {
     Reversal,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalOutcome {
+    Success,
+    Rejected,
+    InternalError,
+}
+
+impl TerminalOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Rejected => "rejected",
+            Self::InternalError => "internal_error",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdempotencyOutcome {
+    Owner,
+    Replay,
+    Conflict,
+}
+
+impl IdempotencyOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Replay => "replay",
+            Self::Conflict => "conflict",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FinancialReason {
+    None,
+    InternalError,
+    Code(&'static str),
+}
+
+impl FinancialReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::InternalError => "internal_error",
+            Self::Code(code) => code,
+        }
+    }
+}
+
 impl FinancialOperation {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -61,27 +112,27 @@ impl TransactionObservation {
         }
     }
 
-    pub fn idempotency(&self, outcome: &'static str) {
-        counter!("ledger_idempotency_outcomes_total", "operation" => self.operation.as_str(), "outcome" => outcome).increment(1);
+    pub fn idempotency(&self, outcome: IdempotencyOutcome) {
+        counter!("ledger_idempotency_outcomes_total", "operation" => self.operation.as_str(), "outcome" => outcome.as_str()).increment(1);
         tracing::info!(
             operation = self.operation.as_str(),
-            outcome,
+            outcome = outcome.as_str(),
             "ledger idempotency outcome"
         );
     }
 
-    pub fn complete(&mut self, outcome: &'static str, reason: &'static str) {
+    pub fn complete(&mut self, outcome: TerminalOutcome, reason: FinancialReason) {
         if self.completed {
             return;
         }
         self.completed = true;
         let duration = self.started.elapsed().as_secs_f64();
-        counter!("ledger_operations_total", "operation" => self.operation.as_str(), "outcome" => outcome, "reason" => reason).increment(1);
-        histogram!("ledger_database_transaction_duration_seconds", "operation" => self.operation.as_str(), "outcome" => outcome).record(duration);
+        counter!("ledger_operations_total", "operation" => self.operation.as_str(), "outcome" => outcome.as_str(), "reason" => reason.as_str()).increment(1);
+        histogram!("ledger_database_transaction_duration_seconds", "operation" => self.operation.as_str(), "outcome" => outcome.as_str()).record(duration);
         tracing::info!(
             operation = self.operation.as_str(),
-            outcome,
-            reason,
+            outcome = outcome.as_str(),
+            reason = reason.as_str(),
             transaction_duration_seconds = duration,
             "ledger operation completed"
         );
@@ -96,9 +147,26 @@ impl TransactionObservation {
 impl Drop for TransactionObservation {
     fn drop(&mut self) {
         if !self.completed {
-            self.complete("internal_error", "internal_error");
+            self.complete(
+                TerminalOutcome::InternalError,
+                FinancialReason::InternalError,
+            );
         }
     }
+}
+
+pub fn record_operation_without_transaction(
+    operation: FinancialOperation,
+    outcome: TerminalOutcome,
+    reason: FinancialReason,
+) {
+    counter!("ledger_operations_total", "operation" => operation.as_str(), "outcome" => outcome.as_str(), "reason" => reason.as_str()).increment(1);
+    tracing::info!(
+        operation = operation.as_str(),
+        outcome = outcome.as_str(),
+        reason = reason.as_str(),
+        "ledger operation completed"
+    );
 }
 
 static METRICS: OnceLock<PrometheusHandle> = OnceLock::new();
@@ -299,8 +367,11 @@ mod tests {
     fn financial_metrics_use_only_bounded_labels() {
         let secret = Uuid::new_v4().to_string();
         let mut observation = TransactionObservation::new(FinancialOperation::Transfer);
-        observation.idempotency("owner");
-        observation.complete("rejected", "insufficient_funds");
+        observation.idempotency(IdempotencyOutcome::Owner);
+        observation.complete(
+            TerminalOutcome::Rejected,
+            FinancialReason::Code("insufficient_funds"),
+        );
 
         let metrics = metrics_handle().render();
         assert!(metrics.contains("ledger_operations_total"));

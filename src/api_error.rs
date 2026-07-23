@@ -9,6 +9,8 @@ use serde_json::Value;
 use tracing::error;
 use utoipa::ToSchema;
 
+use crate::observability::{FinancialReason, TerminalOutcome};
+
 /// The stable JSON envelope returned when an API operation cannot succeed.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ErrorEnvelope {
@@ -67,20 +69,45 @@ pub enum AppError {
 }
 
 impl AppError {
-    pub fn financial_metric_outcome(&self) -> (&'static str, &'static str) {
+    pub fn financial_metric_outcome(&self) -> (TerminalOutcome, FinancialReason) {
         match self {
-            Self::Internal { .. } => ("internal_error", "internal_error"),
-            Self::IdempotencyConflict => ("rejected", "idempotency_conflict"),
-            Self::AccountUnavailable => ("rejected", "account_unavailable"),
-            Self::Business { code, .. } | Self::Validation { code, .. } => {
-                ("rejected", financial_reason(code))
-            }
-            Self::NotFound => ("rejected", "not_found"),
-            Self::BadRequest { .. } => ("rejected", "bad_request"),
-            Self::Unauthorized => ("rejected", "unauthorized"),
-            Self::Forbidden => ("rejected", "forbidden"),
-            Self::Conflict => ("rejected", "conflict"),
-            Self::ServiceUnavailable => ("rejected", "service_unavailable"),
+            Self::Internal { .. } => (
+                TerminalOutcome::InternalError,
+                FinancialReason::InternalError,
+            ),
+            Self::IdempotencyConflict => (
+                TerminalOutcome::Rejected,
+                FinancialReason::Code("idempotency_conflict"),
+            ),
+            Self::AccountUnavailable => (
+                TerminalOutcome::Rejected,
+                FinancialReason::Code("account_unavailable"),
+            ),
+            Self::Business { code, .. } | Self::Validation { code, .. } => (
+                TerminalOutcome::Rejected,
+                FinancialReason::Code(financial_reason(code)),
+            ),
+            Self::NotFound => (
+                TerminalOutcome::Rejected,
+                FinancialReason::Code("not_found"),
+            ),
+            Self::BadRequest { .. } => (
+                TerminalOutcome::Rejected,
+                FinancialReason::Code("bad_request"),
+            ),
+            Self::Unauthorized => (
+                TerminalOutcome::Rejected,
+                FinancialReason::Code("unauthorized"),
+            ),
+            Self::Forbidden => (
+                TerminalOutcome::Rejected,
+                FinancialReason::Code("forbidden"),
+            ),
+            Self::Conflict => (TerminalOutcome::Rejected, FinancialReason::Code("conflict")),
+            Self::ServiceUnavailable => (
+                TerminalOutcome::Rejected,
+                FinancialReason::Code("service_unavailable"),
+            ),
         }
     }
     pub fn bad_request(details: Option<Value>) -> Self {
@@ -232,12 +259,18 @@ mod tests {
         let error = AppError::business("insufficient_funds", "sensitive balance is 101.23");
         assert_eq!(
             error.financial_metric_outcome(),
-            ("rejected", "insufficient_funds")
+            (
+                TerminalOutcome::Rejected,
+                FinancialReason::Code("insufficient_funds")
+            )
         );
         assert_eq!(
             AppError::validation("unrecognized_code", "arbitrary detail")
                 .financial_metric_outcome(),
-            ("rejected", "invalid_request")
+            (
+                TerminalOutcome::Rejected,
+                FinancialReason::Code("invalid_request")
+            )
         );
     }
 }
