@@ -268,7 +268,7 @@ pub async fn account_pool(
         "SELECT planned.idempotency_key, record.record_count, record.resulting_transfer_id, \
          count(DISTINCT transfer.id), count(entry.id) \
          FROM unnest($1::text[], $2::text[]) AS planned(client_id, idempotency_key) \
-         LEFT JOIN LATERAL (SELECT count(*)::bigint AS record_count, max(resulting_resource_id) AS resulting_transfer_id \
+         LEFT JOIN LATERAL (SELECT count(*)::bigint AS record_count, (array_agg(resulting_resource_id))[1] AS resulting_transfer_id \
              FROM idempotency_records WHERE client_id=planned.client_id AND operation_type='transfer' AND idempotency_key=planned.idempotency_key) record ON true \
          LEFT JOIN transfers transfer ON transfer.id=record.resulting_transfer_id \
          LEFT JOIN account_entries entry ON entry.transfer_id=record.resulting_transfer_id \
