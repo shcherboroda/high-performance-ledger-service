@@ -2,6 +2,7 @@ use axum::{
     body::Body,
     http::{HeaderValue, Request, header},
 };
+use std::time::Duration;
 
 use super::support::*;
 
@@ -191,6 +192,10 @@ async fn financial_handlers_emit_bounded_operation_and_idempotency_metrics(pool:
     let replay_label = ["operation=\"transfer\"", "outcome=\"replay\""];
     let conflict_label = ["operation=\"transfer\"", "outcome=\"conflict\""];
     let success_before = metric_value("ledger_operations_total", &success);
+    let success_duration_before = metric_value(
+        "ledger_database_transaction_duration_seconds_count",
+        &["operation=\"transfer\"", "outcome=\"success\""],
+    );
     let owner_before = metric_value("ledger_idempotency_outcomes_total", &owner_label);
     let replay_before = metric_value("ledger_idempotency_outcomes_total", &replay_label);
     let conflict_before = metric_value("ledger_idempotency_outcomes_total", &conflict_label);
@@ -207,6 +212,13 @@ async fn financial_handlers_emit_bounded_operation_and_idempotency_metrics(pool:
     assert_eq!(
         metric_value("ledger_operations_total", &success),
         success_before + 1.0
+    );
+    assert_eq!(
+        metric_value(
+            "ledger_database_transaction_duration_seconds_count",
+            &["operation=\"transfer\"", "outcome=\"success\""],
+        ),
+        success_duration_before + 1.0
     );
     assert_eq!(
         metric_value("ledger_idempotency_outcomes_total", &owner_label),
@@ -244,10 +256,21 @@ async fn financial_handlers_emit_bounded_operation_and_idempotency_metrics(pool:
         "reason=\"insufficient_funds\"",
     ];
     let insufficient_before = metric_value("ledger_operations_total", &insufficient);
+    let rejected_duration_before = metric_value(
+        "ledger_database_transaction_duration_seconds_count",
+        &["operation=\"transfer\"", "outcome=\"rejected\""],
+    );
     assert_eq!(transfer_response(pool.clone(), &owner, "metrics-rejected-owner", json!({"source_account_id": source, "destination_account_id": destination, "amount": "1000.00"})).await.status(), StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(
         metric_value("ledger_operations_total", &insufficient),
         insufficient_before + 1.0
+    );
+    assert_eq!(
+        metric_value(
+            "ledger_database_transaction_duration_seconds_count",
+            &["operation=\"transfer\"", "outcome=\"rejected\""],
+        ),
+        rejected_duration_before + 1.0
     );
 
     let fx_source = Uuid::new_v4();
@@ -276,6 +299,9 @@ async fn financial_handlers_emit_bounded_operation_and_idempotency_metrics(pool:
         "reason=\"none\"",
     ];
     let reversal_before = metric_value("ledger_operations_total", &reversal_success);
+    let reversal_replay = ["operation=\"reversal\"", "outcome=\"replay\""];
+    let reversal_replay_before =
+        metric_value("ledger_idempotency_outcomes_total", &reversal_replay);
     let transfer_id: Uuid = sqlx::query_scalar(
         "SELECT id FROM transfers WHERE source_account_id = $1 ORDER BY created_at DESC LIMIT 1",
     )
@@ -292,5 +318,67 @@ async fn financial_handlers_emit_bounded_operation_and_idempotency_metrics(pool:
     assert_eq!(
         metric_value("ledger_operations_total", &reversal_success),
         reversal_before + 1.0
+    );
+    assert_eq!(
+        reversal_response(pool.clone(), &recipient, "metrics-reversal", transfer_id)
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        metric_value("ledger_idempotency_outcomes_total", &reversal_replay),
+        reversal_replay_before + 1.0
+    );
+
+    let internal_duration_before = metric_value(
+        "ledger_database_transaction_duration_seconds_count",
+        &["operation=\"transfer\"", "outcome=\"internal_error\""],
+    );
+    sqlx::query("CREATE FUNCTION reject_metric_entry() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced metric failure'; END; $$")
+        .execute(&pool).await.unwrap();
+    sqlx::query("CREATE TRIGGER reject_metric_entry BEFORE INSERT ON account_entries FOR EACH ROW EXECUTE FUNCTION reject_metric_entry()")
+        .execute(&pool).await.unwrap();
+    assert_eq!(transfer_response(pool.clone(), &owner, "metrics-internal", json!({"source_account_id": source, "destination_account_id": destination, "amount": "1.00"})).await.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    sqlx::query("DROP TRIGGER reject_metric_entry ON account_entries")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP FUNCTION reject_metric_entry()")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        metric_value(
+            "ledger_database_transaction_duration_seconds_count",
+            &["operation=\"transfer\"", "outcome=\"internal_error\""],
+        ),
+        internal_duration_before + 1.0
+    );
+
+    let reversal_internal_duration_before = metric_value(
+        "ledger_database_transaction_duration_seconds_count",
+        &["operation=\"reversal\"", "outcome=\"internal_error\""],
+    );
+    let unavailable_pool = PgPoolOptions::new()
+        .acquire_timeout(Duration::from_millis(100))
+        .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/ledger")
+        .unwrap();
+    assert_eq!(
+        reversal_response(
+            unavailable_pool,
+            &recipient,
+            "metrics-begin-failure",
+            Uuid::new_v4()
+        )
+        .await
+        .status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        metric_value(
+            "ledger_database_transaction_duration_seconds_count",
+            &["operation=\"reversal\"", "outcome=\"internal_error\""],
+        ),
+        reversal_internal_duration_before
     );
 }
