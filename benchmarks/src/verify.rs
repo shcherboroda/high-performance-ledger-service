@@ -13,52 +13,56 @@ pub struct Verification {
     pub checks: Vec<Check>,
     pub valid: bool,
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplaySnapshot {
+    pub transfers: i64,
+    pub entries: i64,
+    pub balances: BTreeMap<Uuid, i64>,
+    pub idempotency_records: i64,
+}
+fn check(name: &str, passed: bool, detail: String) -> Check {
+    Check {
+        name: name.into(),
+        passed,
+        detail,
+    }
+}
+fn finish(checks: Vec<Check>) -> Verification {
+    let valid = checks.iter().all(|check| check.passed);
+    Verification { checks, valid }
+}
 
-pub async fn verify(
+pub async fn independent(
     pool: &sqlx::PgPool,
-    measured: &[(Uuid, Uuid)],
+    pairs: &[(Uuid, Uuid)],
     expected: usize,
 ) -> anyhow::Result<Verification> {
-    let sources: Vec<Uuid> = measured.iter().map(|(source, _)| *source).collect();
-    let committed: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM transfers WHERE source_account_id = ANY($1) AND kind = 'transfer'",
-    )
-    .bind(&sources)
-    .fetch_one(pool)
-    .await?;
-    let entries: i64 = sqlx::query_scalar("SELECT count(*) FROM account_entries WHERE transfer_id IN (SELECT id FROM transfers WHERE source_account_id = ANY($1))").bind(&sources).fetch_one(pool).await?;
-    let duplicates: i64 = sqlx::query_scalar("SELECT count(*) FROM (SELECT source_account_id, count(*) FROM transfers WHERE source_account_id = ANY($1) GROUP BY source_account_id HAVING count(*) > 1) duplicate_keys").bind(&sources).fetch_one(pool).await?;
-    let ids: Vec<Uuid> = measured.iter().flat_map(|(a, b)| [*a, *b]).collect();
-    let balances: Vec<(Uuid, i64)> =
-        sqlx::query_as("SELECT id, balance_minor FROM accounts WHERE id = ANY($1)")
-            .bind(&ids)
-            .fetch_all(pool)
-            .await?;
-    Ok(evaluate(
+    let sources: Vec<Uuid> = pairs.iter().map(|pair| pair.0).collect();
+    let committed = transfer_count(pool, &sources).await?;
+    let entries = entry_count(pool, &sources).await?;
+    let duplicates: i64 = sqlx::query_scalar("SELECT count(*) FROM (SELECT source_account_id FROM transfers WHERE source_account_id=ANY($1) GROUP BY source_account_id HAVING count(*) > 1) duplicate_groups").bind(&sources).fetch_one(pool).await?;
+    Ok(evaluate_independent(
         committed,
         entries,
         duplicates,
-        balances.into_iter().collect(),
-        measured,
+        balances(
+            pool,
+            &pairs.iter().flat_map(|(s, d)| [*s, *d]).collect::<Vec<_>>(),
+        )
+        .await?,
+        pairs,
         expected,
     ))
 }
-
-fn evaluate(
+pub fn evaluate_independent(
     committed: i64,
     entries: i64,
     duplicates: i64,
-    map: BTreeMap<Uuid, i64>,
-    measured: &[(Uuid, Uuid)],
+    balances: BTreeMap<Uuid, i64>,
+    pairs: &[(Uuid, Uuid)],
     expected: usize,
 ) -> Verification {
-    let pair_balances = measured.iter().all(|(source, destination)| {
-        map.get(source)
-            .zip(map.get(destination))
-            .is_some_and(|(source, destination)| *source == 900 && *destination == 1100)
-    });
-    let no_overdraft = map.values().all(|balance| *balance >= 0);
-    let checks = vec![
+    finish(vec![
         check(
             "committed_measured_transfers",
             committed == expected as i64,
@@ -72,68 +76,228 @@ fn evaluate(
         check(
             "no_duplicate_transfer_side_effects",
             duplicates == 0,
-            format!("duplicate operation groups: {duplicates}"),
+            format!("duplicate transfer groups: {duplicates}"),
         ),
         check(
             "expected_final_balances_and_pair_conservation",
-            pair_balances,
-            "each measured pair must be 9.00 / 11.00".into(),
+            pairs
+                .iter()
+                .all(|(s, d)| balances.get(s) == Some(&900) && balances.get(d) == Some(&1100)),
+            "each pair must be 9.00 / 11.00".into(),
         ),
         check(
             "no_unexpected_overdrafts",
-            no_overdraft,
-            "all measured account balances must be non-negative".into(),
+            balances.values().all(|b| *b >= 0),
+            "all balances non-negative".into(),
         ),
-    ];
-    Verification {
-        valid: checks.iter().all(|check| check.passed),
-        checks,
-    }
+    ])
 }
-fn check(name: &str, passed: bool, detail: String) -> Check {
-    Check {
-        name: name.into(),
-        passed,
-        detail,
-    }
+
+pub async fn hot_account(
+    pool: &sqlx::PgPool,
+    source: Uuid,
+    destinations: &[Uuid],
+    expected: usize,
+) -> anyhow::Result<Verification> {
+    let committed = transfer_count(pool, &[source]).await?;
+    let entries = entry_count(pool, &[source]).await?;
+    let duplicates: i64 = sqlx::query_scalar("SELECT count(*) FROM (SELECT destination_account_id FROM transfers WHERE source_account_id=$1 GROUP BY destination_account_id HAVING count(*) > 1) duplicate_groups").bind(source).fetch_one(pool).await?;
+    let mut ids = destinations.to_vec();
+    ids.push(source);
+    Ok(evaluate_hot(
+        committed,
+        entries,
+        duplicates,
+        balances(pool, &ids).await?,
+        source,
+        destinations,
+        expected,
+    ))
+}
+pub fn evaluate_hot(
+    committed: i64,
+    entries: i64,
+    duplicates: i64,
+    balances: BTreeMap<Uuid, i64>,
+    source: Uuid,
+    destinations: &[Uuid],
+    expected: usize,
+) -> Verification {
+    finish(vec![
+        check(
+            "committed_measured_transfers",
+            committed == expected as i64,
+            format!("expected {expected}, found {committed}"),
+        ),
+        check(
+            "exactly_two_entries_per_transfer",
+            entries == expected as i64 * 2,
+            format!("expected {}, found {entries}", expected * 2),
+        ),
+        check(
+            "no_duplicate_transfer_side_effects",
+            duplicates == 0,
+            format!("duplicate destination groups: {duplicates}"),
+        ),
+        check(
+            "shared_source_final_balance",
+            balances.get(&source) == Some(&1000),
+            "source balance must equal initial funding minus measured amount".into(),
+        ),
+        check(
+            "every_destination_received_once",
+            destinations
+                .iter()
+                .all(|id| balances.get(id) == Some(&1100)),
+            "every destination must be 11.00".into(),
+        ),
+        check(
+            "total_conservation",
+            balances.values().sum::<i64>() == (expected as i64 * 1100) + 1000,
+            "sum of shared-source and destination balances must be conserved".into(),
+        ),
+        check(
+            "no_unexpected_overdrafts",
+            balances.values().all(|b| *b >= 0),
+            "all balances non-negative".into(),
+        ),
+    ])
+}
+
+pub async fn replay_snapshot(
+    pool: &sqlx::PgPool,
+    accounts: &[(Uuid, Uuid)],
+    client_prefix: &str,
+    keys: &[String],
+) -> anyhow::Result<ReplaySnapshot> {
+    let sources = accounts
+        .iter()
+        .map(|(source, _)| *source)
+        .collect::<Vec<_>>();
+    let ids = accounts
+        .iter()
+        .flat_map(|(source, destination)| [*source, *destination])
+        .collect::<Vec<_>>();
+    let idempotency_records:i64=sqlx::query_scalar("SELECT count(*) FROM idempotency_records WHERE client_id LIKE $1 AND operation_type='transfer' AND idempotency_key=ANY($2)").bind(client_prefix).bind(keys).fetch_one(pool).await?;
+    Ok(ReplaySnapshot {
+        transfers: transfer_count(pool, &sources).await?,
+        entries: entry_count(pool, &sources).await?,
+        balances: balances(pool, &ids).await?,
+        idempotency_records,
+    })
+}
+pub fn evaluate_replay(
+    before: &ReplaySnapshot,
+    after: &ReplaySnapshot,
+    expected: usize,
+    request_ids_match: bool,
+) -> Verification {
+    finish(vec![
+        check(
+            "replays_return_original_transfer_ids",
+            request_ids_match,
+            "each replay key must return its prepared transfer ID".into(),
+        ),
+        check(
+            "no_additional_transfers",
+            after.transfers == before.transfers && before.transfers == expected as i64,
+            format!(
+                "before {}, after {}, expected {expected}",
+                before.transfers, after.transfers
+            ),
+        ),
+        check(
+            "no_additional_entries",
+            after.entries == before.entries && before.entries == expected as i64 * 2,
+            format!(
+                "before {}, after {}, expected {}",
+                before.entries,
+                after.entries,
+                expected * 2
+            ),
+        ),
+        check(
+            "balances_unchanged",
+            after.balances == before.balances,
+            "replay phase must not change balances".into(),
+        ),
+        check(
+            "one_idempotency_record_per_prepared_key",
+            after.idempotency_records == before.idempotency_records
+                && before.idempotency_records == expected as i64,
+            format!(
+                "before {}, after {}, expected {expected}",
+                before.idempotency_records, after.idempotency_records
+            ),
+        ),
+    ])
+}
+async fn transfer_count(pool: &sqlx::PgPool, sources: &[Uuid]) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT count(*) FROM transfers WHERE source_account_id=ANY($1) AND kind='transfer'",
+    )
+    .bind(sources)
+    .fetch_one(pool)
+    .await?)
+}
+async fn entry_count(pool: &sqlx::PgPool, sources: &[Uuid]) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar("SELECT count(*) FROM account_entries WHERE transfer_id IN (SELECT id FROM transfers WHERE source_account_id=ANY($1))").bind(sources).fetch_one(pool).await?)
+}
+async fn balances(pool: &sqlx::PgPool, ids: &[Uuid]) -> anyhow::Result<BTreeMap<Uuid, i64>> {
+    Ok(
+        sqlx::query_as::<_, (Uuid, i64)>("SELECT id,balance_minor FROM accounts WHERE id=ANY($1)")
+            .bind(ids)
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .collect(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn verification_reports_failed_check() {
-        let check = check("count", false, "mismatch".into());
-        assert!(
-            !Verification {
-                valid: check.passed,
-                checks: vec![check]
-            }
-            .valid
-        );
+    fn snapshot(transfers: i64, entries: i64, balance: i64, records: i64) -> ReplaySnapshot {
+        ReplaySnapshot {
+            transfers,
+            entries,
+            balances: BTreeMap::from([(Uuid::nil(), balance)]),
+            idempotency_records: records,
+        }
     }
-
     #[test]
-    fn mismatched_counts_and_balances_make_verification_invalid() {
-        let source = Uuid::new_v4();
-        let destination = Uuid::new_v4();
-        let result = evaluate(
-            0,
-            0,
-            0,
-            BTreeMap::from([(source, 1_000), (destination, 1_000)]),
-            &[(source, destination)],
-            1,
-        );
-        assert!(!result.valid);
+    fn independent_duplicate_is_invalid() {
+        let id = Uuid::nil();
         assert!(
-            result
-                .checks
-                .iter()
-                .any(|check| check.name == "committed_measured_transfers" && !check.passed)
-        );
-        assert!(result.checks.iter().any(|check| check.name
-            == "expected_final_balances_and_pair_conservation"
-            && !check.passed));
+            !evaluate_independent(
+                1,
+                2,
+                1,
+                BTreeMap::from([(id, 900), (Uuid::max(), 1100)]),
+                &[(id, Uuid::max())],
+                1
+            )
+            .valid
+        )
+    }
+    #[test]
+    fn hot_duplicate_and_overdraft_are_invalid() {
+        let s = Uuid::nil();
+        let d = Uuid::max();
+        let result = evaluate_hot(1, 2, 1, BTreeMap::from([(s, -1), (d, 1100)]), s, &[d], 1);
+        assert!(!result.valid)
+    }
+    #[test]
+    fn replay_rejects_all_side_effect_mismatches() {
+        let before = snapshot(1, 2, 1000, 1);
+        for after in [
+            snapshot(2, 2, 1000, 1),
+            snapshot(1, 3, 1000, 1),
+            snapshot(1, 2, 999, 1),
+            snapshot(1, 2, 1000, 2),
+        ] {
+            assert!(!evaluate_replay(&before, &after, 1, true).valid)
+        }
+        assert!(!evaluate_replay(&before, &before, 1, false).valid)
     }
 }

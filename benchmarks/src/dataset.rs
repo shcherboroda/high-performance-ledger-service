@@ -1,26 +1,62 @@
 use anyhow::Result;
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScenarioPlan {
+    Independent,
+    HotAccount,
+    IdempotentReplay,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PairPlan {
+pub struct TransferPlan {
     pub owner: String,
     pub client: usize,
     pub phase: &'static str,
+    pub source: usize,
+    pub destination: usize,
+    pub key: String,
 }
 
 pub fn subject(seed: u64, client: usize) -> String {
     format!("benchmark-{seed}-{client}")
 }
 
-pub fn plans(seed: u64, clients: usize, warmup: usize, measured: usize) -> Vec<PairPlan> {
+pub fn plans(
+    scenario: ScenarioPlan,
+    seed: u64,
+    clients: usize,
+    warmup: usize,
+    measured: usize,
+) -> Vec<TransferPlan> {
     (0..(warmup + measured))
         .map(|index| {
             let phase = if index < warmup { "warmup" } else { "measured" };
-            PairPlan {
-                owner: subject(seed, index % clients),
-                client: index % clients,
+            let client = match scenario {
+                ScenarioPlan::HotAccount => 0,
+                ScenarioPlan::Independent | ScenarioPlan::IdempotentReplay => index % clients,
+            };
+            let (source, destination) = match scenario {
+                ScenarioPlan::Independent | ScenarioPlan::IdempotentReplay => (index, index),
+                ScenarioPlan::HotAccount => (if phase == "warmup" { 0 } else { 1 }, index),
+            };
+            TransferPlan {
+                owner: subject(seed, client),
+                client,
                 phase,
+                source,
+                destination,
+                key: format!("benchmark-{seed}-{phase}-{index}-{client}"),
             }
         })
         .collect()
+}
+
+pub fn deterministic_uuid(seed: u64, level: usize, index: usize) -> Uuid {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_OID,
+        format!("benchmark-{seed}-{level}-{index}").as_bytes(),
+    )
 }
 
 pub async fn migrate_and_clean(pool: &sqlx::PgPool, seed: u64) -> Result<()> {
@@ -49,11 +85,29 @@ mod tests {
     use super::*;
     #[test]
     fn plans_are_deterministic_and_phase_separated() {
-        let a = plans(9, 2, 1, 3);
-        assert_eq!(a, plans(9, 2, 1, 3));
+        let a = plans(ScenarioPlan::Independent, 9, 2, 1, 3);
+        assert_eq!(a, plans(ScenarioPlan::Independent, 9, 2, 1, 3));
         assert_eq!(a[0].phase, "warmup");
         assert!(a[1..].iter().all(|p| p.phase == "measured"));
-        assert_eq!(a[0].client, 0);
-        assert_eq!(a[1].client, 1);
+    }
+    #[test]
+    fn hot_account_plans_share_only_the_source() {
+        let plans = plans(ScenarioPlan::HotAccount, 1, 2, 0, 3);
+        assert!(plans.iter().all(|plan| plan.source == 1));
+        assert_eq!(
+            plans
+                .iter()
+                .map(|plan| plan.destination)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert!(plans.iter().all(|plan| plan.client == 0));
+    }
+    #[test]
+    fn replay_plans_are_stable() {
+        assert_eq!(
+            plans(ScenarioPlan::IdempotentReplay, 1, 1, 0, 2),
+            plans(ScenarioPlan::IdempotentReplay, 1, 1, 0, 2)
+        );
     }
 }
