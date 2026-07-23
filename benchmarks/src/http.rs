@@ -13,7 +13,7 @@ pub struct Classifications {
     pub unexpected_http_failures: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Operation {
     pub latency_ns: Option<u128>,
     pub classification: Classifications,
@@ -100,13 +100,6 @@ impl Http {
                             }
                         }
                     }
-                } else if is_expected_business_rejection(status) {
-                    classification.expected_business_rejections += 1;
-                    Operation {
-                        latency_ns: Some(started.elapsed().as_nanos()),
-                        classification,
-                        valid: false,
-                    }
                 } else {
                     classification.unexpected_http_failures += 1;
                     Operation {
@@ -139,14 +132,12 @@ impl Http {
             .send()
             .await
             .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?
             .text()
             .await
             .map_err(|e| e.to_string())
     }
-}
-
-fn is_expected_business_rejection(status: StatusCode) -> bool {
-    matches!(status.as_u16(), 400 | 401 | 404 | 409 | 422)
 }
 
 pub fn merge(into: &mut Classifications, next: &Classifications) {
@@ -158,6 +149,25 @@ pub fn merge(into: &mut Classifications, next: &Classifications) {
     into.timeout_failures += next.timeout_failures;
     into.parsing_failures += next.parsing_failures;
     into.unexpected_http_failures += next.unexpected_http_failures;
+}
+
+pub struct PhaseOperations {
+    pub warmup: Vec<Operation>,
+    pub measured: Vec<Operation>,
+}
+
+pub fn summarize_measured(phases: &PhaseOperations) -> (Classifications, Vec<u128>, bool) {
+    let mut classifications = Classifications::default();
+    let mut samples = Vec::with_capacity(phases.measured.len());
+    let mut valid = true;
+    for operation in &phases.measured {
+        if let Some(latency) = operation.latency_ns {
+            samples.push(latency);
+        }
+        merge(&mut classifications, &operation.classification);
+        valid &= operation.valid;
+    }
+    (classifications, samples, valid)
 }
 
 #[cfg(test)]
@@ -175,12 +185,30 @@ mod tests {
     }
 
     #[test]
-    fn business_rejections_are_not_unexpected_http_failures() {
-        assert!(is_expected_business_rejection(
-            StatusCode::UNPROCESSABLE_ENTITY
-        ));
-        assert!(!is_expected_business_rejection(
-            StatusCode::INTERNAL_SERVER_ERROR
-        ));
+    fn only_measured_operations_are_aggregated() {
+        let warmup = Operation {
+            latency_ns: Some(1),
+            classification: Classifications {
+                unexpected_http_failures: 1,
+                ..Default::default()
+            },
+            valid: false,
+        };
+        let measured = Operation {
+            latency_ns: Some(100),
+            classification: Classifications {
+                http_statuses: BTreeMap::from([(201, 1)]),
+                ..Default::default()
+            },
+            valid: true,
+        };
+        let (classifications, samples, valid) = summarize_measured(&PhaseOperations {
+            warmup: vec![warmup],
+            measured: vec![measured],
+        });
+        assert_eq!(samples, vec![100]);
+        assert_eq!(classifications.http_statuses.get(&201), Some(&1));
+        assert_eq!(classifications.unexpected_http_failures, 0);
+        assert!(valid);
     }
 }

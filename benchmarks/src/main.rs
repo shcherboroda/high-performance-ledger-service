@@ -6,8 +6,7 @@ use clap::Parser;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use ledger_benchmarks::{
     config::Config,
-    dataset,
-    http::{self, Classifications},
+    dataset, http,
     result::{self, ResultDocument},
     stats, verify,
 };
@@ -118,17 +117,9 @@ async fn run() -> Result<()> {
         .collect::<Vec<_>>();
     let verification = verify::verify(&pool, &measured_accounts, config.operations).await?;
     // Phase 9: versioned machine-readable report.
-    let mut classifications = Classifications::default();
-    let mut samples = Vec::new();
-    let mut workload_valid = true;
-    for operation in measured {
-        if let Some(latency) = operation.latency_ns {
-            samples.push(latency);
-        }
-        http::merge(&mut classifications, &operation.classification);
-        workload_valid &= operation.valid;
-    }
-    let latency = stats::calculate_measured(&[], &mut samples);
+    let (classifications, mut samples, workload_valid) =
+        http::summarize_measured(&http::PhaseOperations { warmup, measured });
+    let latency = stats::calculate(&mut samples);
     let result = ResultDocument { schema_version: result::SCHEMA_VERSION, generated_at_utc: Utc::now(), commit_sha: git_sha(), scenario: "independent_normal_transfer_smoke", seed: config.seed, service_urls: config.service_urls.clone(), logical_clients: config.logical_clients, concurrency: config.concurrency, warmup_operations: config.warmup_operations, measured_operations: config.operations, request_timeout_secs: config.request_timeout_secs, elapsed_measured_ns: elapsed.as_nanos(), throughput_operations_per_second: config.operations as f64 / elapsed.as_secs_f64(), latency, classifications, metrics_before, metrics_after, verification: Some(verification.clone()), valid: warmup_valid && workload_valid && verification.valid, database_pool_assumptions: config.db_pool_assumptions, telemetry_mode: config.telemetry_mode, environment: environment(&pool).await, limitations: vec!["This smoke scenario is harness validation, not a performance claim.".into(), "Metrics are raw process-local snapshots and are not used for client latency percentiles.".into(), "Service pool size and telemetry mode are operator supplied when recorded.".into()] };
     result::write(&config.output, &result)?;
     if !result.valid {
