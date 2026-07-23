@@ -3,13 +3,13 @@ use std::future::pending;
 
 use anyhow::Result;
 use rust_backend_technical_assessment::{app, auth::AuthVerifier, config::Config, db};
-use tracing::{error, info};
+use tracing::info;
 
 #[tokio::main]
 async fn main() {
-    if let Err(error) = run().await {
-        eprintln!("application failed to start: {error}");
-        error!(error = %error, "application startup failed");
+    if run().await.is_err() {
+        eprintln!("application failed to start");
+        rust_backend_technical_assessment::observability::log_startup_failure();
         std::process::exit(1);
     }
 }

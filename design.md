@@ -594,7 +594,7 @@ Expected categories include:
 * transfer already reversed;
 * internal error.
 
-Internal database details are logged but not returned.
+Internal database details are not returned or logged; logs use bounded error categories instead.
 
 ## 17. Observability
 
@@ -612,6 +612,13 @@ request/response bodies.
 `ledger_http_request_duration_seconds{method,route}` using bounded route templates and explicit
 histogram buckets. It performs no network export; deployments must protect access to this endpoint
 at their network boundary when appropriate.
+
+Readiness checks additionally report exactly one
+`ledger_readiness_checks_total{outcome,reason}` and one
+`ledger_readiness_check_duration_seconds{outcome}` observation after check execution starts.
+Readiness outcomes are exactly `ready` and `not_ready`; reasons are exactly `none`,
+`database_unavailable`, and `internal_error`. Each readiness request emits one terminal structured
+event with those bounded fields and readiness duration. No raw database error text is recorded.
 
 Financial writes additionally report `ledger_operations_total{operation,outcome,reason}`,
 `ledger_idempotency_outcomes_total{operation,outcome}`, and
@@ -634,6 +641,13 @@ idempotency work, locking, validation, SQL execution, and commit or rollback aba
 exclude HTTP handling, authentication, request parsing, and failed transaction acquisition. The
 metrics and terminal structured events exclude client, account, transfer, and idempotency
 identifiers, financial values, currencies, rates, fees, fingerprints, and error text.
+
+Application-owned internal, readiness, and startup failure events use stable bounded component,
+operation, outcome/reason, and error-category fields. They exclude configuration values and
+credentials, authentication key material and tokens, SQL or bind values, identifiers, financial
+values, idempotency material, request/response bodies, raw database errors, and raw error chains.
+Logging begins only after configuration parsing, so pre-configuration failures are limited to the
+fixed process-stderr startup message and cannot produce structured logs.
 
 ## 18. Testing strategy
 

@@ -39,6 +39,38 @@ pub enum TerminalOutcome {
     InternalError,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadinessOutcome {
+    Ready,
+    NotReady,
+}
+
+impl ReadinessOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::NotReady => "not_ready",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadinessReason {
+    None,
+    DatabaseUnavailable,
+    InternalError,
+}
+
+impl ReadinessReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::DatabaseUnavailable => "database_unavailable",
+            Self::InternalError => "internal_error",
+        }
+    }
+}
+
 impl TerminalOutcome {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -219,6 +251,30 @@ pub fn record_operation_without_transaction(
     );
 }
 
+pub fn record_readiness_check(
+    outcome: ReadinessOutcome,
+    reason: ReadinessReason,
+    duration_seconds: f64,
+) {
+    counter!("ledger_readiness_checks_total", "outcome" => outcome.as_str(), "reason" => reason.as_str()).increment(1);
+    histogram!("ledger_readiness_check_duration_seconds", "outcome" => outcome.as_str())
+        .record(duration_seconds);
+    tracing::info!(
+        outcome = outcome.as_str(),
+        reason = reason.as_str(),
+        readiness_duration_seconds = duration_seconds,
+        "readiness check completed"
+    );
+}
+
+pub fn log_startup_failure() {
+    tracing::error!(
+        component = "startup",
+        error_category = "startup_failure",
+        "application startup failed"
+    );
+}
+
 static METRICS: OnceLock<PrometheusHandle> = OnceLock::new();
 
 pub fn init_logging(log_filter: &str) -> Result<WorkerGuard> {
@@ -341,7 +397,9 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use axum::{Router, body::Body, http::Request, middleware, routing::get};
+    use axum::{
+        Router, body::Body, http::Request, middleware, response::IntoResponse, routing::get,
+    };
     use tower::ServiceExt;
 
     use super::*;
@@ -432,5 +490,74 @@ mod tests {
         assert!(metrics.contains("outcome=\"owner\""));
         assert!(metrics.contains("ledger_database_transaction_duration_seconds"));
         assert!(!metrics.contains(&secret));
+    }
+
+    #[test]
+    fn readiness_metrics_and_failure_logs_use_only_bounded_context() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(move || TestWriter(writer.clone()))
+            .finish();
+        let secret = "postgres://ledger_user:ledger_password@db.example/ledger";
+        let public_key = "-----BEGIN PUBLIC KEY----- seeded-key-material";
+        let token = "Bearer seeded-token";
+        let sql = "SELECT balance_minor FROM accounts WHERE id = $1";
+        let identifier = "account-7 transfer-8 reversal-9";
+        let financial = "amount=101.23 rate=1.25 fee=2.00";
+        let idempotency = "idempotency-key=fingerprint-27";
+        let raw_error = "seeded database failure";
+
+        tracing::subscriber::with_default(subscriber, || {
+            record_readiness_check(
+                ReadinessOutcome::NotReady,
+                ReadinessReason::DatabaseUnavailable,
+                0.01,
+            );
+            log_startup_failure();
+            let _ = crate::api_error::AppError::internal(anyhow::anyhow!(
+                "{secret} {public_key} {token} {sql} {identifier} {financial} {idempotency} {raw_error}"
+            ))
+            .into_response();
+        });
+
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        for forbidden in [
+            secret,
+            public_key,
+            token,
+            sql,
+            identifier,
+            financial,
+            idempotency,
+            raw_error,
+        ] {
+            assert!(!logs.contains(forbidden), "log exposed {forbidden}");
+        }
+        assert!(logs.contains("readiness check completed"));
+        assert!(logs.contains("database_unavailable"));
+        assert!(logs.contains("startup_failure"));
+        assert!(logs.contains("internal_error"));
+
+        let metrics = metrics_handle().render();
+        let readiness_lines = metrics
+            .lines()
+            .filter(|line| line.starts_with("ledger_readiness_"))
+            .collect::<Vec<_>>();
+        assert!(!readiness_lines.is_empty());
+        for line in readiness_lines {
+            assert!(
+                line.contains("outcome=\"ready\"")
+                    || line.contains("outcome=\"not_ready\"")
+                    || line.starts_with("#")
+            );
+            assert!(
+                !line.contains("reason=")
+                    || line.contains("reason=\"none\"")
+                    || line.contains("reason=\"database_unavailable\"")
+                    || line.contains("reason=\"internal_error\"")
+            );
+        }
     }
 }
