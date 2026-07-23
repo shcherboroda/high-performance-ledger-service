@@ -96,6 +96,23 @@ def throughput_ratio(previous, current):
         return "unavailable"
     return f"{current / previous:.3f}"
 
+def stored_throughput_ratio(document, topology, current, matching_topologies):
+    """Return a matching schema-v4 ratio, if it can describe this adjacent level."""
+    summary = document.get("summary")
+    ratios = summary.get("adjacent_throughput_ratios") if isinstance(summary, dict) else None
+    instances = topology.get("configured_instances")
+    if matching_topologies != 1 or not isinstance(ratios, list):
+        return False, None
+    for ratio in ratios:
+        if not isinstance(ratio, dict):
+            continue
+        if (ratio.get("from_instances") == instances and ratio.get("to_instances") == instances
+                and ratio.get("concurrency") == current.get("concurrency")):
+            value = ratio.get("throughput_ratio")
+            if value is None or isinstance(value, (int, float)):
+                return True, value
+    return False, None
+
 def summarize(document):
     if not isinstance(document, dict) or document.get("schema_version") != 4 or not isinstance(document.get("topology_levels"), list):
         raise ValueError("unsupported schema version or structurally unusable result")
@@ -113,6 +130,12 @@ def summarize(document):
         for failure in topology.get("workload_failures", []): print(f"workload failure: {failure}")
         invalid |= topology.get("valid") is False
         topology_rows = []
+        previous_throughput = None
+        instances = topology.get("configured_instances")
+        matching_topologies = sum(
+            item.get("configured_instances") == instances
+            for item in document["topology_levels"] if isinstance(item, dict)
+        )
         for level in topology.get("levels", []):
             if not isinstance(level, dict): raise ValueError("structurally unusable level result")
             valid = level.get("valid")
@@ -126,18 +149,22 @@ def summarize(document):
             print(f"level valid={valid}; metrics:")
             for url in sorted(set(level.get("metrics_before", {})) | set(level.get("metrics_after", {}))):
                 print(f"  {url}: " + ", ".join(f"{key}={unavailable(value)}" for key, value in metric_deltas(snapshot_value(level.get("metrics_before", {}).get(url)), snapshot_value(level.get("metrics_after", {}).get(url))).items()))
-            topology_rows.append((topology.get("configured_instances"), level))
+            throughput = level.get("throughput_operations_per_second")
+            has_stored_ratio, stored_ratio = stored_throughput_ratio(document, topology, level, matching_topologies)
+            ratio = ("1.000" if previous_throughput is None else
+                     "unavailable" if has_stored_ratio and stored_ratio is None else
+                     f"{stored_ratio:.3f}" if has_stored_ratio else
+                     throughput_ratio(previous_throughput, throughput))
+            topology_rows.append((instances, level, ratio))
+            previous_throughput = throughput
         rows.extend(topology_rows)
     if len(rows) > 1:
         print("\ninstances | concurrency | completed/expected | throughput | mean | p50 | p95 | p99 | failures | valid | throughput ratio")
-        previous_by_topology = {}
-        for instances, level in rows:
+        for instances, level, ratio in rows:
             latency = level.get("latency") or {}
             classification = level.get("classifications") or {}
             failure_count = sum(classification.get(key, 0) for key in ("expected_business_rejections", "transport_failures", "timeout_failures", "parsing_failures", "unexpected_http_failures"))
             throughput = level.get("throughput_operations_per_second")
-            ratio = throughput_ratio(previous_by_topology.get(instances), throughput)
-            previous_by_topology[instances] = throughput
             print(f"{instances} | {level.get('concurrency')} | {level.get('completed_measured_operations')}/{level.get('measured_operations')} | {throughput} | " + " | ".join("unavailable" if latency.get(key) is None else f"{latency[key] / 1_000_000:.3f} ms" for key in ("mean_ns", "p50_ns", "p95_ns", "p99_ns")) + f" | {failure_count} | {level.get('valid')} | {ratio}")
     return 1 if invalid else 0
 

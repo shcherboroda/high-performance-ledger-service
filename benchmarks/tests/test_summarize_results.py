@@ -72,6 +72,21 @@ class SummarizerTests(unittest.TestCase):
         self.assertIn("1.000", output.getvalue())
         self.assertIn("1.500", output.getvalue())
 
+    def test_comparison_table_prefers_structurally_matching_stored_ratio(self):
+        document = result()
+        levels = document["topology_levels"][0]["levels"]
+        next_level = copy.deepcopy(levels[0])
+        next_level["concurrency"] = 4
+        next_level["throughput_operations_per_second"] = 150.0
+        levels.append(next_level)
+        document["summary"] = {"adjacent_throughput_ratios": [{
+            "from_instances": 1, "to_instances": 1, "concurrency": 4, "throughput_ratio": 9.876,
+        }]}
+        output = io.StringIO()
+        with redirect_stdout(output): self.assertEqual(summarizer.summarize(document), 0)
+        self.assertIn("9.876", output.getvalue())
+        self.assertNotIn("| 1.500", output.getvalue())
+
     def test_comparison_table_handles_zero_or_missing_throughput(self):
         document = result()
         levels = document["topology_levels"][0]["levels"]
@@ -91,7 +106,7 @@ class SummarizerTests(unittest.TestCase):
         first["levels"][1]["concurrency"] = 4
         first["levels"][1]["throughput_operations_per_second"] = 200.0
         second = copy.deepcopy(first)
-        second["configured_instances"] = 2
+        second["service_urls"] = ["http://b"]
         second["levels"][0]["throughput_operations_per_second"] = 50.0
         second["levels"][1]["throughput_operations_per_second"] = 100.0
         document["topology_levels"].append(second)
