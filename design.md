@@ -646,8 +646,9 @@ Application-owned internal, readiness, and startup failure events use stable bou
 operation, outcome/reason, and error-category fields. They exclude configuration values and
 credentials, authentication key material and tokens, SQL or bind values, identifiers, financial
 values, idempotency material, request/response bodies, raw database errors, and raw error chains.
-Logging begins only after configuration parsing, so pre-configuration failures are limited to the
-fixed process-stderr startup message and cannot produce structured logs.
+Failures before successful logging initialization, including configuration parsing and logger
+initialization itself, are limited to the fixed process-stderr startup message and cannot produce
+structured logs. Bounded structured startup events apply only after logging initialization succeeds.
 
 ## 18. Testing strategy
 
@@ -687,6 +688,14 @@ Concurrency tests verify:
 * safe opposing transfers;
 * one committed reversal under concurrent attempts;
 * one committed side effect for concurrent duplicate successful requests.
+
+Observability tests cover:
+
+* request-ID validation, propagation, and replacement of invalid caller values;
+* bounded HTTP metric method, route, and status labels;
+* bounded financial-operation, idempotency, and transaction-duration outcomes;
+* readiness success and PostgreSQL-failure metric deltas;
+* structured-log sanitization for request, internal, readiness, and startup failure paths.
 
 ## 19. Key invariants
 
