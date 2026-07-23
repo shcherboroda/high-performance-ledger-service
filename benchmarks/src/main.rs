@@ -100,15 +100,26 @@ async fn run_level(
         Scenario::Independent => ScenarioPlan::Independent,
         Scenario::HotAccount => ScenarioPlan::HotAccount,
         Scenario::IdempotentReplay => ScenarioPlan::IdempotentReplay,
+        Scenario::AccountPool => ScenarioPlan::AccountPool,
     };
-    let plans = dataset::plans(
-        scenario,
-        config.seed,
-        config.logical_clients,
-        config.warmup_operations,
-        config.operations,
-    );
-    let accounts = prepare(config, http, tokens, &plans).await?;
+    let plans = if config.scenario == Scenario::AccountPool {
+        dataset::account_pool_plans(
+            config.seed,
+            config.logical_clients,
+            config.account_pool_size,
+            config.warmup_operations,
+            config.operations,
+        )
+    } else {
+        dataset::plans(
+            scenario,
+            config.seed,
+            config.logical_clients,
+            config.warmup_operations,
+            config.operations,
+        )
+    };
+    let (accounts, pool_ids) = prepare(config, http, tokens, &plans).await?;
     let (warmup, prepared_ids, replay_before) = if config.scenario == Scenario::IdempotentReplay {
         let originals = run_phase(http, tokens, &plans, &accounts, concurrency).await;
         let prepared_ids = transfer_ids_by_key(&originals)?;
@@ -134,7 +145,8 @@ async fn run_level(
         (warmup, prepared_ids, Some(before))
     } else {
         (
-            run_phase(
+            run_operations(
+                config,
                 http,
                 tokens,
                 &plans[..config.warmup_operations],
@@ -148,7 +160,8 @@ async fn run_level(
     };
     let metrics_before = metrics(http).await;
     let started = Instant::now();
-    let measured = run_phase(
+    let measured = run_operations(
+        config,
         http,
         tokens,
         &plans[config.warmup_operations..],
@@ -211,6 +224,18 @@ async fn run_level(
                 replay_ids == expected_replay_ids,
             )
         }
+        Scenario::AccountPool => {
+            verify::account_pool(
+                pool,
+                pool_ids
+                    .as_deref()
+                    .expect("account-pool setup provides all pool IDs"),
+                &dataset::expected_pool_balances(config.account_pool_size, &plans),
+                &plans[config.warmup_operations..],
+                config.operations,
+            )
+            .await?
+        }
     };
     let measured_requests_per_url = http::measured_requests_per_url(&measured);
     let distribution_valid = http::every_instance_received_measured_traffic(
@@ -224,6 +249,9 @@ async fn run_level(
         concurrency,
         warmup_operations: config.warmup_operations,
         measured_operations: config.operations,
+        account_pool_size: (config.scenario == Scenario::AccountPool).then_some(config.account_pool_size),
+        phase_count: (config.scenario == Scenario::AccountPool).then(|| config.operations.div_ceil(config.account_pool_size)),
+        phase_model: (config.scenario == Scenario::AccountPool).then(|| "ring phases: each account is debited and credited at most once per phase; phases run sequentially".into()),
         completed_measured_operations: samples.len(),
         elapsed_measured_ns: elapsed.as_nanos(),
         throughput_operations_per_second: config.operations as f64 / elapsed.as_secs_f64(),
@@ -261,7 +289,28 @@ async fn prepare(
     http: &http::Http,
     tokens: &[String],
     plans: &[TransferPlan],
-) -> Result<Vec<(Uuid, Uuid)>> {
+) -> Result<(Vec<(Uuid, Uuid)>, Option<Vec<Uuid>>)> {
+    if config.scenario == Scenario::AccountPool {
+        let mut pool_ids = Vec::with_capacity(config.account_pool_size);
+        for index in 0..config.account_pool_size {
+            pool_ids.push(
+                http.create_account(
+                    index,
+                    &tokens[index % config.logical_clients],
+                    &format!("benchmark-{}-account-pool-{index}", config.seed),
+                    "100.00",
+                )
+                .await?,
+            );
+        }
+        return Ok((
+            plans
+                .iter()
+                .map(|plan| (pool_ids[plan.source], pool_ids[plan.destination]))
+                .collect(),
+            Some(pool_ids),
+        ));
+    }
     let count = plans.len();
     let mut result = Vec::with_capacity(count);
     if config.scenario == Scenario::HotAccount {
@@ -317,7 +366,27 @@ async fn prepare(
             result.push((source, destination))
         }
     }
-    Ok(result)
+    Ok((result, None))
+}
+async fn run_operations(
+    config: &Config,
+    http: &Arc<http::Http>,
+    tokens: &[String],
+    plans: &[TransferPlan],
+    accounts: &[(Uuid, Uuid)],
+    concurrency: usize,
+) -> Vec<http::Operation> {
+    if config.scenario != Scenario::AccountPool {
+        return run_phase(http, tokens, plans, accounts, concurrency).await;
+    }
+    let mut operations = Vec::with_capacity(plans.len());
+    for (plans, accounts) in plans
+        .chunks(config.account_pool_size)
+        .zip(accounts.chunks(config.account_pool_size))
+    {
+        operations.extend(run_phase(http, tokens, plans, accounts, concurrency).await);
+    }
+    operations
 }
 async fn run_phase(
     http: &Arc<http::Http>,

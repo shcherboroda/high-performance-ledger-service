@@ -2,7 +2,7 @@ use crate::{http::Classifications, stats::Latency, verify::Verification};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::{collections::BTreeMap, path::Path};
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 #[derive(Debug, Serialize)]
 pub struct LevelResult {
     pub scenario: String,
@@ -10,6 +10,9 @@ pub struct LevelResult {
     pub concurrency: usize,
     pub warmup_operations: usize,
     pub measured_operations: usize,
+    pub account_pool_size: Option<usize>,
+    pub phase_count: Option<usize>,
+    pub phase_model: Option<String>,
     pub completed_measured_operations: usize,
     pub elapsed_measured_ns: u128,
     pub throughput_operations_per_second: f64,
@@ -174,6 +177,9 @@ mod tests {
             concurrency,
             warmup_operations: 0,
             measured_operations: 1,
+            account_pool_size: None,
+            phase_count: None,
+            phase_model: None,
             completed_measured_operations: 1,
             elapsed_measured_ns: 1,
             throughput_operations_per_second: throughput,
@@ -208,6 +214,36 @@ mod tests {
         assert!(serde_json::to_value(summary).is_ok());
     }
     #[test]
+    fn account_pool_metadata_is_serialized() {
+        let level = LevelResult {
+            scenario: "account-pool".into(),
+            seed: 7,
+            concurrency: 2,
+            warmup_operations: 1,
+            measured_operations: 3,
+            account_pool_size: Some(2),
+            phase_count: Some(2),
+            phase_model: Some("ring phases".into()),
+            completed_measured_operations: 3,
+            elapsed_measured_ns: 1,
+            throughput_operations_per_second: 3.0,
+            latency: None,
+            classifications: Classifications::default(),
+            measured_requests_per_url: BTreeMap::new(),
+            metrics_before: BTreeMap::new(),
+            metrics_after: BTreeMap::new(),
+            verification: Verification {
+                checks: vec![],
+                valid: true,
+            },
+            valid: true,
+        };
+        let value = serde_json::to_value(level).unwrap();
+        assert_eq!(value["account_pool_size"], 2);
+        assert_eq!(value["phase_count"], 2);
+        assert_eq!(value["phase_model"], "ring phases");
+    }
+    #[test]
     fn topology_summary_compares_each_matching_concurrency_level() {
         let level = |concurrency, throughput| LevelResult {
             scenario: "independent".into(),
@@ -215,6 +251,9 @@ mod tests {
             concurrency,
             warmup_operations: 0,
             measured_operations: 1,
+            account_pool_size: None,
+            phase_count: None,
+            phase_model: None,
             completed_measured_operations: 1,
             elapsed_measured_ns: 1,
             throughput_operations_per_second: throughput,
