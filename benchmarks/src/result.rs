@@ -32,8 +32,14 @@ pub struct TopologyLevelResult {
     pub service_urls: Vec<String>,
     pub readiness: BTreeMap<String, Result<(), String>>,
     pub workload_skipped_reason: Option<String>,
+    pub workload_failures: Vec<WorkloadFailure>,
     pub levels: Vec<LevelResult>,
     pub valid: bool,
+}
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct WorkloadFailure {
+    pub concurrency: usize,
+    pub reason: String,
 }
 impl TopologyLevelResult {
     pub fn readiness_failure(
@@ -48,6 +54,27 @@ impl TopologyLevelResult {
             workload_skipped_reason: Some(
                 "workload skipped because at least one configured instance was not ready".into(),
             ),
+            workload_failures: Vec::new(),
+            levels: Vec::new(),
+            valid: false,
+        }
+    }
+    pub fn workload_failure(
+        configured_instances: usize,
+        service_urls: Vec<String>,
+        readiness: BTreeMap<String, Result<(), String>>,
+        concurrency: usize,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            configured_instances,
+            service_urls,
+            readiness,
+            workload_skipped_reason: None,
+            workload_failures: vec![WorkloadFailure {
+                concurrency,
+                reason: reason.into(),
+            }],
             levels: Vec::new(),
             valid: false,
         }
@@ -172,6 +199,7 @@ mod tests {
             service_urls: vec!["http://a".into(), "http://b".into()],
             readiness: BTreeMap::from([("http://a".into(), Ok(())), ("http://b".into(), Ok(()))]),
             workload_skipped_reason: None,
+            workload_failures: Vec::new(),
             levels: vec![],
             valid: true,
         };
@@ -206,6 +234,7 @@ mod tests {
             service_urls: vec![],
             readiness: BTreeMap::new(),
             workload_skipped_reason: None,
+            workload_failures: Vec::new(),
             levels,
             valid: true,
         };
@@ -245,5 +274,24 @@ mod tests {
         assert!(result.levels.is_empty());
         assert_eq!(result.readiness.len(), 2);
         assert!(result.workload_skipped_reason.is_some());
+    }
+    #[test]
+    fn workload_failure_is_retained_without_fabricating_measurements() {
+        let result = TopologyLevelResult::workload_failure(
+            2,
+            vec!["http://a".into(), "http://b".into()],
+            BTreeMap::from([("http://a".into(), Ok(())), ("http://b".into(), Ok(()))]),
+            4,
+            "account setup returned HTTP 503",
+        );
+        assert!(!result.valid);
+        assert!(result.levels.is_empty());
+        assert_eq!(
+            result.workload_failures,
+            vec![WorkloadFailure {
+                concurrency: 4,
+                reason: "account setup returned HTTP 503".into()
+            }]
+        );
     }
 }

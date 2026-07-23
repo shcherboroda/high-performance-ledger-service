@@ -50,19 +50,24 @@ async fn run() -> Result<()> {
             ));
             continue;
         }
-        let levels = {
-            let mut levels = Vec::new();
-            for concurrency in config.levels()? {
-                levels.push(run_level(&config, &pool, &http, &tokens, concurrency).await?)
+        let mut levels = Vec::new();
+        let mut workload_failures = Vec::new();
+        for concurrency in config.levels()? {
+            match run_level(&config, &pool, &http, &tokens, concurrency).await {
+                Ok(level) => levels.push(level),
+                Err(error) => workload_failures.push(result::WorkloadFailure {
+                    concurrency,
+                    reason: format!("{error:#}"),
+                }),
             }
-            levels
-        };
+        }
         topology_levels.push(TopologyLevelResult {
             configured_instances: instances,
             service_urls: urls,
             readiness,
             workload_skipped_reason: None,
-            valid: levels.iter().all(|level| level.valid),
+            valid: workload_failures.is_empty() && levels.iter().all(|level| level.valid),
+            workload_failures,
             levels,
         });
     }
