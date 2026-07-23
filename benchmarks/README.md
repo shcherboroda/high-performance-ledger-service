@@ -33,9 +33,58 @@ DATABASE_URL=postgres://.../ledger_benchmark JWT_ISSUER=benchmark-issuer JWT_AUD
 
 For hot-account runs the shared source is funded for every warm-up and measured transfer. Replay preparation, JWTs, setup, snapshots, verification, and reporting are outside the measured interval. Warm-up traffic is excluded from all measurements and correctness counts.
 
-## Smoke run
+## Local one-instance smoke runs
 
-Build both packages in release mode, leave the service running, and run:
+The local scripts use only benchmark-specific configuration. Export the dedicated database, the
+benchmark issuer/audience and private key used by the harness, and the matching public key used by
+the service:
+
+```bash
+export BENCHMARK_DATABASE_URL=postgres://.../ledger_benchmark
+export BENCHMARK_JWT_ISSUER=benchmark-issuer
+export BENCHMARK_JWT_AUDIENCE=ledger
+export BENCHMARK_JWT_PRIVATE_KEY=/tmp/ledger-benchmark-private.pem
+export JWT_PUBLIC_KEY_PEM="$(cat /tmp/ledger-benchmark-public.pem)"
+```
+
+Start one release-built local service, then wait for the script to confirm `/ready`:
+
+```bash
+./benchmarks/run-local-service.sh
+```
+
+The script requires a PostgreSQL URL whose parsed database name ends in `_benchmark`; it refuses
+to start otherwise. It defaults `RUST_LOG` to `warn` (an explicit value is preserved), starts on
+the normal local port unless the existing `BIND_ADDRESS` override is set, and does not change pool
+settings, Tokio settings, or PostgreSQL settings. Its PID and log are written to the ignored
+`benchmark-results/local-service.pid` and `benchmark-results/local-service.log` paths.
+
+With the service running, acknowledge destructive benchmark setup and run either documented smoke
+scenario:
+
+```bash
+export BENCHMARK_ALLOW_DESTRUCTIVE=1
+export SERVICE_URLS=http://127.0.0.1:3000
+./benchmarks/run-smoke.sh independent
+./benchmarks/run-smoke.sh account-pool
+```
+
+The commands write ignored, deterministic raw version-4 JSON files at
+`benchmark-results/smoke-independent.json` and `benchmark-results/smoke-account-pool.json`.
+Additional benchmark CLI arguments may follow the scenario. Stop only the recorded service when
+finished:
+
+```bash
+./benchmarks/stop-local-service.sh
+```
+
+Raw JSON, service logs, and PID files remain uncommitted. These scripts do not change workload
+logic, result schema, metrics logic, topology behavior, service behavior, pool settings, Tokio
+settings, or PostgreSQL configuration. `run-topology.sh` remains the existing tool for one-versus-
+two-instance execution.
+
+Direct CLI use remains available. Build both packages in release mode, leave the service running,
+and run:
 
 ```bash
 BENCHMARK_ALLOW_DESTRUCTIVE=1 \
@@ -51,7 +100,7 @@ cargo run -p ledger-benchmarks --release -- \
 
 CLI flags take their displayed values; matching environment variables provide defaults. Required fields are the service URL list, database URL, destructive acknowledgement, issuer, audience, and private-key path. `SERVICE_URLS` accepts a comma-separated list. The remaining options are documented by `cargo run -p ledger-benchmarks -- --help`; defaults are deliberately small. JWTs are generated once before setup, have deterministic subjects derived from seed and client index, and the tool rejects a lifetime shorter than a conservative configured run duration.
 
-Run the other smoke scenarios by changing `--scenario hot-account` or `--scenario idempotent-replay`. A bounded sweep uses the same operation count and isolated setup/cleanup for each ascending level:
+Run the other scenarios directly by changing `--scenario hot-account` or `--scenario idempotent-replay`. A bounded sweep uses the same operation count and isolated setup/cleanup for each ascending level:
 
 ```bash
 BENCHMARK_ALLOW_DESTRUCTIVE=1 BENCHMARK_DATABASE_URL=postgres://.../ledger_benchmark \
