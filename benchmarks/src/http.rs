@@ -18,6 +18,7 @@ pub struct Operation {
     pub latency_ns: Option<u128>,
     pub classification: Classifications,
     pub valid: bool,
+    pub transfer_id: Option<uuid::Uuid>,
 }
 
 #[derive(Clone)]
@@ -41,6 +42,7 @@ impl Http {
         operation: usize,
         token: &str,
         idempotency_key: &str,
+        initial_balance: &str,
     ) -> anyhow::Result<uuid::Uuid> {
         let response = self
             .client
@@ -50,7 +52,7 @@ impl Http {
             ))
             .bearer_auth(token)
             .header("Idempotency-Key", idempotency_key)
-            .json(&serde_json::json!({"currency":"USD","initial_balance":"10.00"}))
+            .json(&serde_json::json!({"currency":"USD","initial_balance":initial_balance}))
             .send()
             .await?;
         if response.status() != StatusCode::CREATED {
@@ -89,6 +91,10 @@ impl Http {
                                 latency_ns: Some(started.elapsed().as_nanos()),
                                 classification,
                                 valid: true,
+                                transfer_id: body
+                                    .get("id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .and_then(|id| uuid::Uuid::parse_str(id).ok()),
                             }
                         }
                         _ => {
@@ -97,6 +103,7 @@ impl Http {
                                 latency_ns: Some(started.elapsed().as_nanos()),
                                 classification,
                                 valid: false,
+                                transfer_id: None,
                             }
                         }
                     }
@@ -106,6 +113,7 @@ impl Http {
                         latency_ns: Some(started.elapsed().as_nanos()),
                         classification,
                         valid: false,
+                        transfer_id: None,
                     }
                 }
             }
@@ -119,6 +127,7 @@ impl Http {
                     latency_ns: Some(started.elapsed().as_nanos()),
                     classification,
                     valid: false,
+                    transfer_id: None,
                 }
             }
         }
@@ -193,6 +202,7 @@ mod tests {
                 ..Default::default()
             },
             valid: false,
+            transfer_id: None,
         };
         let measured = Operation {
             latency_ns: Some(100),
@@ -201,6 +211,7 @@ mod tests {
                 ..Default::default()
             },
             valid: true,
+            transfer_id: None,
         };
         let (classifications, samples, valid) = summarize_measured(&PhaseOperations {
             warmup: vec![warmup],

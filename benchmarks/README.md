@@ -1,6 +1,6 @@
 # Ledger benchmark foundation
 
-This package is a reproducible HTTP/PostgreSQL harness. Its only scenario is a small independent same-currency transfer smoke run; it validates the harness and makes **no performance claim**. It does not yet provide FX, contention, replay, history, multi-process, or saturation scenarios.
+This package is a reproducible HTTP/PostgreSQL harness for transfer writes. It records raw, environment-specific measurements and makes **no production performance claim**.
 
 ## Prerequisites and safety
 
@@ -22,6 +22,16 @@ openssl rsa -in /tmp/ledger-benchmark-private.pem -pubout -out /tmp/ledger-bench
 DATABASE_URL=postgres://.../ledger_benchmark JWT_ISSUER=benchmark-issuer JWT_AUDIENCE=ledger JWT_PUBLIC_KEY_PEM="$(cat /tmp/ledger-benchmark-public.pem)" cargo run --release
 ```
 
+## Scenarios and runs
+
+`--scenario` selects one deterministic workload:
+
+- `independent`: every operation has its own funded source/destination pair; all requests must succeed.
+- `hot-account`: requests share a funded source and have independent destinations; this exercises source-account serialization without retries.
+- `idempotent-replay`: successful original transfers are prepared before measurement; measured traffic replays the same client/key/fingerprint and must add no records or balance changes.
+
+For hot-account runs the shared source is funded for every warm-up and measured transfer. Replay preparation, JWTs, setup, snapshots, verification, and reporting are outside the measured interval. Warm-up traffic is excluded from all measurements and correctness counts.
+
 ## Smoke run
 
 Build both packages in release mode, leave the service running, and run:
@@ -34,17 +44,30 @@ BENCHMARK_JWT_ISSUER=benchmark-issuer \
 BENCHMARK_JWT_AUDIENCE=ledger \
 BENCHMARK_JWT_PRIVATE_KEY=/tmp/ledger-benchmark-private.pem \
 cargo run -p ledger-benchmarks --release -- \
-  --logical-clients 2 --concurrency 2 --operations 20 --warmup-operations 4 \
+  --scenario independent --logical-clients 2 --concurrency 2 --operations 20 --warmup-operations 4 \
   --output benchmark-results/smoke.json
 ```
 
 CLI flags take their displayed values; matching environment variables provide defaults. Required fields are the service URL list, database URL, destructive acknowledgement, issuer, audience, and private-key path. `SERVICE_URLS` accepts a comma-separated list. The remaining options are documented by `cargo run -p ledger-benchmarks -- --help`; defaults are deliberately small. JWTs are generated once before setup, have deterministic subjects derived from seed and client index, and the tool rejects a lifetime shorter than a conservative configured run duration.
 
+Run the other smoke scenarios by changing `--scenario hot-account` or `--scenario idempotent-replay`. A bounded sweep uses the same operation count and isolated setup/cleanup for each ascending level:
+
+```bash
+BENCHMARK_ALLOW_DESTRUCTIVE=1 BENCHMARK_DATABASE_URL=postgres://.../ledger_benchmark \
+SERVICE_URLS=http://127.0.0.1:3000 BENCHMARK_JWT_ISSUER=benchmark-issuer \
+BENCHMARK_JWT_AUDIENCE=ledger BENCHMARK_JWT_PRIVATE_KEY=/tmp/ledger-benchmark-private.pem \
+cargo run -p ledger-benchmarks --release -- \
+  --scenario hot-account --operations 20 --warmup-operations 4 \
+  --concurrency-levels 1,2,4,8 --output benchmark-results/hot-sweep.json
+```
+
+Concurrency levels are sorted, must be unique and nonzero, and are conservatively capped at 256. A normal `--concurrency N` single run remains supported.
+
 ## Result and verification
 
-The JSON output is schema version 1 and records scenario inputs, environment facts that can be detected, raw per-instance `/metrics` snapshots, classifications, latency samples summarized as min/max/mean/p50/p95/p99, throughput, operator-supplied pool/telemetry assumptions, limitations, and an overall validity flag. Raw results are ignored by default.
+The version-2 JSON output has one complete raw result per concurrency level plus a compact factual matrix summary (highest valid tested level and adjacent throughput changes). Every level records scenario/seed, operation counts, latency, throughput, classifications, metrics snapshots, SQL verification, validity, environment and limitations. Interpret `valid: true` as the workload and SQL checks passing in that environment; do not treat it as a capacity or production-performance guarantee. Raw results are ignored by default.
 
-The smoke workload creates independent USD account pairs over real `POST /accounts` and `POST /transfers` HTTP calls, reusing async HTTP connections and round-robining configured URLs. Every measured transfer has a unique idempotency key. SQL validation checks committed measured transfers, duplicate effects, two entries per transfer, expected 9.00/11.00 balances, non-negative balances, and pair conservation. Any unexpected HTTP response, transport/timeout, parse, or database-validation failure marks the run invalid. `/metrics` collection failures are reported in the output separately from workload failures.
+All workloads use real `POST /accounts` and `POST /transfers` calls, reusable async connections, and deterministic plans. SQL validation checks scenario-specific transfer/entry counts, balances, conservation and replay side effects; unexpected HTTP, transport, parse, or database-validation failures mark the affected level invalid. `/metrics` collection failures are reported separately from workload failures.
 
 For normal checks (which do not run a load test):
 

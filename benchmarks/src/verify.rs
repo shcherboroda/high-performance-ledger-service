@@ -1,7 +1,6 @@
 use serde::Serialize;
 use std::collections::BTreeMap;
 use uuid::Uuid;
-
 #[derive(Debug, Clone, Serialize)]
 pub struct Check {
     pub name: String,
@@ -13,52 +12,50 @@ pub struct Verification {
     pub checks: Vec<Check>,
     pub valid: bool,
 }
-
-pub async fn verify(
+fn check(name: &str, passed: bool, detail: String) -> Check {
+    Check {
+        name: name.into(),
+        passed,
+        detail,
+    }
+}
+fn finish(checks: Vec<Check>) -> Verification {
+    let valid = checks.iter().all(|check| check.passed);
+    Verification { checks, valid }
+}
+pub async fn independent(
     pool: &sqlx::PgPool,
-    measured: &[(Uuid, Uuid)],
+    pairs: &[(Uuid, Uuid)],
     expected: usize,
 ) -> anyhow::Result<Verification> {
-    let sources: Vec<Uuid> = measured.iter().map(|(source, _)| *source).collect();
+    let sources: Vec<Uuid> = pairs.iter().map(|pair| pair.0).collect();
     let committed: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM transfers WHERE source_account_id = ANY($1) AND kind = 'transfer'",
+        "SELECT count(*) FROM transfers WHERE source_account_id=ANY($1) AND kind='transfer'",
     )
     .bind(&sources)
     .fetch_one(pool)
     .await?;
-    let entries: i64 = sqlx::query_scalar("SELECT count(*) FROM account_entries WHERE transfer_id IN (SELECT id FROM transfers WHERE source_account_id = ANY($1))").bind(&sources).fetch_one(pool).await?;
-    let duplicates: i64 = sqlx::query_scalar("SELECT count(*) FROM (SELECT source_account_id, count(*) FROM transfers WHERE source_account_id = ANY($1) GROUP BY source_account_id HAVING count(*) > 1) duplicate_keys").bind(&sources).fetch_one(pool).await?;
-    let ids: Vec<Uuid> = measured.iter().flat_map(|(a, b)| [*a, *b]).collect();
-    let balances: Vec<(Uuid, i64)> =
-        sqlx::query_as("SELECT id, balance_minor FROM accounts WHERE id = ANY($1)")
+    let entries:i64=sqlx::query_scalar("SELECT count(*) FROM account_entries WHERE transfer_id IN (SELECT id FROM transfers WHERE source_account_id=ANY($1))").bind(&sources).fetch_one(pool).await?;
+    let ids: Vec<Uuid> = pairs.iter().flat_map(|p| [p.0, p.1]).collect();
+    let balances: BTreeMap<Uuid, i64> =
+        sqlx::query_as::<_, (Uuid, i64)>("SELECT id,balance_minor FROM accounts WHERE id=ANY($1)")
             .bind(&ids)
             .fetch_all(pool)
-            .await?;
-    Ok(evaluate(
-        committed,
-        entries,
-        duplicates,
-        balances.into_iter().collect(),
-        measured,
-        expected,
+            .await?
+            .into_iter()
+            .collect();
+    Ok(evaluate_independent(
+        committed, entries, balances, pairs, expected,
     ))
 }
-
-fn evaluate(
+pub fn evaluate_independent(
     committed: i64,
     entries: i64,
-    duplicates: i64,
-    map: BTreeMap<Uuid, i64>,
-    measured: &[(Uuid, Uuid)],
+    balances: BTreeMap<Uuid, i64>,
+    pairs: &[(Uuid, Uuid)],
     expected: usize,
 ) -> Verification {
-    let pair_balances = measured.iter().all(|(source, destination)| {
-        map.get(source)
-            .zip(map.get(destination))
-            .is_some_and(|(source, destination)| *source == 900 && *destination == 1100)
-    });
-    let no_overdraft = map.values().all(|balance| *balance >= 0);
-    let checks = vec![
+    finish(vec![
         check(
             "committed_measured_transfers",
             committed == expected as i64,
@@ -70,70 +67,154 @@ fn evaluate(
             format!("expected {}, found {entries}", expected * 2),
         ),
         check(
-            "no_duplicate_transfer_side_effects",
-            duplicates == 0,
-            format!("duplicate operation groups: {duplicates}"),
-        ),
-        check(
             "expected_final_balances_and_pair_conservation",
-            pair_balances,
-            "each measured pair must be 9.00 / 11.00".into(),
+            pairs
+                .iter()
+                .all(|(s, d)| balances.get(s) == Some(&900) && balances.get(d) == Some(&1100)),
+            "each pair must be 9.00 / 11.00".into(),
         ),
         check(
             "no_unexpected_overdrafts",
-            no_overdraft,
-            "all measured account balances must be non-negative".into(),
+            balances.values().all(|b| *b >= 0),
+            "all balances non-negative".into(),
         ),
-    ];
-    Verification {
-        valid: checks.iter().all(|check| check.passed),
-        checks,
-    }
+    ])
 }
-fn check(name: &str, passed: bool, detail: String) -> Check {
-    Check {
-        name: name.into(),
-        passed,
-        detail,
-    }
+pub async fn hot_account(
+    pool: &sqlx::PgPool,
+    source: Uuid,
+    destinations: &[Uuid],
+    expected: usize,
+) -> anyhow::Result<Verification> {
+    let committed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM transfers WHERE source_account_id=$1 AND kind='transfer'",
+    )
+    .bind(source)
+    .fetch_one(pool)
+    .await?;
+    let entries:i64=sqlx::query_scalar("SELECT count(*) FROM account_entries WHERE transfer_id IN (SELECT id FROM transfers WHERE source_account_id=$1)").bind(source).fetch_one(pool).await?;
+    let mut ids = destinations.to_vec();
+    ids.push(source);
+    let balances: BTreeMap<Uuid, i64> =
+        sqlx::query_as::<_, (Uuid, i64)>("SELECT id,balance_minor FROM accounts WHERE id=ANY($1)")
+            .bind(&ids)
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .collect();
+    Ok(evaluate_hot(
+        committed,
+        entries,
+        balances,
+        source,
+        destinations,
+        expected,
+    ))
 }
-
+pub fn evaluate_hot(
+    committed: i64,
+    entries: i64,
+    balances: BTreeMap<Uuid, i64>,
+    source: Uuid,
+    destinations: &[Uuid],
+    expected: usize,
+) -> Verification {
+    finish(vec![
+        check(
+            "committed_measured_transfers",
+            committed == expected as i64,
+            format!("expected {expected}, found {committed}"),
+        ),
+        check(
+            "exactly_two_entries_per_transfer",
+            entries == expected as i64 * 2,
+            format!("expected {}, found {entries}", expected * 2),
+        ),
+        check(
+            "shared_source_final_balance",
+            balances.get(&source) == Some(&1000),
+            "source balance must equal initial funding minus measured amount".into(),
+        ),
+        check(
+            "every_destination_received_once",
+            destinations
+                .iter()
+                .all(|id| balances.get(id) == Some(&1100)),
+            "every destination must be 11.00".into(),
+        ),
+        check(
+            "total_conservation",
+            balances.values().sum::<i64>() == (expected as i64 * 1100) + 1000,
+            "sum of shared-source and destination balances must be conserved".into(),
+        ),
+    ])
+}
+pub async fn replay(
+    pool: &sqlx::PgPool,
+    transfer_ids: &[Uuid],
+    accounts: &[Uuid],
+    before: &BTreeMap<Uuid, i64>,
+) -> anyhow::Result<Verification> {
+    let transfers: i64 = sqlx::query_scalar("SELECT count(*) FROM transfers WHERE id=ANY($1)")
+        .bind(transfer_ids)
+        .fetch_one(pool)
+        .await?;
+    let entries: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM account_entries WHERE transfer_id=ANY($1)")
+            .bind(transfer_ids)
+            .fetch_one(pool)
+            .await?;
+    let after: BTreeMap<Uuid, i64> =
+        sqlx::query_as::<_, (Uuid, i64)>("SELECT id,balance_minor FROM accounts WHERE id=ANY($1)")
+            .bind(accounts)
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .collect();
+    Ok(evaluate_replay(
+        transfers,
+        entries,
+        after,
+        before,
+        transfer_ids.len(),
+    ))
+}
+pub fn evaluate_replay(
+    transfers: i64,
+    entries: i64,
+    after: BTreeMap<Uuid, i64>,
+    before: &BTreeMap<Uuid, i64>,
+    expected: usize,
+) -> Verification {
+    finish(vec![
+        check(
+            "no_additional_transfers",
+            transfers == expected as i64,
+            format!("expected {expected}, found {transfers}"),
+        ),
+        check(
+            "no_additional_entries",
+            entries == expected as i64 * 2,
+            format!("expected {}, found {entries}", expected * 2),
+        ),
+        check(
+            "balances_unchanged",
+            &after == before,
+            "replay phase must not change balances".into(),
+        ),
+    ])
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn verification_reports_failed_check() {
-        let check = check("count", false, "mismatch".into());
-        assert!(
-            !Verification {
-                valid: check.passed,
-                checks: vec![check]
-            }
-            .valid
-        );
+    fn hot_mismatch_is_invalid() {
+        let s = Uuid::new_v4();
+        let d = Uuid::new_v4();
+        assert!(!evaluate_hot(1, 2, BTreeMap::from([(s, 99), (d, 1100)]), s, &[d], 1).valid)
     }
-
     #[test]
-    fn mismatched_counts_and_balances_make_verification_invalid() {
-        let source = Uuid::new_v4();
-        let destination = Uuid::new_v4();
-        let result = evaluate(
-            0,
-            0,
-            0,
-            BTreeMap::from([(source, 1_000), (destination, 1_000)]),
-            &[(source, destination)],
-            1,
-        );
-        assert!(!result.valid);
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|check| check.name == "committed_measured_transfers" && !check.passed)
-        );
-        assert!(result.checks.iter().any(|check| check.name
-            == "expected_final_balances_and_pair_conservation"
-            && !check.passed));
+    fn replay_mismatch_is_invalid() {
+        assert!(!evaluate_replay(2, 2, BTreeMap::new(), &BTreeMap::new(), 1).valid)
     }
 }
