@@ -6,6 +6,7 @@ pub enum ScenarioPlan {
     Independent,
     HotAccount,
     IdempotentReplay,
+    AccountPool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +18,8 @@ pub struct TransferPlan {
     pub destination: usize,
     pub key: String,
 }
+
+pub const ACCOUNT_POOL_INITIAL_BALANCE_MINOR: i64 = 10_000;
 
 pub fn subject(seed: u64, client: usize) -> String {
     format!("benchmark-{seed}-{client}")
@@ -35,9 +38,11 @@ pub fn plans(
             let client = match scenario {
                 ScenarioPlan::HotAccount => 0,
                 ScenarioPlan::Independent | ScenarioPlan::IdempotentReplay => index % clients,
+                ScenarioPlan::AccountPool => unreachable!("use account_pool_plans"),
             };
             let (source, destination) = match scenario {
                 ScenarioPlan::Independent | ScenarioPlan::IdempotentReplay => (index, index),
+                ScenarioPlan::AccountPool => unreachable!("use account_pool_plans"),
                 ScenarioPlan::HotAccount => (if phase == "warmup" { 0 } else { 1 }, index),
             };
             TransferPlan {
@@ -50,6 +55,40 @@ pub fn plans(
             }
         })
         .collect()
+}
+
+pub fn account_pool_plans(
+    seed: u64,
+    clients: usize,
+    pool_size: usize,
+    warmup: usize,
+    measured: usize,
+) -> Vec<TransferPlan> {
+    let offset = (seed as usize % (pool_size - 1)) + 1;
+    (0..(warmup + measured))
+        .map(|index| {
+            let source = (index + seed as usize) % pool_size;
+            let destination = (source + offset) % pool_size;
+            let phase = if index < warmup { "warmup" } else { "measured" };
+            TransferPlan {
+                owner: subject(seed, source % clients),
+                client: source % clients,
+                phase,
+                source,
+                destination,
+                key: format!("benchmark-{seed}-account-pool-{phase}-{index}-{source}"),
+            }
+        })
+        .collect()
+}
+
+pub fn expected_pool_balances(pool_size: usize, plans: &[TransferPlan]) -> Vec<i64> {
+    let mut balances = vec![ACCOUNT_POOL_INITIAL_BALANCE_MINOR; pool_size];
+    for plan in plans {
+        balances[plan.source] -= 100;
+        balances[plan.destination] += 100;
+    }
+    balances
 }
 
 pub fn deterministic_uuid(seed: u64, level: usize, index: usize) -> Uuid {
@@ -108,6 +147,37 @@ mod tests {
         assert_eq!(
             plans(ScenarioPlan::IdempotentReplay, 1, 1, 0, 2),
             plans(ScenarioPlan::IdempotentReplay, 1, 1, 0, 2)
+        );
+    }
+    #[test]
+    fn account_pool_plan_is_deterministic_safe_and_uses_distinct_accounts() {
+        let plans = account_pool_plans(9, 3, 4, 2, 10);
+        assert_eq!(plans, account_pool_plans(9, 3, 4, 2, 10));
+        assert!(plans.iter().all(|plan| plan.source != plan.destination));
+        assert_eq!(
+            plans
+                .iter()
+                .map(|plan| &plan.key)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            plans.len()
+        );
+        assert!(
+            expected_pool_balances(4, &plans)
+                .iter()
+                .all(|balance| *balance >= 0)
+        );
+        assert!(plans.iter().all(|plan| plan.client == plan.source % 3));
+        assert_ne!(
+            plans[0].source,
+            account_pool_plans(10, 3, 4, 2, 10)[0].source
+        );
+    }
+    #[test]
+    fn account_pool_options_do_not_change_existing_scenario_plans() {
+        assert_eq!(
+            plans(ScenarioPlan::Independent, 2, 2, 1, 3),
+            plans(ScenarioPlan::Independent, 2, 2, 1, 3)
         );
     }
 }

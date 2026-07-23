@@ -29,6 +29,7 @@ DATABASE_URL=postgres://.../ledger_benchmark JWT_ISSUER=benchmark-issuer JWT_AUD
 - `independent`: every operation has its own funded source/destination pair; all requests must succeed.
 - `hot-account`: requests share a funded source and have independent destinations; this exercises source-account serialization without retries.
 - `idempotent-replay`: successful original transfers are prepared before measurement; measured traffic replays the same client/key/fingerprint and must add no records or balance changes.
+- `account-pool`: creates a reusable, bounded pool of funded USD accounts, then executes a larger stream of successful $1.00 transfers across that pool.
 
 For hot-account runs the shared source is funded for every warm-up and measured transfer. Replay preparation, JWTs, setup, snapshots, verification, and reporting are outside the measured interval. Warm-up traffic is excluded from all measurements and correctness counts.
 
@@ -63,6 +64,36 @@ cargo run -p ledger-benchmarks --release -- \
 
 Concurrency levels are sorted, must be unique and nonzero, and are conservatively capped at 256. A normal `--concurrency N` single run remains supported.
 
+## Account-pool workload
+
+`account-pool` is for sustained same-currency transfer traffic over pre-created accounts; it is not a production capacity test. `--account-pool-size` defaults to 1000, has effect only for this scenario, and has a conservative local maximum of 10,000 accounts. `--operations` stays independent and can be larger than the pool size.
+
+Every account starts with $100.00 and has a deterministic owner selected from the bounded logical-client set. The plan uses a seed-derived ring offset. Each phase has at most one outgoing and one incoming transfer per account, then phases execute sequentially. Therefore concurrent requests inside a phase cannot overdraft an account; phase coordination is outside individual HTTP latency samples but inside the measured wall-clock interval. Account creation, plan generation, and warm-up remain outside the interval.
+
+Small smoke command:
+
+```bash
+BENCHMARK_ALLOW_DESTRUCTIVE=1 BENCHMARK_DATABASE_URL=postgres://.../ledger_benchmark \
+SERVICE_URLS=http://127.0.0.1:3000 BENCHMARK_JWT_ISSUER=benchmark-issuer \
+BENCHMARK_JWT_AUDIENCE=ledger BENCHMARK_JWT_PRIVATE_KEY=/tmp/ledger-benchmark-private.pem \
+cargo run -p ledger-benchmarks --release -- \
+  --scenario account-pool --account-pool-size 10 --operations 30 --warmup-operations 4 \
+  --logical-clients 2 --concurrency 2 --output benchmark-results/account-pool-smoke.json
+```
+
+Bounded larger local example (expect setup to spend time issuing 1,000 authenticated account requests before measurement):
+
+```bash
+BENCHMARK_ALLOW_DESTRUCTIVE=1 BENCHMARK_DATABASE_URL=postgres://.../ledger_benchmark \
+SERVICE_URLS=http://127.0.0.1:3000 BENCHMARK_JWT_ISSUER=benchmark-issuer \
+BENCHMARK_JWT_AUDIENCE=ledger BENCHMARK_JWT_PRIVATE_KEY=/tmp/ledger-benchmark-private.pem \
+cargo run -p ledger-benchmarks --release -- \
+  --scenario account-pool --account-pool-size 1000 --operations 10000 --warmup-operations 100 \
+  --logical-clients 8 --concurrency 32 --output benchmark-results/account-pool-local.json
+```
+
+The result records pool size, phase count/model, operation counts, raw throughput and latency, and verification over every pool account. A valid result means this exact environment completed the plan with matching transfer, entry, idempotency, balance, non-negative, and conservation checks. It does not establish a maximum account count, throughput, SLA, or production guarantee.
+
 ## Local topology comparison
 
 `run-topology.sh` starts release service processes directly: each has a distinct loopback port and process-local `/metrics`, while all use exactly the same `BENCHMARK_DATABASE_URL`. It accepts `1`, `2`, or `matrix`; `matrix` starts two processes and runs the versioned `1,2` comparison in one benchmark invocation. The harness records every `/ready` outcome before traffic, skips an unready topology, writes it as invalid, and stops every process on success, failure, or interruption. It does not add a proxy or load balancer.
@@ -84,13 +115,13 @@ BENCHMARK_SCENARIO=hot-account ./benchmarks/run-topology.sh 2 \
   --operations 10 --warmup-operations 2 --concurrency 2
 ```
 
-The ignored `benchmark-results/topology-matrix.json` is schema version 3 and contains both topology levels; `topology-1.json` and `topology-2.json` remain available for a focused single topology. Each result records the configured URLs, readiness outcome, per-instance metrics before/after, exact measured request count per URL, request failures, SQL verification, and validity. The matrix summary has one factual throughput ratio for each matching concurrency level. URLs are deterministically assigned round-robin by operation index, so every URL must receive measured traffic when operations cover the instance count. A readiness, metrics, transport, timeout, parse, unexpected-HTTP, SQL, or distribution failure makes the topology invalid; no failed instance is removed from a run.
+The ignored `benchmark-results/topology-matrix.json` is schema version 4 and contains both topology levels; `topology-1.json` and `topology-2.json` remain available for a focused single topology. Each result records the configured URLs, readiness outcome, per-instance metrics before/after, exact measured request count per URL, request failures, SQL verification, and validity. The matrix summary has one factual throughput ratio for each matching concurrency level. URLs are deterministically assigned round-robin by operation index, so every URL must receive measured traffic when operations cover the instance count. A readiness, metrics, transport, timeout, parse, unexpected-HTTP, SQL, or distribution failure makes the topology invalid; no failed instance is removed from a run.
 
 To compare the raw documents, retain the same seed, operation/warm-up counts, and concurrency. Any throughput ratio or latency difference is an environment-specific observation only, not evidence of linear scaling, maximum capacity, or a production guarantee. Logs are local under `benchmark-results/`; inspect them after a failed readiness check. The trap cleans processes, and leftover release processes can be stopped with their recorded PIDs if the shell itself is forcibly killed.
 
 ## Result and verification
 
-The version-3 JSON output has one complete raw result per requested topology and concurrency level, plus compact factual summaries. Every level records scenario/seed, operation counts, latency, throughput, classifications, per-instance request counts, metrics snapshots, SQL verification, validity, environment and limitations. Interpret `valid: true` as the workload and SQL checks passing in that environment; do not treat it as a capacity or production-performance guarantee. Raw results are ignored by default.
+The version-4 JSON output has one complete raw result per requested topology and concurrency level, plus compact factual summaries. Every level records scenario/seed, operation counts, latency, throughput, classifications, per-instance request counts, metrics snapshots, SQL verification, validity, environment and limitations. Account-pool levels additionally record pool and phase metadata. Interpret `valid: true` as the workload and SQL checks passing in that environment; do not treat it as a capacity or production-performance guarantee. Raw results are ignored by default.
 
 All workloads use real `POST /accounts` and `POST /transfers` calls, reusable async connections, and deterministic plans. SQL validation checks scenario-specific transfer/entry counts, balances, conservation and replay side effects; unexpected HTTP, transport, parse, or database-validation failures mark the affected level invalid. `/metrics` collection failures are reported separately from workload failures.
 

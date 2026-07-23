@@ -20,6 +20,14 @@ pub struct ReplaySnapshot {
     pub balances: BTreeMap<Uuid, i64>,
     pub idempotency_records: i64,
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountPoolSnapshot {
+    pub transfers: i64,
+    pub entries: i64,
+    pub idempotency_records: i64,
+    pub duplicate_side_effects: i64,
+    pub balances: BTreeMap<Uuid, i64>,
+}
 fn check(name: &str, passed: bool, detail: String) -> Check {
     Check {
         name: name.into(),
@@ -232,6 +240,99 @@ pub fn evaluate_replay(
         ),
     ])
 }
+
+pub async fn account_pool(
+    pool: &sqlx::PgPool,
+    account_ids: &[Uuid],
+    expected_balances: &[i64],
+    measured_keys: &[String],
+    expected_transfers: usize,
+) -> anyhow::Result<Verification> {
+    let balances = balances(pool, account_ids).await?;
+    let transfers: i64 = sqlx::query_scalar("SELECT count(*) FROM transfers WHERE id IN (SELECT resulting_resource_id FROM idempotency_records WHERE operation_type='transfer' AND idempotency_key=ANY($1))").bind(measured_keys).fetch_one(pool).await?;
+    let entries: i64 = sqlx::query_scalar("SELECT count(*) FROM account_entries WHERE transfer_id IN (SELECT resulting_resource_id FROM idempotency_records WHERE operation_type='transfer' AND idempotency_key=ANY($1))").bind(measured_keys).fetch_one(pool).await?;
+    let records: i64 = sqlx::query_scalar("SELECT count(*) FROM idempotency_records WHERE operation_type='transfer' AND idempotency_key=ANY($1)").bind(measured_keys).fetch_one(pool).await?;
+    let duplicate_side_effects: i64 = sqlx::query_scalar("SELECT count(*) FROM (SELECT resulting_resource_id FROM idempotency_records WHERE operation_type='transfer' AND idempotency_key=ANY($1) GROUP BY resulting_resource_id HAVING count(*) > 1) duplicates").bind(measured_keys).fetch_one(pool).await?;
+    Ok(evaluate_account_pool(
+        AccountPoolSnapshot {
+            transfers,
+            entries,
+            idempotency_records: records,
+            duplicate_side_effects,
+            balances,
+        },
+        account_ids,
+        expected_balances,
+        expected_transfers,
+    ))
+}
+
+pub fn evaluate_account_pool(
+    snapshot: AccountPoolSnapshot,
+    account_ids: &[Uuid],
+    expected_balances: &[i64],
+    expected: usize,
+) -> Verification {
+    let actual = account_ids
+        .iter()
+        .map(|id| snapshot.balances.get(id).copied())
+        .collect::<Vec<_>>();
+    finish(vec![
+        check(
+            "committed_measured_transfers",
+            snapshot.transfers == expected as i64,
+            format!("expected {expected}, found {}", snapshot.transfers),
+        ),
+        check(
+            "exactly_two_entries_per_transfer",
+            snapshot.entries == expected as i64 * 2,
+            format!("expected {}, found {}", expected * 2, snapshot.entries),
+        ),
+        check(
+            "one_idempotency_record_per_planned_key",
+            snapshot.idempotency_records == expected as i64,
+            format!(
+                "expected {expected}, found {}",
+                snapshot.idempotency_records
+            ),
+        ),
+        check(
+            "no_duplicate_transfer_side_effects",
+            snapshot.duplicate_side_effects == 0,
+            format!(
+                "duplicate transfer side-effect groups: {}",
+                snapshot.duplicate_side_effects
+            ),
+        ),
+        check(
+            "entire_account_pool_exists",
+            snapshot.balances.len() == account_ids.len(),
+            format!(
+                "expected {}, found {}",
+                account_ids.len(),
+                snapshot.balances.len()
+            ),
+        ),
+        check(
+            "expected_final_balances",
+            actual
+                .iter()
+                .zip(expected_balances)
+                .all(|(actual, expected)| *actual == Some(*expected)),
+            "every pool balance must match deterministic simulation".into(),
+        ),
+        check(
+            "no_unexpected_overdrafts",
+            snapshot.balances.values().all(|balance| *balance >= 0),
+            "all balances non-negative".into(),
+        ),
+        check(
+            "total_conservation",
+            snapshot.balances.values().sum::<i64>() == expected_balances.iter().sum::<i64>(),
+            "pool total must be conserved".into(),
+        ),
+    ])
+}
 async fn transfer_count(pool: &sqlx::PgPool, sources: &[Uuid]) -> anyhow::Result<i64> {
     Ok(sqlx::query_scalar(
         "SELECT count(*) FROM transfers WHERE source_account_id=ANY($1) AND kind='transfer'",
@@ -263,6 +364,21 @@ mod tests {
             entries,
             balances: BTreeMap::from([(Uuid::nil(), balance)]),
             idempotency_records: records,
+        }
+    }
+    fn pool_snapshot(
+        transfers: i64,
+        entries: i64,
+        records: i64,
+        duplicates: i64,
+        balances: BTreeMap<Uuid, i64>,
+    ) -> AccountPoolSnapshot {
+        AccountPoolSnapshot {
+            transfers,
+            entries,
+            idempotency_records: records,
+            duplicate_side_effects: duplicates,
+            balances,
         }
     }
     #[test]
@@ -299,5 +415,108 @@ mod tests {
             assert!(!evaluate_replay(&before, &after, 1, true).valid)
         }
         assert!(!evaluate_replay(&before, &before, 1, false).valid)
+    }
+    #[test]
+    fn account_pool_rejects_missing_balances_counts_and_conservation_failures() {
+        let ids = [Uuid::nil(), Uuid::max()];
+        let valid = || {
+            evaluate_account_pool(
+                pool_snapshot(
+                    2,
+                    4,
+                    2,
+                    0,
+                    BTreeMap::from([(ids[0], 10_000), (ids[1], 10_000)]),
+                ),
+                &ids,
+                &[10_000, 10_000],
+                2,
+            )
+        };
+        assert!(valid().valid);
+        assert!(
+            !evaluate_account_pool(
+                pool_snapshot(
+                    1,
+                    4,
+                    2,
+                    0,
+                    BTreeMap::from([(ids[0], 10_000), (ids[1], 10_000)])
+                ),
+                &ids,
+                &[10_000, 10_000],
+                2
+            )
+            .valid
+        );
+        assert!(
+            !evaluate_account_pool(
+                pool_snapshot(
+                    2,
+                    4,
+                    2,
+                    1,
+                    BTreeMap::from([(ids[0], 10_000), (ids[1], 10_000)])
+                ),
+                &ids,
+                &[10_000, 10_000],
+                2
+            )
+            .valid
+        );
+        assert!(
+            !evaluate_account_pool(
+                pool_snapshot(
+                    2,
+                    3,
+                    2,
+                    0,
+                    BTreeMap::from([(ids[0], 10_000), (ids[1], 10_000)])
+                ),
+                &ids,
+                &[10_000, 10_000],
+                2
+            )
+            .valid
+        );
+        assert!(
+            !evaluate_account_pool(
+                pool_snapshot(
+                    2,
+                    4,
+                    1,
+                    0,
+                    BTreeMap::from([(ids[0], 10_000), (ids[1], 10_000)])
+                ),
+                &ids,
+                &[10_000, 10_000],
+                2
+            )
+            .valid
+        );
+        assert!(
+            !evaluate_account_pool(
+                pool_snapshot(2, 4, 2, 0, BTreeMap::from([(ids[0], -1)])),
+                &ids,
+                &[10_000, 10_000],
+                2
+            )
+            .valid
+        );
+        assert!(
+            !evaluate_account_pool(
+                pool_snapshot(
+                    2,
+                    4,
+                    2,
+                    0,
+                    BTreeMap::from([(ids[0], 10_001), (ids[1], 10_000)])
+                ),
+                &ids,
+                &[10_000, 10_000],
+                2
+            )
+            .valid
+        );
     }
 }

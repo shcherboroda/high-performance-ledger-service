@@ -5,11 +5,13 @@ use url::Url;
 
 pub const MAX_CONCURRENCY: usize = 256;
 pub const MAX_INSTANCES: usize = 16;
+pub const MAX_ACCOUNT_POOL_SIZE: usize = 10_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Scenario {
     Independent,
     HotAccount,
     IdempotentReplay,
+    AccountPool,
 }
 impl Scenario {
     pub fn name(self) -> &'static str {
@@ -17,6 +19,7 @@ impl Scenario {
             Self::Independent => "independent",
             Self::HotAccount => "hot-account",
             Self::IdempotentReplay => "idempotent-replay",
+            Self::AccountPool => "account-pool",
         }
     }
 }
@@ -40,6 +43,8 @@ pub struct Config {
     pub concurrency_levels: Vec<usize>,
     #[arg(long, env = "BENCHMARK_OPERATIONS", default_value_t = 20)]
     pub operations: usize,
+    #[arg(long, env = "BENCHMARK_ACCOUNT_POOL_SIZE", default_value_t = 1000)]
+    pub account_pool_size: usize,
     #[arg(long, env = "BENCHMARK_WARMUP_OPERATIONS", default_value_t = 4)]
     pub warmup_operations: usize,
     #[arg(long, env = "BENCHMARK_SEED", default_value_t = 1)]
@@ -124,6 +129,11 @@ impl Config {
                 "logical clients, operations, and concurrency (maximum {MAX_CONCURRENCY}) must be greater than zero"
             )
         }
+        if self.scenario == Scenario::AccountPool
+            && !(2..=MAX_ACCOUNT_POOL_SIZE).contains(&self.account_pool_size)
+        {
+            bail!("account pool size must be between 2 and {MAX_ACCOUNT_POOL_SIZE}")
+        }
         parse_concurrency_levels(&self.concurrency_levels)?;
         if self.request_timeout_secs == 0 || self.jwt_lifetime_secs == 0 {
             bail!("request timeout and JWT lifetime must be greater than zero")
@@ -205,6 +215,7 @@ mod tests {
             concurrency: 1,
             concurrency_levels: vec![],
             operations: 1,
+            account_pool_size: 2,
             warmup_operations: 0,
             seed: 1,
             request_timeout_secs: 1,
@@ -276,6 +287,20 @@ mod tests {
             ])
             .is_err()
         );
+    }
+    #[test]
+    fn account_pool_size_is_bounded_only_for_the_account_pool_scenario() {
+        let mut config = valid();
+        config.scenario = Scenario::AccountPool;
+        config.account_pool_size = 1;
+        assert!(config.validate().is_err());
+        config.account_pool_size = MAX_ACCOUNT_POOL_SIZE + 1;
+        assert!(config.validate().is_err());
+        config.account_pool_size = 2;
+        assert!(config.validate().is_ok());
+        config.scenario = Scenario::Independent;
+        config.account_pool_size = 1;
+        assert!(config.validate().is_ok());
     }
     #[test]
     fn database_guard_fails_closed() {
