@@ -259,18 +259,14 @@ pub(crate) async fn create_transfer(
         },
         transaction_started,
     );
+    let result = async {
     let source_scale = u8::try_from(preliminary.1).map_err(AppError::internal)?;
-    let amount_minor = parse_minor_units(&request.amount, source_scale).map_err(|error| {
-        let error = transfer_money_error(error);
-        observation.reject(&error);
-        error
-    })?;
+    let amount_minor = parse_minor_units(&request.amount, source_scale).map_err(transfer_money_error)?;
     if amount_minor <= 0 {
         let error = AppError::validation(
             "non_positive_amount",
             "The amount must be greater than zero",
         );
-        observation.reject(&error);
         return Err(error);
     }
     let fingerprint = idempotency::transfer_fingerprint(
@@ -293,9 +289,7 @@ pub(crate) async fn create_transfer(
             return Err(AppError::idempotency_conflict());
         }
         observation.idempotency(IdempotencyOutcome::Replay);
-        transaction.commit().await.map_err(AppError::internal)?;
         let status = StatusCode::from_u16(http_status as u16).map_err(AppError::internal)?;
-        observation.complete(TerminalOutcome::Success, FinancialReason::None);
         return Ok((status, Json(response_body)).into_response());
     }
     match idempotency::reserve(
@@ -314,9 +308,7 @@ pub(crate) async fn create_transfer(
             response_body,
         } => {
             observation.idempotency(IdempotencyOutcome::Replay);
-            transaction.commit().await.map_err(AppError::internal)?;
             let status = StatusCode::from_u16(http_status as u16).map_err(AppError::internal)?;
-            observation.complete(TerminalOutcome::Success, FinancialReason::None);
             return Ok((status, Json(response_body)).into_response());
         }
         Reservation::Conflict => {
@@ -337,11 +329,7 @@ pub(crate) async fn create_transfer(
             operation_time,
         )
         .await
-        .map_err(|error| {
-            let error = transfer_configuration_error(error);
-            observation.reject(&error);
-            error
-        })?;
+        .map_err(transfer_configuration_error)?;
         let fee = select_fee_rule(
             &mut transaction,
             &preliminary.0,
@@ -349,11 +337,7 @@ pub(crate) async fn create_transfer(
             operation_time,
         )
         .await
-        .map_err(|error| {
-            let error = transfer_configuration_error(error);
-            observation.reject(&error);
-            error
-        })?;
+        .map_err(transfer_configuration_error)?;
         Some((rate, fee))
     } else {
         None
@@ -368,7 +352,6 @@ pub(crate) async fn create_transfer(
     .map_err(AppError::internal)?;
     if accounts.len() != 2 {
         let error = AppError::account_unavailable();
-        observation.reject(&error);
         return Err(error);
     }
     let locked = accounts
@@ -394,7 +377,6 @@ pub(crate) async fn create_transfer(
         .expect("both locked accounts returned");
     if source.owner_id != client_id || source.status != "active" || destination.status != "active" {
         let error = AppError::account_unavailable();
-        observation.reject(&error);
         return Err(error);
     }
     if (
@@ -431,27 +413,15 @@ pub(crate) async fn create_transfer(
             None,
         ),
         Some((rate, fee)) => {
-            let fee_calculation = calculate_fee(amount_minor, fee.fee_bps).map_err(|error| {
-                let error = transfer_arithmetic_error(error);
-                observation.reject(&error);
-                error
-            })?;
-            let exact_rate = ExactRate::parse(&rate.rate).map_err(|error| {
-                let error = transfer_arithmetic_error(error);
-                observation.reject(&error);
-                error
-            })?;
+            let fee_calculation = calculate_fee(amount_minor, fee.fee_bps).map_err(transfer_arithmetic_error)?;
+            let exact_rate = ExactRate::parse(&rate.rate).map_err(transfer_arithmetic_error)?;
             let destination_amount = calculate_destination(
                 amount_minor,
                 source.scale as u8,
                 destination.scale as u8,
                 &exact_rate,
             )
-            .map_err(|error| {
-                let error = transfer_arithmetic_error(error);
-                observation.reject(&error);
-                error
-            })?;
+            .map_err(transfer_arithmetic_error)?;
             (
                 TransferKind::FxTransfer,
                 destination_amount,
@@ -468,7 +438,6 @@ pub(crate) async fn create_transfer(
             "insufficient_funds",
             "The source account has insufficient funds",
         );
-        observation.reject(&error);
         return Err(error);
     }
     let source_balance = source
@@ -567,9 +536,27 @@ pub(crate) async fn create_transfer(
     )
     .await
     .map_err(AppError::internal)?;
-    transaction.commit().await.map_err(AppError::internal)?;
-    observation.complete(TerminalOutcome::Success, FinancialReason::None);
     Ok((StatusCode::CREATED, Json(response_body)).into_response())
+    }
+    .await;
+    match result {
+        Ok(response) => match transaction.commit().await {
+            Ok(()) => {
+                observation.complete(TerminalOutcome::Success, FinancialReason::None);
+                Ok(response)
+            }
+            Err(error) => {
+                let error = AppError::internal(error);
+                observation.reject(&error);
+                Err(error)
+            }
+        },
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            observation.reject(&error);
+            Err(error)
+        }
+    }
 }
 fn transfer_money_error(error: MoneyError) -> AppError {
     match error {

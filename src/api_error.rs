@@ -77,36 +77,23 @@ impl AppError {
             ),
             Self::IdempotencyConflict => (
                 TerminalOutcome::Rejected,
-                FinancialReason::Code("idempotency_conflict"),
+                FinancialReason::IdempotencyConflict,
             ),
             Self::AccountUnavailable => (
                 TerminalOutcome::Rejected,
-                FinancialReason::Code("account_unavailable"),
+                FinancialReason::AccountUnavailable,
             ),
-            Self::Business { code, .. } | Self::Validation { code, .. } => (
-                TerminalOutcome::Rejected,
-                FinancialReason::Code(financial_reason(code)),
-            ),
-            Self::NotFound => (
-                TerminalOutcome::Rejected,
-                FinancialReason::Code("not_found"),
-            ),
-            Self::BadRequest { .. } => (
-                TerminalOutcome::Rejected,
-                FinancialReason::Code("bad_request"),
-            ),
-            Self::Unauthorized => (
-                TerminalOutcome::Rejected,
-                FinancialReason::Code("unauthorized"),
-            ),
-            Self::Forbidden => (
-                TerminalOutcome::Rejected,
-                FinancialReason::Code("forbidden"),
-            ),
-            Self::Conflict => (TerminalOutcome::Rejected, FinancialReason::Code("conflict")),
+            Self::Business { code, .. } | Self::Validation { code, .. } => {
+                (TerminalOutcome::Rejected, financial_reason(code))
+            }
+            Self::NotFound => (TerminalOutcome::Rejected, FinancialReason::NotFound),
+            Self::BadRequest { .. } => (TerminalOutcome::Rejected, FinancialReason::BadRequest),
+            Self::Unauthorized => (TerminalOutcome::Rejected, FinancialReason::Unauthorized),
+            Self::Forbidden => (TerminalOutcome::Rejected, FinancialReason::Forbidden),
+            Self::Conflict => (TerminalOutcome::Rejected, FinancialReason::Conflict),
             Self::ServiceUnavailable => (
                 TerminalOutcome::Rejected,
-                FinancialReason::Code("service_unavailable"),
+                FinancialReason::ServiceUnavailable,
             ),
         }
     }
@@ -215,28 +202,28 @@ impl AppError {
     }
 }
 
-fn financial_reason(code: &'static str) -> &'static str {
+fn financial_reason(code: &'static str) -> FinancialReason {
     match code {
-        "same_source_and_destination"
-        | "account_unavailable"
-        | "insufficient_funds"
-        | "rate_unavailable"
-        | "rate_configuration_ambiguous"
-        | "fee_rule_unavailable"
-        | "fee_rule_configuration_ambiguous"
-        | "destination_amount_too_small"
-        | "idempotency_conflict"
-        | "reversal_of_reversal"
-        | "transfer_already_reversed"
-        | "arithmetic_overflow"
-        | "malformed_amount"
-        | "too_many_fractional_digits"
-        | "non_positive_amount"
-        | "amount_overflow"
-        | "malformed_account_id"
-        | "malformed_transfer_id"
-        | "invalid_json" => code,
-        _ => "invalid_request",
+        "same_source_and_destination" => FinancialReason::SameSourceAndDestination,
+        "account_unavailable" => FinancialReason::AccountUnavailable,
+        "insufficient_funds" => FinancialReason::InsufficientFunds,
+        "rate_unavailable" => FinancialReason::RateUnavailable,
+        "rate_configuration_ambiguous" => FinancialReason::RateConfigurationAmbiguous,
+        "fee_rule_unavailable" => FinancialReason::FeeRuleUnavailable,
+        "fee_rule_configuration_ambiguous" => FinancialReason::FeeRuleConfigurationAmbiguous,
+        "destination_amount_too_small" => FinancialReason::DestinationAmountTooSmall,
+        "idempotency_conflict" => FinancialReason::IdempotencyConflict,
+        "reversal_of_reversal" => FinancialReason::ReversalOfReversal,
+        "transfer_already_reversed" => FinancialReason::TransferAlreadyReversed,
+        "arithmetic_overflow" => FinancialReason::ArithmeticOverflow,
+        "malformed_amount" => FinancialReason::MalformedAmount,
+        "too_many_fractional_digits" => FinancialReason::TooManyFractionalDigits,
+        "non_positive_amount" => FinancialReason::NonPositiveAmount,
+        "amount_overflow" => FinancialReason::AmountOverflow,
+        "malformed_account_id" => FinancialReason::MalformedAccountId,
+        "malformed_transfer_id" => FinancialReason::MalformedTransferId,
+        "invalid_json" => FinancialReason::InvalidJson,
+        _ => FinancialReason::InvalidRequest,
     }
 }
 
@@ -261,16 +248,13 @@ mod tests {
             error.financial_metric_outcome(),
             (
                 TerminalOutcome::Rejected,
-                FinancialReason::Code("insufficient_funds")
+                FinancialReason::InsufficientFunds
             )
         );
         assert_eq!(
             AppError::validation("unrecognized_code", "arbitrary detail")
                 .financial_metric_outcome(),
-            (
-                TerminalOutcome::Rejected,
-                FinancialReason::Code("invalid_request")
-            )
+            (TerminalOutcome::Rejected, FinancialReason::InvalidRequest)
         );
     }
 }

@@ -70,7 +70,32 @@ impl IdempotencyOutcome {
 pub enum FinancialReason {
     None,
     InternalError,
-    Code(&'static str),
+    SameSourceAndDestination,
+    AccountUnavailable,
+    InsufficientFunds,
+    RateUnavailable,
+    RateConfigurationAmbiguous,
+    FeeRuleUnavailable,
+    FeeRuleConfigurationAmbiguous,
+    DestinationAmountTooSmall,
+    IdempotencyConflict,
+    ReversalOfReversal,
+    TransferAlreadyReversed,
+    ArithmeticOverflow,
+    MalformedAmount,
+    TooManyFractionalDigits,
+    NonPositiveAmount,
+    AmountOverflow,
+    MalformedAccountId,
+    MalformedTransferId,
+    InvalidJson,
+    NotFound,
+    BadRequest,
+    Unauthorized,
+    Forbidden,
+    Conflict,
+    ServiceUnavailable,
+    InvalidRequest,
 }
 
 impl FinancialReason {
@@ -78,7 +103,32 @@ impl FinancialReason {
         match self {
             Self::None => "none",
             Self::InternalError => "internal_error",
-            Self::Code(code) => code,
+            Self::SameSourceAndDestination => "same_source_and_destination",
+            Self::AccountUnavailable => "account_unavailable",
+            Self::InsufficientFunds => "insufficient_funds",
+            Self::RateUnavailable => "rate_unavailable",
+            Self::RateConfigurationAmbiguous => "rate_configuration_ambiguous",
+            Self::FeeRuleUnavailable => "fee_rule_unavailable",
+            Self::FeeRuleConfigurationAmbiguous => "fee_rule_configuration_ambiguous",
+            Self::DestinationAmountTooSmall => "destination_amount_too_small",
+            Self::IdempotencyConflict => "idempotency_conflict",
+            Self::ReversalOfReversal => "reversal_of_reversal",
+            Self::TransferAlreadyReversed => "transfer_already_reversed",
+            Self::ArithmeticOverflow => "arithmetic_overflow",
+            Self::MalformedAmount => "malformed_amount",
+            Self::TooManyFractionalDigits => "too_many_fractional_digits",
+            Self::NonPositiveAmount => "non_positive_amount",
+            Self::AmountOverflow => "amount_overflow",
+            Self::MalformedAccountId => "malformed_account_id",
+            Self::MalformedTransferId => "malformed_transfer_id",
+            Self::InvalidJson => "invalid_json",
+            Self::NotFound => "not_found",
+            Self::BadRequest => "bad_request",
+            Self::Unauthorized => "unauthorized",
+            Self::Forbidden => "forbidden",
+            Self::Conflict => "conflict",
+            Self::ServiceUnavailable => "service_unavailable",
+            Self::InvalidRequest => "invalid_request",
         }
     }
 }
@@ -370,7 +420,7 @@ mod tests {
         observation.idempotency(IdempotencyOutcome::Owner);
         observation.complete(
             TerminalOutcome::Rejected,
-            FinancialReason::Code("insufficient_funds"),
+            FinancialReason::InsufficientFunds,
         );
 
         let metrics = metrics_handle().render();
