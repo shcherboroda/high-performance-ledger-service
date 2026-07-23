@@ -4,6 +4,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +22,10 @@ use crate::{
     },
     idempotency::{self, IdempotencyKey, Reservation},
     money::{MoneyError, format_minor_units, parse_minor_units},
+    observability::{
+        FinancialOperation, FinancialReason, IdempotencyOutcome, TerminalOutcome,
+        TransactionObservation,
+    },
 };
 
 #[derive(Deserialize, ToSchema)]
@@ -225,6 +230,7 @@ pub(crate) async fn create_transfer(
     }
 
     let mut transaction = state.pool.begin().await.map_err(AppError::internal)?;
+    let transaction_started = Instant::now();
     let preliminary = sqlx::query_as::<_, (String, i16, String, i16)>(
         "SELECT source.currency, source.currency_scale, destination.currency, destination.currency_scale \
          FROM accounts source JOIN accounts destination ON destination.id = $2 WHERE source.id = $1",
@@ -245,14 +251,23 @@ pub(crate) async fn create_transfer(
     } else {
         idempotency::FX_TRANSFER_OPERATION
     };
+    let mut observation = TransactionObservation::started(
+        if operation_type == idempotency::TRANSFER_OPERATION {
+            FinancialOperation::Transfer
+        } else {
+            FinancialOperation::FxTransfer
+        },
+        transaction_started,
+    );
+    let result = async {
     let source_scale = u8::try_from(preliminary.1).map_err(AppError::internal)?;
-    let amount_minor =
-        parse_minor_units(&request.amount, source_scale).map_err(transfer_money_error)?;
+    let amount_minor = parse_minor_units(&request.amount, source_scale).map_err(transfer_money_error)?;
     if amount_minor <= 0 {
-        return Err(AppError::validation(
+        let error = AppError::validation(
             "non_positive_amount",
             "The amount must be greater than zero",
-        ));
+        );
+        return Err(error);
     }
     let fingerprint = idempotency::transfer_fingerprint(
         source_account_id,
@@ -270,9 +285,10 @@ pub(crate) async fn create_transfer(
     .map_err(AppError::internal)?
     {
         if fingerprint != stored_fingerprint {
+            observation.idempotency(IdempotencyOutcome::Conflict);
             return Err(AppError::idempotency_conflict());
         }
-        transaction.commit().await.map_err(AppError::internal)?;
+        observation.idempotency(IdempotencyOutcome::Replay);
         let status = StatusCode::from_u16(http_status as u16).map_err(AppError::internal)?;
         return Ok((status, Json(response_body)).into_response());
     }
@@ -291,12 +307,15 @@ pub(crate) async fn create_transfer(
             http_status,
             response_body,
         } => {
-            transaction.commit().await.map_err(AppError::internal)?;
+            observation.idempotency(IdempotencyOutcome::Replay);
             let status = StatusCode::from_u16(http_status as u16).map_err(AppError::internal)?;
             return Ok((status, Json(response_body)).into_response());
         }
-        Reservation::Conflict => return Err(AppError::idempotency_conflict()),
-        Reservation::Owned => {}
+        Reservation::Conflict => {
+            observation.idempotency(IdempotencyOutcome::Conflict);
+            return Err(AppError::idempotency_conflict());
+        }
+        Reservation::Owned => observation.idempotency(IdempotencyOutcome::Owner),
     }
     let operation_time = sqlx::query_scalar("SELECT transaction_timestamp()")
         .fetch_one(&mut *transaction)
@@ -332,7 +351,8 @@ pub(crate) async fn create_transfer(
     .await
     .map_err(AppError::internal)?;
     if accounts.len() != 2 {
-        return Err(AppError::account_unavailable());
+        let error = AppError::account_unavailable();
+        return Err(error);
     }
     let locked = accounts
         .into_iter()
@@ -356,7 +376,8 @@ pub(crate) async fn create_transfer(
         .find(|account| account.id == destination_account_id)
         .expect("both locked accounts returned");
     if source.owner_id != client_id || source.status != "active" || destination.status != "active" {
-        return Err(AppError::account_unavailable());
+        let error = AppError::account_unavailable();
+        return Err(error);
     }
     if (
         source.currency.as_str(),
@@ -392,8 +413,7 @@ pub(crate) async fn create_transfer(
             None,
         ),
         Some((rate, fee)) => {
-            let fee_calculation =
-                calculate_fee(amount_minor, fee.fee_bps).map_err(transfer_arithmetic_error)?;
+            let fee_calculation = calculate_fee(amount_minor, fee.fee_bps).map_err(transfer_arithmetic_error)?;
             let exact_rate = ExactRate::parse(&rate.rate).map_err(transfer_arithmetic_error)?;
             let destination_amount = calculate_destination(
                 amount_minor,
@@ -414,10 +434,11 @@ pub(crate) async fn create_transfer(
         }
     };
     if source.balance_minor < total_source_debit_minor {
-        return Err(AppError::business(
+        let error = AppError::business(
             "insufficient_funds",
             "The source account has insufficient funds",
-        ));
+        );
+        return Err(error);
     }
     let source_balance = source
         .balance_minor
@@ -515,8 +536,27 @@ pub(crate) async fn create_transfer(
     )
     .await
     .map_err(AppError::internal)?;
-    transaction.commit().await.map_err(AppError::internal)?;
     Ok((StatusCode::CREATED, Json(response_body)).into_response())
+    }
+    .await;
+    match result {
+        Ok(response) => match transaction.commit().await {
+            Ok(()) => {
+                observation.complete(TerminalOutcome::Success, FinancialReason::None);
+                Ok(response)
+            }
+            Err(error) => {
+                let error = AppError::internal(error);
+                observation.reject(&error);
+                Err(error)
+            }
+        },
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            observation.reject(&error);
+            Err(error)
+        }
+    }
 }
 fn transfer_money_error(error: MoneyError) -> AppError {
     match error {

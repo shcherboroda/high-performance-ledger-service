@@ -9,6 +9,8 @@ use serde_json::Value;
 use tracing::error;
 use utoipa::ToSchema;
 
+use crate::observability::{FinancialReason, TerminalOutcome};
+
 /// The stable JSON envelope returned when an API operation cannot succeed.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ErrorEnvelope {
@@ -67,6 +69,34 @@ pub enum AppError {
 }
 
 impl AppError {
+    pub fn financial_metric_outcome(&self) -> (TerminalOutcome, FinancialReason) {
+        match self {
+            Self::Internal { .. } => (
+                TerminalOutcome::InternalError,
+                FinancialReason::InternalError,
+            ),
+            Self::IdempotencyConflict => (
+                TerminalOutcome::Rejected,
+                FinancialReason::IdempotencyConflict,
+            ),
+            Self::AccountUnavailable => (
+                TerminalOutcome::Rejected,
+                FinancialReason::AccountUnavailable,
+            ),
+            Self::Business { code, .. } | Self::Validation { code, .. } => {
+                (TerminalOutcome::Rejected, financial_reason(code))
+            }
+            Self::NotFound => (TerminalOutcome::Rejected, FinancialReason::NotFound),
+            Self::BadRequest { .. } => (TerminalOutcome::Rejected, FinancialReason::BadRequest),
+            Self::Unauthorized => (TerminalOutcome::Rejected, FinancialReason::Unauthorized),
+            Self::Forbidden => (TerminalOutcome::Rejected, FinancialReason::Forbidden),
+            Self::Conflict => (TerminalOutcome::Rejected, FinancialReason::Conflict),
+            Self::ServiceUnavailable => (
+                TerminalOutcome::Rejected,
+                FinancialReason::ServiceUnavailable,
+            ),
+        }
+    }
     pub fn bad_request(details: Option<Value>) -> Self {
         Self::BadRequest { details }
     }
@@ -172,6 +202,31 @@ impl AppError {
     }
 }
 
+fn financial_reason(code: &'static str) -> FinancialReason {
+    match code {
+        "same_source_and_destination" => FinancialReason::SameSourceAndDestination,
+        "account_unavailable" => FinancialReason::AccountUnavailable,
+        "insufficient_funds" => FinancialReason::InsufficientFunds,
+        "rate_unavailable" => FinancialReason::RateUnavailable,
+        "rate_configuration_ambiguous" => FinancialReason::RateConfigurationAmbiguous,
+        "fee_rule_unavailable" => FinancialReason::FeeRuleUnavailable,
+        "fee_rule_configuration_ambiguous" => FinancialReason::FeeRuleConfigurationAmbiguous,
+        "destination_amount_too_small" => FinancialReason::DestinationAmountTooSmall,
+        "idempotency_conflict" => FinancialReason::IdempotencyConflict,
+        "reversal_of_reversal" => FinancialReason::ReversalOfReversal,
+        "transfer_already_reversed" => FinancialReason::TransferAlreadyReversed,
+        "arithmetic_overflow" => FinancialReason::ArithmeticOverflow,
+        "malformed_amount" => FinancialReason::MalformedAmount,
+        "too_many_fractional_digits" => FinancialReason::TooManyFractionalDigits,
+        "non_positive_amount" => FinancialReason::NonPositiveAmount,
+        "amount_overflow" => FinancialReason::AmountOverflow,
+        "malformed_account_id" => FinancialReason::MalformedAccountId,
+        "malformed_transfer_id" => FinancialReason::MalformedTransferId,
+        "invalid_json" => FinancialReason::InvalidJson,
+        _ => FinancialReason::InvalidRequest,
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         if let Self::Internal { source } = &self {
@@ -179,5 +234,27 @@ impl IntoResponse for AppError {
         }
         let (status, body) = self.response_parts();
         (status, Json(body)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn financial_metrics_never_use_error_text_as_a_reason() {
+        let error = AppError::business("insufficient_funds", "sensitive balance is 101.23");
+        assert_eq!(
+            error.financial_metric_outcome(),
+            (
+                TerminalOutcome::Rejected,
+                FinancialReason::InsufficientFunds
+            )
+        );
+        assert_eq!(
+            AppError::validation("unrecognized_code", "arbitrary detail")
+                .financial_metric_outcome(),
+            (TerminalOutcome::Rejected, FinancialReason::InvalidRequest)
+        );
     }
 }

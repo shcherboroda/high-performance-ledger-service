@@ -613,6 +613,28 @@ request/response bodies.
 histogram buckets. It performs no network export; deployments must protect access to this endpoint
 at their network boundary when appropriate.
 
+Financial writes additionally report `ledger_operations_total{operation,outcome,reason}`,
+`ledger_idempotency_outcomes_total{operation,outcome}`, and
+`ledger_database_transaction_duration_seconds{operation,outcome}`. Operations are the persisted
+business classifications `transfer`, `fx_transfer`, and `reversal`; the unified transfer handler
+selects transfer versus FX only after reading the participating account currency metadata.
+Consequently, a unified-transfer failure before that authoritative lookup (including transaction
+acquisition failure or an unavailable preliminary account lookup) is intentionally unclassified:
+it does not emit an operation metric or transaction-duration observation. This avoids guessing an
+operation label from request fields; once classification succeeds, every transaction attempt emits
+one terminal operation outcome.
+Terminal operation outcomes are `success`, `rejected`, and `internal_error`, with `none` for a
+success reason and `internal_error` for an internal failure. Rejections use a fixed mapping of
+stable API codes (including account availability, funding, FX configuration, arithmetic, reversal,
+and idempotency codes), never error text. Idempotency outcomes are exactly one of `owner`,
+`replay`, or `conflict`; a replay is also a successful terminal financial operation.
+
+Transaction-duration observations begin after a PostgreSQL transaction is acquired and include
+idempotency work, locking, validation, SQL execution, and commit or rollback abandonment. They
+exclude HTTP handling, authentication, request parsing, and failed transaction acquisition. The
+metrics and terminal structured events exclude client, account, transfer, and idempotency
+identifiers, financial values, currencies, rates, fees, fingerprints, and error text.
+
 ## 18. Testing strategy
 
 Unit tests cover:

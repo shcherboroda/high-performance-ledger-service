@@ -14,6 +14,8 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{EnvFilter, fmt::writer::BoxMakeWriter, prelude::*};
 use uuid::Uuid;
 
+use crate::api_error::AppError;
+
 const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
 const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 const BUCKETS: &[f64] = &[
@@ -22,6 +24,200 @@ const BUCKETS: &[f64] = &[
 
 #[derive(Clone, Debug)]
 pub struct RequestId(pub String);
+
+#[derive(Clone, Copy)]
+pub enum FinancialOperation {
+    Transfer,
+    FxTransfer,
+    Reversal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalOutcome {
+    Success,
+    Rejected,
+    InternalError,
+}
+
+impl TerminalOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Rejected => "rejected",
+            Self::InternalError => "internal_error",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdempotencyOutcome {
+    Owner,
+    Replay,
+    Conflict,
+}
+
+impl IdempotencyOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Replay => "replay",
+            Self::Conflict => "conflict",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FinancialReason {
+    None,
+    InternalError,
+    SameSourceAndDestination,
+    AccountUnavailable,
+    InsufficientFunds,
+    RateUnavailable,
+    RateConfigurationAmbiguous,
+    FeeRuleUnavailable,
+    FeeRuleConfigurationAmbiguous,
+    DestinationAmountTooSmall,
+    IdempotencyConflict,
+    ReversalOfReversal,
+    TransferAlreadyReversed,
+    ArithmeticOverflow,
+    MalformedAmount,
+    TooManyFractionalDigits,
+    NonPositiveAmount,
+    AmountOverflow,
+    MalformedAccountId,
+    MalformedTransferId,
+    InvalidJson,
+    NotFound,
+    BadRequest,
+    Unauthorized,
+    Forbidden,
+    Conflict,
+    ServiceUnavailable,
+    InvalidRequest,
+}
+
+impl FinancialReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::InternalError => "internal_error",
+            Self::SameSourceAndDestination => "same_source_and_destination",
+            Self::AccountUnavailable => "account_unavailable",
+            Self::InsufficientFunds => "insufficient_funds",
+            Self::RateUnavailable => "rate_unavailable",
+            Self::RateConfigurationAmbiguous => "rate_configuration_ambiguous",
+            Self::FeeRuleUnavailable => "fee_rule_unavailable",
+            Self::FeeRuleConfigurationAmbiguous => "fee_rule_configuration_ambiguous",
+            Self::DestinationAmountTooSmall => "destination_amount_too_small",
+            Self::IdempotencyConflict => "idempotency_conflict",
+            Self::ReversalOfReversal => "reversal_of_reversal",
+            Self::TransferAlreadyReversed => "transfer_already_reversed",
+            Self::ArithmeticOverflow => "arithmetic_overflow",
+            Self::MalformedAmount => "malformed_amount",
+            Self::TooManyFractionalDigits => "too_many_fractional_digits",
+            Self::NonPositiveAmount => "non_positive_amount",
+            Self::AmountOverflow => "amount_overflow",
+            Self::MalformedAccountId => "malformed_account_id",
+            Self::MalformedTransferId => "malformed_transfer_id",
+            Self::InvalidJson => "invalid_json",
+            Self::NotFound => "not_found",
+            Self::BadRequest => "bad_request",
+            Self::Unauthorized => "unauthorized",
+            Self::Forbidden => "forbidden",
+            Self::Conflict => "conflict",
+            Self::ServiceUnavailable => "service_unavailable",
+            Self::InvalidRequest => "invalid_request",
+        }
+    }
+}
+
+impl FinancialOperation {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Transfer => "transfer",
+            Self::FxTransfer => "fx_transfer",
+            Self::Reversal => "reversal",
+        }
+    }
+}
+
+pub struct TransactionObservation {
+    operation: FinancialOperation,
+    started: Instant,
+    completed: bool,
+}
+
+impl TransactionObservation {
+    pub fn new(operation: FinancialOperation) -> Self {
+        Self::started(operation, Instant::now())
+    }
+
+    pub fn started(operation: FinancialOperation, started: Instant) -> Self {
+        Self {
+            operation,
+            started,
+            completed: false,
+        }
+    }
+
+    pub fn idempotency(&self, outcome: IdempotencyOutcome) {
+        counter!("ledger_idempotency_outcomes_total", "operation" => self.operation.as_str(), "outcome" => outcome.as_str()).increment(1);
+        tracing::info!(
+            operation = self.operation.as_str(),
+            outcome = outcome.as_str(),
+            "ledger idempotency outcome"
+        );
+    }
+
+    pub fn complete(&mut self, outcome: TerminalOutcome, reason: FinancialReason) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        let duration = self.started.elapsed().as_secs_f64();
+        counter!("ledger_operations_total", "operation" => self.operation.as_str(), "outcome" => outcome.as_str(), "reason" => reason.as_str()).increment(1);
+        histogram!("ledger_database_transaction_duration_seconds", "operation" => self.operation.as_str(), "outcome" => outcome.as_str()).record(duration);
+        tracing::info!(
+            operation = self.operation.as_str(),
+            outcome = outcome.as_str(),
+            reason = reason.as_str(),
+            transaction_duration_seconds = duration,
+            "ledger operation completed"
+        );
+    }
+
+    pub fn reject(&mut self, error: &AppError) {
+        let (outcome, reason) = error.financial_metric_outcome();
+        self.complete(outcome, reason);
+    }
+}
+
+impl Drop for TransactionObservation {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.complete(
+                TerminalOutcome::InternalError,
+                FinancialReason::InternalError,
+            );
+        }
+    }
+}
+
+pub fn record_operation_without_transaction(
+    operation: FinancialOperation,
+    outcome: TerminalOutcome,
+    reason: FinancialReason,
+) {
+    counter!("ledger_operations_total", "operation" => operation.as_str(), "outcome" => outcome.as_str(), "reason" => reason.as_str()).increment(1);
+    tracing::info!(
+        operation = operation.as_str(),
+        outcome = outcome.as_str(),
+        reason = reason.as_str(),
+        "ledger operation completed"
+    );
+}
 
 static METRICS: OnceLock<PrometheusHandle> = OnceLock::new();
 
@@ -215,5 +411,26 @@ mod tests {
         assert!(!logs.contains("sensitive-secret"));
         assert!(!logs.contains("token=discard"));
         assert!(!logs.contains(&resource_id.to_string()));
+    }
+
+    #[test]
+    fn financial_metrics_use_only_bounded_labels() {
+        let secret = Uuid::new_v4().to_string();
+        let mut observation = TransactionObservation::new(FinancialOperation::Transfer);
+        observation.idempotency(IdempotencyOutcome::Owner);
+        observation.complete(
+            TerminalOutcome::Rejected,
+            FinancialReason::InsufficientFunds,
+        );
+
+        let metrics = metrics_handle().render();
+        assert!(metrics.contains("ledger_operations_total"));
+        assert!(metrics.contains("operation=\"transfer\""));
+        assert!(metrics.contains("outcome=\"rejected\""));
+        assert!(metrics.contains("reason=\"insufficient_funds\""));
+        assert!(metrics.contains("ledger_idempotency_outcomes_total"));
+        assert!(metrics.contains("outcome=\"owner\""));
+        assert!(metrics.contains("ledger_database_transaction_duration_seconds"));
+        assert!(!metrics.contains(&secret));
     }
 }
