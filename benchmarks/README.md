@@ -65,17 +65,16 @@ Concurrency levels are sorted, must be unique and nonzero, and are conservativel
 
 ## Local topology comparison
 
-`run-topology.sh` starts release service processes directly: each has a distinct loopback port and process-local `/metrics`, while all use exactly the same `BENCHMARK_DATABASE_URL`. It only accepts `1` or `2`, waits for every `/ready`, and stops every process on success, failure, or interruption. It does not add a proxy or load balancer.
+`run-topology.sh` starts release service processes directly: each has a distinct loopback port and process-local `/metrics`, while all use exactly the same `BENCHMARK_DATABASE_URL`. It accepts `1`, `2`, or `matrix`; `matrix` starts two processes and runs the versioned `1,2` comparison in one benchmark invocation. The harness records every `/ready` outcome before traffic, skips an unready topology, writes it as invalid, and stops every process on success, failure, or interruption. It does not add a proxy or load balancer.
 
-Export the shared benchmark-only service configuration, then run the independent baseline once for each topology:
+Export the shared benchmark-only service configuration, then run the independent one-versus-two baseline:
 
 ```bash
 export BENCHMARK_DATABASE_URL=postgres://.../ledger_benchmark
 export BENCHMARK_JWT_ISSUER=benchmark-issuer BENCHMARK_JWT_AUDIENCE=ledger
 export BENCHMARK_JWT_PRIVATE_KEY=/tmp/ledger-benchmark-private.pem
 export JWT_PUBLIC_KEY_PEM="$(cat /tmp/ledger-benchmark-public.pem)"
-./benchmarks/run-topology.sh 1 --operations 20 --warmup-operations 4 --concurrency 2
-./benchmarks/run-topology.sh 2 --operations 20 --warmup-operations 4 --concurrency 2
+./benchmarks/run-topology.sh matrix --operations 20 --warmup-operations 4 --concurrency 2
 ```
 
 For the required two-instance shared-database contention smoke, use a small hot-account workload:
@@ -85,7 +84,7 @@ BENCHMARK_SCENARIO=hot-account ./benchmarks/run-topology.sh 2 \
   --operations 10 --warmup-operations 2 --concurrency 2
 ```
 
-Each ignored `benchmark-results/topology-<N>.json` is schema version 3. It records the configured URLs, readiness outcome, per-instance metrics before/after, exact measured request count per URL, request failures, SQL verification, and validity. URLs are deterministically assigned round-robin by operation index, so every URL must receive measured traffic when operations cover the instance count. A readiness, metrics, transport, timeout, parse, unexpected-HTTP, SQL, or distribution failure makes the topology invalid; no failed instance is removed from a run.
+The ignored `benchmark-results/topology-matrix.json` is schema version 3 and contains both topology levels; `topology-1.json` and `topology-2.json` remain available for a focused single topology. Each result records the configured URLs, readiness outcome, per-instance metrics before/after, exact measured request count per URL, request failures, SQL verification, and validity. The matrix summary has one factual throughput ratio for each matching concurrency level. URLs are deterministically assigned round-robin by operation index, so every URL must receive measured traffic when operations cover the instance count. A readiness, metrics, transport, timeout, parse, unexpected-HTTP, SQL, or distribution failure makes the topology invalid; no failed instance is removed from a run.
 
 To compare the raw documents, retain the same seed, operation/warm-up counts, and concurrency. Any throughput ratio or latency difference is an environment-specific observation only, not evidence of linear scaling, maximum capacity, or a production guarantee. Logs are local under `benchmark-results/`; inspect them after a failed readiness check. The trap cleans processes, and leftover release processes can be stopped with their recorded PIDs if the shell itself is forcibly killed.
 

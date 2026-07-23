@@ -43,16 +43,26 @@ async fn run() -> Result<()> {
         let urls = config.service_urls[..instances].to_vec();
         let http = Arc::new(http::Http::new(urls.clone(), config.request_timeout())?);
         let readiness = readiness(&http).await;
-        let mut levels = Vec::new();
-        for concurrency in config.levels()? {
-            levels.push(run_level(&config, &pool, &http, &tokens, concurrency).await?)
-        }
         let ready = readiness.values().all(Result::is_ok);
+        if !ready {
+            topology_levels.push(TopologyLevelResult::readiness_failure(
+                instances, urls, readiness,
+            ));
+            continue;
+        }
+        let levels = {
+            let mut levels = Vec::new();
+            for concurrency in config.levels()? {
+                levels.push(run_level(&config, &pool, &http, &tokens, concurrency).await?)
+            }
+            levels
+        };
         topology_levels.push(TopologyLevelResult {
             configured_instances: instances,
             service_urls: urls,
             readiness,
-            valid: ready && levels.iter().all(|level| level.valid),
+            workload_skipped_reason: None,
+            valid: levels.iter().all(|level| level.valid),
             levels,
         });
     }
