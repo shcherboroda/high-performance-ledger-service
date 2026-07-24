@@ -37,7 +37,9 @@ For hot-account runs the shared source is funded for every warm-up and measured 
 
 For a one-command local smoke run, create your ignored machine-specific configuration once. The
 runner reads the public key file and passes its contents to the service; do not put a multiline PEM
-directly in the configuration file:
+directly in the configuration file. The example config sets an 8-hour benchmark JWT lifetime because
+the harness conservatively validates the complete configured sweep duration before it starts. This is
+benchmark-only configuration, not a production JWT lifetime recommendation:
 
 ```bash
 cp benchmarks/local.env.example benchmarks/local.env

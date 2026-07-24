@@ -33,7 +33,8 @@ def result(valid=True):
 
 class SummarizerTests(unittest.TestCase):
     def test_local_config_example_is_sourceable(self):
-        completed = subprocess.run(["bash", "-c", 'source "$1" && [[ "$BENCHMARK_DB_POOL_ASSUMPTIONS" == "1 local service instance; application default DB pool configuration" ]] && [[ "$BENCHMARK_TELEMETRY_MODE" == "RUST_LOG=warn; process-local Prometheus snapshots before and after each measured level" ]]', "bash", str(CONFIG_EXAMPLE)], capture_output=True, text=True, check=False)
+        self.assertIn("BENCHMARK_JWT_LIFETIME_SECS=28800", CONFIG_EXAMPLE.read_text(encoding="utf-8"))
+        completed = subprocess.run(["bash", "-c", 'source "$1" && [[ "$BENCHMARK_JWT_LIFETIME_SECS" == "28800" ]] && [[ "$BENCHMARK_DB_POOL_ASSUMPTIONS" == "1 local service instance; application default DB pool configuration" ]] && [[ "$BENCHMARK_TELEMETRY_MODE" == "RUST_LOG=warn; process-local Prometheus snapshots before and after each measured level" ]]', "bash", str(CONFIG_EXAMPLE)], capture_output=True, text=True, check=False)
         self.assertEqual(completed.returncode, 0, completed.stderr)
     def test_schema_v4_summary(self): self.assertEqual(summarizer.summarize(result()), 0)
     def test_label_aware_metrics_delta(self):
