@@ -14,23 +14,26 @@ class LocalScriptTests(unittest.TestCase):
             key = temporary_path / "key.pem"
             key.write_text("key", encoding="utf-8")
             captured = temporary_path / "arguments"
+            captured_lifetime = temporary_path / "jwt-lifetime"
             cargo = temporary_path / "cargo"
-            cargo.write_text("#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" >\"$CAPTURED_ARGUMENTS\"\n", encoding="utf-8")
+            cargo.write_text("#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" >\"$CAPTURED_ARGUMENTS\"\nprintf '%s\\n' \"$BENCHMARK_JWT_LIFETIME_SECS\" >\"$CAPTURED_JWT_LIFETIME\"\n", encoding="utf-8")
             cargo.chmod(0o755)
             environment = os.environ | {
                 "PATH": f"{temporary}:{os.environ['PATH']}", "CAPTURED_ARGUMENTS": str(captured),
                 "BENCHMARK_ALLOW_DESTRUCTIVE": "1", "BENCHMARK_DATABASE_URL": "postgres://localhost/ledger_benchmark",
                 "SERVICE_URLS": "http://127.0.0.1:3000", "BENCHMARK_JWT_ISSUER": "issuer",
                 "BENCHMARK_JWT_AUDIENCE": "audience", "BENCHMARK_JWT_PRIVATE_KEY": str(key),
+                "BENCHMARK_JWT_LIFETIME_SECS": "28800",
+                "CAPTURED_JWT_LIFETIME": str(captured_lifetime),
             }
             completed = subprocess.run([str(BENCHMARKS / script), scenario], cwd=BENCHMARKS.parent, env=environment, text=True, capture_output=True, check=False)
             self.assertEqual(completed.returncode, 0, completed.stderr)
-            return captured.read_text(encoding="utf-8").splitlines()
+            return captured.read_text(encoding="utf-8").splitlines(), captured_lifetime.read_text(encoding="utf-8").strip()
 
     def test_baseline_command_arguments_for_both_scenarios(self):
         for scenario in ("independent", "account-pool"):
             with self.subTest(scenario=scenario):
-                arguments = self.run_script("run-baseline.sh", scenario)
+                arguments, _ = self.run_script("run-baseline.sh", scenario)
                 self.assertIn("--concurrency-levels", arguments)
                 self.assertIn("1,2,4,8,16,32", arguments)
                 self.assertIn("--operations", arguments)
@@ -45,12 +48,47 @@ class LocalScriptTests(unittest.TestCase):
                     self.assertIn("100", arguments)
 
     def test_smoke_command_arguments_are_unchanged(self):
-        arguments = self.run_script("run-smoke.sh", "independent")
-        self.assertIn("--concurrency", arguments)
-        self.assertIn("2", arguments)
-        self.assertIn("--operations", arguments)
-        self.assertIn("20", arguments)
-        self.assertIn("benchmark-results/smoke-independent.json", arguments)
+        arguments, _ = self.run_script("run-smoke.sh", "independent")
+        self.assertEqual(arguments, [
+            "run", "-p", "ledger-benchmarks", "--release", "--", "--scenario", "independent",
+            "--logical-clients", "2", "--concurrency", "2", "--operations", "20",
+            "--warmup-operations", "4", "--output", "benchmark-results/smoke-independent.json",
+        ])
+
+    def test_jwt_lifetime_reaches_benchmark_process_through_environment(self):
+        _, lifetime = self.run_script("run-baseline.sh", "independent")
+        self.assertEqual(lifetime, "28800")
+
+    def test_run_local_rejects_invalid_jwt_lifetime_before_service_start(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_path = Path(temporary)
+            private_key = temporary_path / "private.pem"
+            public_key = temporary_path / "public.pem"
+            private_key.write_text("private", encoding="utf-8")
+            public_key.write_text("public", encoding="utf-8")
+            base_config = f'''BENCHMARK_DATABASE_URL=postgres://localhost/ledger_benchmark
+SERVICE_URLS=http://127.0.0.1:3000
+BENCHMARK_JWT_ISSUER=issuer
+BENCHMARK_JWT_AUDIENCE=audience
+BENCHMARK_JWT_PRIVATE_KEY={private_key}
+BENCHMARK_JWT_PUBLIC_KEY={public_key}
+RUST_LOG=warn
+BENCHMARK_DB_POOL_ASSUMPTIONS=pool
+BENCHMARK_TELEMETRY_MODE=telemetry
+'''
+            for name, lifetime, expected_error in (
+                ("missing", None, "set BENCHMARK_JWT_LIFETIME_SECS"),
+                ("zero", "0", "must be a positive integer"),
+                ("negative", "-1", "must be a positive integer"),
+                ("non_numeric", "invalid", "must be a positive integer"),
+            ):
+                with self.subTest(lifetime=name):
+                    config = temporary_path / f"{name}.env"
+                    config.write_text(base_config + ("" if lifetime is None else f"BENCHMARK_JWT_LIFETIME_SECS={lifetime}\n"), encoding="utf-8")
+                    completed = subprocess.run([str(BENCHMARKS / "run-local.sh"), "--config", str(config), "baseline", "independent"], cwd=BENCHMARKS.parent, text=True, capture_output=True, check=False)
+                    self.assertEqual(completed.returncode, 2)
+                    self.assertIn(expected_error, completed.stderr)
+                    self.assertNotIn("starting local benchmark service", completed.stdout)
 
 
 if __name__ == "__main__":

@@ -43,9 +43,13 @@ require_env() {
 
 for name in BENCHMARK_DATABASE_URL SERVICE_URLS BENCHMARK_JWT_ISSUER BENCHMARK_JWT_AUDIENCE \
   BENCHMARK_JWT_PRIVATE_KEY BENCHMARK_JWT_PUBLIC_KEY RUST_LOG BENCHMARK_DB_POOL_ASSUMPTIONS \
-  BENCHMARK_TELEMETRY_MODE; do
+  BENCHMARK_TELEMETRY_MODE BENCHMARK_JWT_LIFETIME_SECS; do
   require_env "$name"
 done
+if [[ ! "$BENCHMARK_JWT_LIFETIME_SECS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "error: BENCHMARK_JWT_LIFETIME_SECS must be a positive integer" >&2
+  exit 2
+fi
 for key_path in "$BENCHMARK_JWT_PRIVATE_KEY" "$BENCHMARK_JWT_PUBLIC_KEY"; do
   if [[ ! -r "$key_path" ]]; then
     echo "error: key file '$key_path' is not readable" >&2
