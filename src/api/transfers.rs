@@ -6,6 +6,8 @@ use axum::{
 };
 use std::time::Instant;
 
+use sqlx::Acquire;
+
 use serde::{Deserialize, Serialize};
 
 use utoipa::ToSchema;
@@ -23,8 +25,8 @@ use crate::{
     idempotency::{self, IdempotencyKey, Reservation},
     money::{MoneyError, format_minor_units, parse_minor_units},
     observability::{
-        FinancialOperation, FinancialReason, IdempotencyOutcome, TerminalOutcome,
-        TransactionObservation,
+        FinancialOperation, FinancialReason, IdempotencyOutcome, PoolAcquireOutcome,
+        TerminalOutcome, TransactionObservation, record_transfer_pool_acquire,
     },
 };
 
@@ -229,7 +231,24 @@ pub(crate) async fn create_transfer(
         ));
     }
 
-    let mut transaction = state.pool.begin().await.map_err(AppError::internal)?;
+    let acquire_started = Instant::now();
+    let mut connection = match state.pool.acquire().await {
+        Ok(connection) => {
+            record_transfer_pool_acquire(
+                PoolAcquireOutcome::Success,
+                acquire_started.elapsed().as_secs_f64(),
+            );
+            connection
+        }
+        Err(error) => {
+            record_transfer_pool_acquire(
+                PoolAcquireOutcome::Failure,
+                acquire_started.elapsed().as_secs_f64(),
+            );
+            return Err(AppError::internal(error));
+        }
+    };
+    let mut transaction = connection.begin().await.map_err(AppError::internal)?;
     let transaction_started = Instant::now();
     let preliminary = sqlx::query_as::<_, (String, i16, String, i16)>(
         "SELECT source.currency, source.currency_scale, destination.currency, destination.currency_scale \

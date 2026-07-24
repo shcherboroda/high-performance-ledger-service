@@ -196,6 +196,10 @@ async fn financial_handlers_emit_bounded_operation_and_idempotency_metrics(pool:
         "ledger_database_transaction_duration_seconds_count",
         &["operation=\"transfer\"", "outcome=\"success\""],
     );
+    let pool_acquire_before = metric_value(
+        "ledger_database_pool_acquire_duration_seconds_count",
+        &["operation=\"transfer\"", "outcome=\"success\""],
+    );
     let owner_before = metric_value("ledger_idempotency_outcomes_total", &owner_label);
     let replay_before = metric_value("ledger_idempotency_outcomes_total", &replay_label);
     let conflict_before = metric_value("ledger_idempotency_outcomes_total", &conflict_label);
@@ -219,6 +223,13 @@ async fn financial_handlers_emit_bounded_operation_and_idempotency_metrics(pool:
             &["operation=\"transfer\"", "outcome=\"success\""],
         ),
         success_duration_before + 1.0
+    );
+    assert_eq!(
+        metric_value(
+            "ledger_database_pool_acquire_duration_seconds_count",
+            &["operation=\"transfer\"", "outcome=\"success\""]
+        ),
+        pool_acquire_before + 1.0
     );
     assert_eq!(
         metric_value("ledger_idempotency_outcomes_total", &owner_label),

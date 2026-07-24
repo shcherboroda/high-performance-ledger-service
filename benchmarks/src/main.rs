@@ -275,6 +275,7 @@ async fn run_level(
         measured_requests_per_url,
         metrics_before,
         metrics_after,
+        metrics_collection_valid: metrics_valid,
         valid: warmup_valid
             && workload_valid
             && metrics_valid

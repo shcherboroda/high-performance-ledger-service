@@ -2,7 +2,9 @@ use crate::{http::Classifications, stats::Latency, verify::Verification};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::{collections::BTreeMap, path::Path};
-pub const SCHEMA_VERSION: u32 = 4;
+/// Version 5 adds `metrics_collection_valid`, so consumers can distinguish an
+/// unavailable process-local metrics snapshot from workload failure.
+pub const SCHEMA_VERSION: u32 = 5;
 #[derive(Debug, Serialize)]
 pub struct LevelResult {
     pub scenario: String,
@@ -21,6 +23,9 @@ pub struct LevelResult {
     pub measured_requests_per_url: BTreeMap<String, usize>,
     pub metrics_before: BTreeMap<String, Result<String, String>>,
     pub metrics_after: BTreeMap<String, Result<String, String>>,
+    /// Snapshot collection failures invalidate diagnostics but are distinct from
+    /// transfer workload and correctness failures in the JSON result.
+    pub metrics_collection_valid: bool,
     pub verification: Verification,
     pub valid: bool,
 }
@@ -206,6 +211,7 @@ mod tests {
             measured_requests_per_url: BTreeMap::new(),
             metrics_before: BTreeMap::new(),
             metrics_after: BTreeMap::new(),
+            metrics_collection_valid: true,
             verification: Verification {
                 checks: vec![],
                 valid,
@@ -292,6 +298,7 @@ mod tests {
             measured_requests_per_url: BTreeMap::new(),
             metrics_before: BTreeMap::new(),
             metrics_after: BTreeMap::new(),
+            metrics_collection_valid: true,
             verification: Verification {
                 checks: vec![],
                 valid: true,
@@ -323,6 +330,7 @@ mod tests {
             measured_requests_per_url: BTreeMap::new(),
             metrics_before: BTreeMap::new(),
             metrics_after: BTreeMap::new(),
+            metrics_collection_valid: true,
             verification: Verification {
                 checks: vec![],
                 valid: true,

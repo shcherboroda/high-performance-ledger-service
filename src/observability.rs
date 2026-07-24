@@ -40,6 +40,21 @@ pub enum TerminalOutcome {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolAcquireOutcome {
+    Success,
+    Failure,
+}
+
+impl PoolAcquireOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadinessOutcome {
     Ready,
     NotReady,
@@ -249,6 +264,21 @@ pub fn record_operation_without_transaction(
         reason = reason.as_str(),
         "ledger operation completed"
     );
+}
+
+/// Records only the wait to obtain a connection for the `/transfers` handler.
+///
+/// This deliberately uses the fixed `transfer` operation label even before the
+/// request can be classified as same-currency or FX. The outcome says whether
+/// SQLx yielded a connection; it is independent from the workload's HTTP
+/// outcome and contains no database error text.
+pub fn record_transfer_pool_acquire(outcome: PoolAcquireOutcome, duration_seconds: f64) {
+    histogram!(
+        "ledger_database_pool_acquire_duration_seconds",
+        "operation" => FinancialOperation::Transfer.as_str(),
+        "outcome" => outcome.as_str()
+    )
+    .record(duration_seconds);
 }
 
 pub fn record_readiness_check(
@@ -490,6 +520,18 @@ mod tests {
         assert!(metrics.contains("outcome=\"owner\""));
         assert!(metrics.contains("ledger_database_transaction_duration_seconds"));
         assert!(!metrics.contains(&secret));
+    }
+
+    #[test]
+    fn transfer_pool_acquire_failure_uses_only_bounded_labels() {
+        let secret = "postgres://user:password@db.example/ledger?detail=secret";
+        record_transfer_pool_acquire(PoolAcquireOutcome::Failure, 0.01);
+
+        let metrics = metrics_handle().render();
+        assert!(metrics.contains("ledger_database_pool_acquire_duration_seconds"));
+        assert!(metrics.contains("operation=\"transfer\""));
+        assert!(metrics.contains("outcome=\"failure\""));
+        assert!(!metrics.contains(secret));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read and concisely display schema-v4 ledger benchmark results without modifying them."""
+"""Read and concisely display schema-v5 ledger benchmark results without modifying them."""
 import json
 import math
 import re
@@ -69,10 +69,14 @@ def metric_deltas(before_snapshot, after_snapshot):
     http_sum = delta(before, after, "ledger_http_request_duration_seconds_sum", {"method": "POST", "route": "/transfers"})
     db_count = delta(before, after, "ledger_database_transaction_duration_seconds_count", {"operation": "transfer", "outcome": "success"})
     db_sum = delta(before, after, "ledger_database_transaction_duration_seconds_sum", {"operation": "transfer", "outcome": "success"})
+    pool_count = delta(before, after, "ledger_database_pool_acquire_duration_seconds_count", {"operation": "transfer", "outcome": "success"})
+    pool_sum = delta(before, after, "ledger_database_pool_acquire_duration_seconds_sum", {"operation": "transfer", "outcome": "success"})
     return {"successful transfer operations": operation, "transfer HTTP requests": http_count,
             "transfer HTTP mean ms": None if not http_count else http_sum * 1000 / http_count if http_sum is not None else None,
             "successful transfer DB transactions": db_count,
-            "successful transfer DB mean ms": None if not db_count else db_sum * 1000 / db_count if db_sum is not None else None}
+            "successful transfer DB mean ms": None if not db_count else db_sum * 1000 / db_count if db_sum is not None else None,
+            "successful transfer pool acquires": pool_count,
+            "successful transfer pool-acquire mean ms": None if not pool_count else pool_sum * 1000 / pool_count if pool_sum is not None else None}
 
 def format_latency(latency):
     if not isinstance(latency, dict):
@@ -97,7 +101,7 @@ def throughput_ratio(previous, current):
     return f"{current / previous:.3f}"
 
 def summarize(document):
-    if not isinstance(document, dict) or document.get("schema_version") != 4 or not isinstance(document.get("topology_levels"), list):
+    if not isinstance(document, dict) or document.get("schema_version") != 5 or not isinstance(document.get("topology_levels"), list):
         raise ValueError("unsupported schema version or structurally unusable result")
     print(f"scenario={document.get('scenario')} seed={document.get('seed')} commit={document.get('commit_sha') or 'unavailable'}")
     for key in ("database_pool_assumptions", "telemetry_mode", "environment"):
@@ -126,6 +130,8 @@ def summarize(document):
             failed = [check for check in verification.get("checks", []) if not check.get("passed", False)] if isinstance(verification, dict) else []
             print(f"verification valid={verification.get('valid') if isinstance(verification, dict) else 'unavailable'} failed checks={failed or 'none'}")
             print(f"level valid={valid}; metrics:")
+            if level.get("metrics_collection_valid") is False:
+                print("  metric collection failed; workload and correctness results are reported separately above")
             for url in sorted(set(level.get("metrics_before", {})) | set(level.get("metrics_after", {}))):
                 print(f"  {url}: " + ", ".join(f"{key}={unavailable(value)}" for key, value in metric_deltas(snapshot_value(level.get("metrics_before", {}).get(url)), snapshot_value(level.get("metrics_after", {}).get(url))).items()))
             throughput = level.get("throughput_operations_per_second")
@@ -145,7 +151,7 @@ def summarize(document):
 
 def main(argv):
     if len(argv) != 2:
-        print(f"usage: {argv[0]} <schema-v4-result.json>", file=sys.stderr); return 2
+        print(f"usage: {argv[0]} <schema-v5-result.json>", file=sys.stderr); return 2
     try:
         with Path(argv[1]).open(encoding="utf-8") as source: document = json.load(source)
         return summarize(document)

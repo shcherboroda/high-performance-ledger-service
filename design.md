@@ -642,6 +642,24 @@ exclude HTTP handling, authentication, request parsing, and failed transaction a
 metrics and terminal structured events exclude client, account, transfer, and idempotency
 identifiers, financial values, currencies, rates, fees, fingerprints, and error text.
 
+Transfer requests additionally report
+`ledger_database_pool_acquire_duration_seconds{operation="transfer",outcome}`. It starts
+immediately before SQLx obtains a pool connection and ends when that acquire succeeds or fails;
+`outcome` is exactly `success` or `failure` and never includes database error text. The transfer
+HTTP duration starts at the request-observability middleware and ends after the response is
+constructed, so it covers authentication, extraction, validation, pool acquisition, transaction
+execution, and response handling. The timing order is:
+
+`client end-to-end -> service HTTP handler -> pool acquire wait -> database transaction -> remaining response work`
+
+These durations overlap: HTTP contains both pool-acquire and transaction time, while pool acquire
+precedes (and does not overlap) transaction time. They must not be added together. Benchmark
+reports retain process-local before/after snapshots per service URL and calculate per-instance
+deltas and means for HTTP, pool-acquire, and successful transaction histograms. A failed snapshot
+collection is explicitly recorded separately from workload and correctness validity. Benchmark
+result schema v5 adds `metrics_collection_valid` for that distinction; schema-v4 readers must be
+upgraded to the paired v5 summarizer rather than interpreting a changed result implicitly.
+
 Application-owned internal, readiness, and startup failure events use stable bounded component,
 operation, outcome/reason, and error-category fields. They exclude configuration values and
 credentials, authentication key material and tokens, SQL or bind values, identifiers, financial
