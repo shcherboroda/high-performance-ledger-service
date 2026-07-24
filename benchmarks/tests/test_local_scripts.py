@@ -1,4 +1,5 @@
 import os
+import shlex
 import stat
 import subprocess
 import tempfile
@@ -12,7 +13,7 @@ VALIDATE_LOCAL = BENCHMARKS.parent / "scripts" / "validate-local.sh"
 
 class LocalScriptTests(unittest.TestCase):
     def write_local_config(self, path, key, database_url="postgres://localhost/ledger_benchmark"):
-        path.write_text(f"""BENCHMARK_DATABASE_URL={database_url}
+        path.write_text(f"""BENCHMARK_DATABASE_URL={shlex.quote(database_url)}
 SERVICE_URLS=http://127.0.0.1:3000
 BENCHMARK_JWT_ISSUER=issuer
 BENCHMARK_JWT_AUDIENCE=audience

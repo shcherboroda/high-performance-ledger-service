@@ -24,6 +24,8 @@ The one local validation command is:
 
 It loads the ignored `benchmarks/local.env`, runs formatting, lint, Rust tests, and benchmark script tests, derives an administrative PostgreSQL URL by replacing only the dedicated `_benchmark` database name with `postgres`, creates the benchmark database if necessary, applies migrations to that dedicated database, and runs the independent smoke orchestration. Connection credentials, host, port, and query parameters are preserved. `DATABASE_URL` must be unset or exactly that derived administrative URL; any other explicit value is rejected rather than used unsafely. SQLx database creation never uses the `_benchmark` URL itself.
 
+`benchmarks/local.env` is sourced by Bash. Quote values containing shell-significant characters; for example, wrap a database URL with an `&` query parameter in single quotes.
+
 The local service is always stopped after startup. A cleanup failure returns nonzero even when the benchmark itself completed, because a possibly live service must not be reported as a successful clean run. The runner prints a final success or failed-phase line with its exit status.
 
 Generate a benchmark-only fixture key, then configure the service with its matching public key. Do not use a production signing key:
