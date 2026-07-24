@@ -1,6 +1,7 @@
 import os
 import subprocess
 import tempfile
+import shutil
 import unittest
 from pathlib import Path
 
@@ -140,10 +141,41 @@ BENCHMARK_TELEMETRY_MODE=telemetry
             self.assertIn("postgresql_server_version=unavailable", contents)
             self.assertIn("docker_engine_version=unavailable", contents)
 
-    def test_run_local_accepts_sustained_mode(self):
-        source = (BENCHMARKS / "run-local.sh").read_text(encoding="utf-8")
-        self.assertIn('"$1" != "sustained"', source)
-        self.assertIn('environment_output="benchmark-results/$mode-$scenario.environment.txt"', source)
+    def test_run_local_orchestrates_sustained_without_changing_smoke_or_baseline_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "repo"
+            shutil.copytree(BENCHMARKS.parent, root, ignore=shutil.ignore_patterns(".git", "target", "benchmark-results", "__pycache__"))
+            events = root / "events"
+            for name, body in {
+                "run-local-service.sh": '#!/usr/bin/env bash\nprintf service >>"$EVENTS"\n',
+                "stop-local-service.sh": '#!/usr/bin/env bash\nprintf stop >>"$EVENTS"\n',
+                "capture-environment.sh": '#!/usr/bin/env bash\nprintf " capture:%s" "$1" >>"$EVENTS"\n',
+                "run-sustained.sh": '#!/usr/bin/env bash\nprintf " sustained:%s" "$1" >>"$EVENTS"\n',
+                "run-smoke.sh": '#!/usr/bin/env bash\nprintf " smoke:%s" "$1" >>"$EVENTS"\n',
+                "run-baseline.sh": '#!/usr/bin/env bash\nprintf " baseline:%s" "$1" >>"$EVENTS"\n',
+                "summarize-results.py": '#!/usr/bin/env bash\n',
+            }.items():
+                path = root / "benchmarks" / name
+                path.write_text(body, encoding="utf-8"); path.chmod(0o755)
+            key = root / "key.pem"; key.write_text("key", encoding="utf-8")
+            config = root / "local.env"
+            config.write_text(f"""BENCHMARK_DATABASE_URL=postgres://localhost/ledger_benchmark
+SERVICE_URLS=http://127.0.0.1:3000
+BENCHMARK_JWT_ISSUER=issuer
+BENCHMARK_JWT_AUDIENCE=audience
+BENCHMARK_JWT_PRIVATE_KEY={key}
+BENCHMARK_JWT_PUBLIC_KEY={key}
+BENCHMARK_JWT_LIFETIME_SECS=28800
+RUST_LOG=warn
+BENCHMARK_DB_POOL_ASSUMPTIONS=pool
+BENCHMARK_TELEMETRY_MODE=telemetry
+""", encoding="utf-8")
+            environment = os.environ | {"EVENTS": str(events)}
+            for mode, expected in (("sustained", "capture:benchmark-results/sustained-independent.environment.txt sustained:independent"), ("smoke", "smoke:independent"), ("baseline", "baseline:independent")):
+                events.write_text("", encoding="utf-8")
+                completed = subprocess.run([str(root / "benchmarks" / "run-local.sh"), "--config", str(config), mode, "independent"], cwd=root, env=environment, text=True, capture_output=True, check=False)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertIn(expected, events.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
