@@ -15,7 +15,7 @@ if [[ "${1:-}" == "--config" ]]; then
   config_path="$2"
   shift 2
 fi
-if [[ $# -ne 2 || ( "$1" != "smoke" && "$1" != "baseline" ) || ( "$2" != "independent" && "$2" != "account-pool" ) ]]; then
+if [[ $# -ne 2 || ( "$1" != "smoke" && "$1" != "baseline" && "$1" != "sustained" ) || ( "$2" != "independent" && "$2" != "account-pool" ) ]]; then
   usage
   exit 2
 fi
