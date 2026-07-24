@@ -126,7 +126,9 @@ BENCHMARK_TELEMETRY_MODE=telemetry
                 with self.subTest(lifetime=name):
                     config = temporary_path / f"{name}.env"
                     config.write_text(base_config + ("" if lifetime is None else f"BENCHMARK_JWT_LIFETIME_SECS={lifetime}\n"), encoding="utf-8")
-                    completed = subprocess.run([str(BENCHMARKS / "run-local.sh"), "--config", str(config), "baseline", "independent"], cwd=BENCHMARKS.parent, text=True, capture_output=True, check=False)
+                    environment = os.environ.copy()
+                    environment.pop("BENCHMARK_JWT_LIFETIME_SECS", None)
+                    completed = subprocess.run([str(BENCHMARKS / "run-local.sh"), "--config", str(config), "baseline", "independent"], cwd=BENCHMARKS.parent, env=environment, text=True, capture_output=True, check=False)
                     self.assertEqual(completed.returncode, 2)
                     self.assertIn(expected_error, completed.stderr)
                     self.assertNotIn("starting local benchmark service", completed.stdout)
