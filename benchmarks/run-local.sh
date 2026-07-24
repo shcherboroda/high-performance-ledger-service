@@ -43,9 +43,13 @@ require_env() {
 
 for name in BENCHMARK_DATABASE_URL SERVICE_URLS BENCHMARK_JWT_ISSUER BENCHMARK_JWT_AUDIENCE \
   BENCHMARK_JWT_PRIVATE_KEY BENCHMARK_JWT_PUBLIC_KEY RUST_LOG BENCHMARK_DB_POOL_ASSUMPTIONS \
-  BENCHMARK_TELEMETRY_MODE BENCHMARK_JWT_LIFETIME_SECS; do
+  BENCHMARK_TELEMETRY_MODE; do
   require_env "$name"
 done
+if [[ -z "${BENCHMARK_JWT_LIFETIME_SECS:-}" ]]; then
+  echo "error: set BENCHMARK_JWT_LIFETIME_SECS in $config_path" >&2
+  exit 2
+fi
 if [[ ! "$BENCHMARK_JWT_LIFETIME_SECS" =~ ^[1-9][0-9]*$ ]]; then
   echo "error: BENCHMARK_JWT_LIFETIME_SECS must be a positive integer" >&2
   exit 2
@@ -69,29 +73,62 @@ JWT_PUBLIC_KEY_PEM="$(<"$BENCHMARK_JWT_PUBLIC_KEY")"
 export JWT_PUBLIC_KEY_PEM
 
 service_started=0
+failed_phase=""
 cleanup() {
   local status=$?
+  local cleanup_status=0
+  trap - EXIT INT TERM
   if [[ $service_started -eq 1 ]]; then
-    ./benchmarks/stop-local-service.sh || status=1
+    if ! ./benchmarks/stop-local-service.sh; then
+      cleanup_status=1
+    fi
   fi
+  if [[ $status -eq 0 && $cleanup_status -eq 0 ]]; then
+    echo "benchmark succeeded (exit status 0)"
+    exit 0
+  fi
+  if [[ $cleanup_status -ne 0 ]]; then
+    echo "benchmark failed during cleanup (exit status 1)" >&2
+    exit 1
+  fi
+  echo "benchmark failed during ${failed_phase:-execution} (exit status $status)" >&2
   exit "$status"
 }
 
-./benchmarks/run-local-service.sh
+if ./benchmarks/run-local-service.sh; then
+  :
+else
+  status=$?
+  echo "benchmark failed during startup (exit status $status)" >&2
+  exit "$status"
+fi
 service_started=1
 trap cleanup EXIT INT TERM
 
 output="benchmark-results/$mode-$scenario.json"
 environment_output="benchmark-results/$mode-$scenario.environment.txt"
 if [[ "$mode" == "sustained" ]]; then
-  ./benchmarks/capture-environment.sh "$environment_output"
+  if ./benchmarks/capture-environment.sh "$environment_output"; then
+    :
+  else
+    status=$?
+    failed_phase="environment capture"
+    exit "$status"
+  fi
   echo "environment: $repo_root/$environment_output"
 fi
 if BENCHMARK_ALLOW_DESTRUCTIVE=1 "./benchmarks/run-$mode.sh" "$scenario"; then
   echo "raw JSON: $repo_root/$output"
-  ./benchmarks/summarize-results.py "$output"
+  if ./benchmarks/summarize-results.py "$output"; then
+    :
+  else
+    status=$?
+    failed_phase="result summarization"
+    exit "$status"
+  fi
 else
   status=$?
+  failed_phase="benchmark execution"
   echo "raw JSON (if written): $repo_root/$output" >&2
   exit "$status"
 fi

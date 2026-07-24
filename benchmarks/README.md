@@ -14,6 +14,20 @@ Create the database and role according to local PostgreSQL policy, for example:
 createdb -O ledger_benchmark ledger_benchmark
 ```
 
+## Canonical local validation
+
+The one local validation command is:
+
+```bash
+./scripts/validate-local.sh
+```
+
+It loads the ignored `benchmarks/local.env`, runs formatting, lint, Rust tests, and benchmark script tests, derives an administrative PostgreSQL URL by replacing only the dedicated `_benchmark` database name with `postgres`, creates the benchmark database if necessary, applies migrations to that dedicated database, and runs the independent smoke orchestration. The derived administrative URL is exported for Cargo and SQLx checks, so SQLx test database management never targets the `_benchmark` database itself. Connection credentials, host, port, and query parameters are preserved. `DATABASE_URL` must be unset or exactly that derived administrative URL; any other explicit value is rejected rather than used unsafely.
+
+`benchmarks/local.env` is sourced by Bash. Quote values containing shell-significant characters; for example, wrap a database URL with an `&` query parameter in single quotes.
+
+The local service is always stopped after startup. A cleanup failure returns nonzero even when the benchmark itself completed, because a possibly live service must not be reported as a successful clean run. The runner prints a final success or failed-phase line with its exit status.
+
 Generate a benchmark-only fixture key, then configure the service with its matching public key. Do not use a production signing key:
 
 ```bash
@@ -179,6 +193,8 @@ Concurrency levels are sorted, must be unique and nonzero, and are conservativel
 
 `account-pool` is for sustained same-currency transfer traffic over pre-created accounts; it is not a production capacity test. `--account-pool-size` defaults to 1000, has effect only for this scenario, and has a conservative local maximum of 10,000 accounts. `--operations` stays independently configurable but must be strictly larger than the pool size, ensuring measured accounts are reused.
 
+The runner writes concise lifecycle updates to stderr, so sustained runs show setup, warm-up, and measured start/completion for each concurrency level. Completion lines include elapsed time; sufficiently long setup and measured phases also show bounded `completed/expected` progress updates. The JSON result file and its schema remain unchanged.
+
 Every account starts with $100.00 and has a deterministic owner selected from the bounded logical-client set. The plan uses a seed-derived ring offset. Each phase has at most one outgoing and one incoming transfer per account, then phases execute sequentially. Therefore concurrent requests inside a phase cannot overdraft an account; phase coordination is outside individual HTTP latency samples but inside the measured wall-clock interval. Account creation, plan generation, and warm-up remain outside the interval.
 
 Small smoke command:
@@ -236,11 +252,4 @@ The version-4 JSON output has one complete raw result per requested topology and
 
 All workloads use real `POST /accounts` and `POST /transfers` calls, reusable async connections, and deterministic plans. SQL validation checks scenario-specific transfer/entry counts, balances, conservation and replay side effects; unexpected HTTP, transport, parse, or database-validation failures mark the affected level invalid. `/metrics` collection failures are reported separately from workload failures.
 
-For normal checks (which do not run a load test):
-
-```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-targets --all-features
-cargo build --workspace --release
-```
+For local PR readiness, use the canonical command above rather than running bare cargo checks separately.
