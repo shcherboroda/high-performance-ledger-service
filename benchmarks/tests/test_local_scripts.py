@@ -122,6 +122,29 @@ BENCHMARK_TELEMETRY_MODE=telemetry
             self.assertNotIn("very-secret", contents)
             self.assertNotIn("private-key-must-not-appear", contents)
 
+    def test_environment_capture_uses_defaults_when_optional_tools_fail(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary) / "environment.txt"
+            tools = Path(temporary) / "tools"; tools.mkdir()
+            for name in ("lscpu", "findmnt", "lsblk", "psql", "docker"):
+                tool = tools / name
+                tool.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+                tool.chmod(0o755)
+            environment = os.environ | {"PATH": f"{tools}:{os.environ['PATH']}", "BENCHMARK_DATABASE_URL": "postgres://localhost/ledger_benchmark", "SERVICE_URLS": "http://127.0.0.1:3000"}
+            environment.pop("DB_MIN_CONNECTIONS", None); environment.pop("DB_MAX_CONNECTIONS", None)
+            completed = subprocess.run([str(BENCHMARKS / "capture-environment.sh"), str(artifact)], cwd=BENCHMARKS.parent, env=environment, text=True, capture_output=True, check=False)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            contents = artifact.read_text(encoding="utf-8")
+            self.assertIn("db_min_connections=0 (service default)", contents)
+            self.assertIn("db_max_connections=10 (service default)", contents)
+            self.assertIn("postgresql_server_version=unavailable", contents)
+            self.assertIn("docker_engine_version=unavailable", contents)
+
+    def test_run_local_accepts_sustained_mode(self):
+        source = (BENCHMARKS / "run-local.sh").read_text(encoding="utf-8")
+        self.assertIn('"$1" != "sustained"', source)
+        self.assertIn('environment_output="benchmark-results/$mode-$scenario.environment.txt"', source)
+
 
 if __name__ == "__main__":
     unittest.main()
