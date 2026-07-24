@@ -90,6 +90,38 @@ BENCHMARK_TELEMETRY_MODE=telemetry
                     self.assertIn(expected_error, completed.stderr)
                     self.assertNotIn("starting local benchmark service", completed.stdout)
 
+    def test_sustained_command_arguments_for_both_scenarios(self):
+        for scenario in ("independent", "account-pool"):
+            with self.subTest(scenario=scenario):
+                arguments, _ = self.run_script("run-sustained.sh", scenario)
+                self.assertIn("8,16,32,64", arguments)
+                self.assertIn("64", arguments)
+                self.assertIn("20000", arguments)
+                self.assertIn("1000", arguments)
+                self.assertIn(f"benchmark-results/sustained-{scenario}.json", arguments)
+                self.assertNotIn(f"benchmark-results/baseline-{scenario}.json", arguments)
+                self.assertNotIn(f"benchmark-results/smoke-{scenario}.json", arguments)
+                if scenario == "account-pool":
+                    self.assertIn("--account-pool-size", arguments)
+                    self.assertIn("1000", arguments)
+
+    def test_environment_capture_redacts_database_credentials_and_records_pool(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary) / "environment.txt"
+            environment = os.environ | {
+                "BENCHMARK_DATABASE_URL": "postgres://user:very-secret@db.example/ledger_benchmark",
+                "SERVICE_URLS": "http://127.0.0.1:3000", "DB_MIN_CONNECTIONS": "3", "DB_MAX_CONNECTIONS": "17",
+                "BENCHMARK_JWT_PRIVATE_KEY": "private-key-must-not-appear",
+            }
+            completed = subprocess.run([str(BENCHMARKS / "capture-environment.sh"), str(artifact)], cwd=BENCHMARKS.parent, env=environment, text=True, capture_output=True, check=False)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            contents = artifact.read_text(encoding="utf-8")
+            self.assertIn("db_min_connections=3 (configured)", contents)
+            self.assertIn("db_max_connections=17 (configured)", contents)
+            self.assertIn("database_endpoint=postgres://db.example/ledger_benchmark", contents)
+            self.assertNotIn("very-secret", contents)
+            self.assertNotIn("private-key-must-not-appear", contents)
+
 
 if __name__ == "__main__":
     unittest.main()
