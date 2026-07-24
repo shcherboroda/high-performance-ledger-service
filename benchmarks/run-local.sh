@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Orchestrates one local smoke benchmark using the existing lifecycle and workload scripts.
+# Orchestrates one local benchmark using the existing lifecycle and workload scripts.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 usage() {
-  echo "usage: $0 [--config <path>] smoke {independent|account-pool}" >&2
+  echo "usage: $0 [--config <path>] {smoke|baseline} {independent|account-pool}" >&2
 }
 
 config_path="benchmarks/local.env"
@@ -15,10 +15,11 @@ if [[ "${1:-}" == "--config" ]]; then
   config_path="$2"
   shift 2
 fi
-if [[ $# -ne 2 || "$1" != "smoke" || ( "$2" != "independent" && "$2" != "account-pool" ) ]]; then
+if [[ $# -ne 2 || ( "$1" != "smoke" && "$1" != "baseline" ) || ( "$2" != "independent" && "$2" != "account-pool" ) ]]; then
   usage
   exit 2
 fi
+mode="$1"
 scenario="$2"
 
 if [[ ! -r "$config_path" ]]; then
@@ -76,8 +77,8 @@ cleanup() {
 service_started=1
 trap cleanup EXIT INT TERM
 
-output="benchmark-results/smoke-$scenario.json"
-if BENCHMARK_ALLOW_DESTRUCTIVE=1 ./benchmarks/run-smoke.sh "$scenario"; then
+output="benchmark-results/$mode-$scenario.json"
+if BENCHMARK_ALLOW_DESTRUCTIVE=1 "./benchmarks/run-$mode.sh" "$scenario"; then
   echo "raw JSON: $repo_root/$output"
   ./benchmarks/summarize-results.py "$output"
 else
