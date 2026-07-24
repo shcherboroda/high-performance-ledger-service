@@ -27,7 +27,7 @@ BENCHMARK_TELEMETRY_MODE=telemetry
 
     def validation_root(self, temporary):
         root = Path(temporary) / "repo"
-        shutil.copytree(BENCHMARKS.parent, root, ignore=shutil.ignore_patterns(".git", "target", "benchmark-results", "__pycache__"))
+        shutil.copytree(BENCHMARKS.parent, root, ignore=shutil.ignore_patterns(".git", "target", "benchmark-results", "__pycache__", "local.env"))
         tools = root / "tools"; tools.mkdir()
         for name, body in {
             "git": "#!/usr/bin/env bash\nexit 0\n",
