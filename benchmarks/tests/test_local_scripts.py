@@ -1,6 +1,7 @@
 import os
 import subprocess
 import tempfile
+import shutil
 import unittest
 from pathlib import Path
 
@@ -89,6 +90,92 @@ BENCHMARK_TELEMETRY_MODE=telemetry
                     self.assertEqual(completed.returncode, 2)
                     self.assertIn(expected_error, completed.stderr)
                     self.assertNotIn("starting local benchmark service", completed.stdout)
+
+    def test_sustained_command_arguments_for_both_scenarios(self):
+        for scenario in ("independent", "account-pool"):
+            with self.subTest(scenario=scenario):
+                arguments, _ = self.run_script("run-sustained.sh", scenario)
+                self.assertIn("8,16,32,64", arguments)
+                self.assertIn("64", arguments)
+                self.assertIn("20000", arguments)
+                self.assertIn("1000", arguments)
+                self.assertIn(f"benchmark-results/sustained-{scenario}.json", arguments)
+                self.assertNotIn(f"benchmark-results/baseline-{scenario}.json", arguments)
+                self.assertNotIn(f"benchmark-results/smoke-{scenario}.json", arguments)
+                if scenario == "account-pool":
+                    self.assertIn("--account-pool-size", arguments)
+                    self.assertIn("1000", arguments)
+
+    def test_environment_capture_redacts_database_credentials_and_records_pool(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary) / "environment.txt"
+            environment = os.environ | {
+                "BENCHMARK_DATABASE_URL": "postgres://user:very-secret@db.example/ledger_benchmark",
+                "SERVICE_URLS": "http://127.0.0.1:3000", "DB_MIN_CONNECTIONS": "3", "DB_MAX_CONNECTIONS": "17",
+                "BENCHMARK_JWT_PRIVATE_KEY": "private-key-must-not-appear",
+            }
+            completed = subprocess.run([str(BENCHMARKS / "capture-environment.sh"), str(artifact)], cwd=BENCHMARKS.parent, env=environment, text=True, capture_output=True, check=False)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            contents = artifact.read_text(encoding="utf-8")
+            self.assertIn("db_min_connections=3 (configured)", contents)
+            self.assertIn("db_max_connections=17 (configured)", contents)
+            self.assertIn("database_endpoint=postgres://db.example/ledger_benchmark", contents)
+            self.assertNotIn("very-secret", contents)
+            self.assertNotIn("private-key-must-not-appear", contents)
+
+    def test_environment_capture_uses_defaults_when_optional_tools_fail(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary) / "environment.txt"
+            tools = Path(temporary) / "tools"; tools.mkdir()
+            for name in ("lscpu", "findmnt", "lsblk", "psql", "docker"):
+                tool = tools / name
+                tool.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+                tool.chmod(0o755)
+            environment = os.environ | {"PATH": f"{tools}:{os.environ['PATH']}", "BENCHMARK_DATABASE_URL": "postgres://localhost/ledger_benchmark", "SERVICE_URLS": "http://127.0.0.1:3000"}
+            environment.pop("DB_MIN_CONNECTIONS", None); environment.pop("DB_MAX_CONNECTIONS", None)
+            completed = subprocess.run([str(BENCHMARKS / "capture-environment.sh"), str(artifact)], cwd=BENCHMARKS.parent, env=environment, text=True, capture_output=True, check=False)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            contents = artifact.read_text(encoding="utf-8")
+            self.assertIn("db_min_connections=0 (service default)", contents)
+            self.assertIn("db_max_connections=10 (service default)", contents)
+            self.assertIn("postgresql_server_version=unavailable", contents)
+            self.assertIn("docker_engine_version=unavailable", contents)
+
+    def test_run_local_orchestrates_sustained_without_changing_smoke_or_baseline_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "repo"
+            shutil.copytree(BENCHMARKS.parent, root, ignore=shutil.ignore_patterns(".git", "target", "benchmark-results", "__pycache__"))
+            events = root / "events"
+            for name, body in {
+                "run-local-service.sh": '#!/usr/bin/env bash\nprintf service >>"$EVENTS"\n',
+                "stop-local-service.sh": '#!/usr/bin/env bash\nprintf stop >>"$EVENTS"\n',
+                "capture-environment.sh": '#!/usr/bin/env bash\nprintf " capture:%s" "$1" >>"$EVENTS"\n',
+                "run-sustained.sh": '#!/usr/bin/env bash\nprintf " sustained:%s" "$1" >>"$EVENTS"\n',
+                "run-smoke.sh": '#!/usr/bin/env bash\nprintf " smoke:%s" "$1" >>"$EVENTS"\n',
+                "run-baseline.sh": '#!/usr/bin/env bash\nprintf " baseline:%s" "$1" >>"$EVENTS"\n',
+                "summarize-results.py": '#!/usr/bin/env bash\n',
+            }.items():
+                path = root / "benchmarks" / name
+                path.write_text(body, encoding="utf-8"); path.chmod(0o755)
+            key = root / "key.pem"; key.write_text("key", encoding="utf-8")
+            config = root / "local.env"
+            config.write_text(f"""BENCHMARK_DATABASE_URL=postgres://localhost/ledger_benchmark
+SERVICE_URLS=http://127.0.0.1:3000
+BENCHMARK_JWT_ISSUER=issuer
+BENCHMARK_JWT_AUDIENCE=audience
+BENCHMARK_JWT_PRIVATE_KEY={key}
+BENCHMARK_JWT_PUBLIC_KEY={key}
+BENCHMARK_JWT_LIFETIME_SECS=28800
+RUST_LOG=warn
+BENCHMARK_DB_POOL_ASSUMPTIONS=pool
+BENCHMARK_TELEMETRY_MODE=telemetry
+""", encoding="utf-8")
+            environment = os.environ | {"EVENTS": str(events)}
+            for mode, expected in (("sustained", "capture:benchmark-results/sustained-independent.environment.txt sustained:independent"), ("smoke", "smoke:independent"), ("baseline", "baseline:independent")):
+                events.write_text("", encoding="utf-8")
+                completed = subprocess.run([str(root / "benchmarks" / "run-local.sh"), "--config", str(config), mode, "independent"], cwd=root, env=environment, text=True, capture_output=True, check=False)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertIn(expected, events.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

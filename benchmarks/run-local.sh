@@ -6,7 +6,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 usage() {
-  echo "usage: $0 [--config <path>] {smoke|baseline} {independent|account-pool}" >&2
+  echo "usage: $0 [--config <path>] {smoke|baseline|sustained} {independent|account-pool}" >&2
 }
 
 config_path="benchmarks/local.env"
@@ -15,7 +15,7 @@ if [[ "${1:-}" == "--config" ]]; then
   config_path="$2"
   shift 2
 fi
-if [[ $# -ne 2 || ( "$1" != "smoke" && "$1" != "baseline" ) || ( "$2" != "independent" && "$2" != "account-pool" ) ]]; then
+if [[ $# -ne 2 || ( "$1" != "smoke" && "$1" != "baseline" && "$1" != "sustained" ) || ( "$2" != "independent" && "$2" != "account-pool" ) ]]; then
   usage
   exit 2
 fi
@@ -82,6 +82,11 @@ service_started=1
 trap cleanup EXIT INT TERM
 
 output="benchmark-results/$mode-$scenario.json"
+environment_output="benchmark-results/$mode-$scenario.environment.txt"
+if [[ "$mode" == "sustained" ]]; then
+  ./benchmarks/capture-environment.sh "$environment_output"
+  echo "environment: $repo_root/$environment_output"
+fi
 if BENCHMARK_ALLOW_DESTRUCTIVE=1 "./benchmarks/run-$mode.sh" "$scenario"; then
   echo "raw JSON: $repo_root/$output"
   ./benchmarks/summarize-results.py "$output"

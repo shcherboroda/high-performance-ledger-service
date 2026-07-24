@@ -71,6 +71,7 @@ cargo build --release -p rust-backend-technical-assessment
 
 echo "starting local benchmark service on $bind_address"
 RUST_LOG="${RUST_LOG:-warn}" BIND_ADDRESS="$bind_address" DATABASE_URL="$BENCHMARK_DATABASE_URL" \
+  DB_MIN_CONNECTIONS="${DB_MIN_CONNECTIONS:-0}" DB_MAX_CONNECTIONS="${DB_MAX_CONNECTIONS:-10}" \
   JWT_ISSUER="$BENCHMARK_JWT_ISSUER" JWT_AUDIENCE="$BENCHMARK_JWT_AUDIENCE" \
   JWT_PUBLIC_KEY_PEM="$JWT_PUBLIC_KEY_PEM" "$service_binary" >"$log_file" 2>&1 &
 service_pid=$!

@@ -48,6 +48,8 @@ cp benchmarks/local.env.example benchmarks/local.env
 ./benchmarks/run-local.sh smoke account-pool
 ./benchmarks/run-local.sh baseline independent
 ./benchmarks/run-local.sh baseline account-pool
+./benchmarks/run-local.sh sustained independent
+./benchmarks/run-local.sh sustained account-pool
 ```
 
 Use another configuration file when needed with
@@ -68,6 +70,26 @@ Every level has 2,000 measured operations, 100 warm-up operations, and 32 logica
 replace smoke output: `benchmark-results/baseline-independent.json` and
 `benchmark-results/baseline-account-pool.json`. The comparison table includes adjacent throughput
 ratios within each topology.
+
+Sustained sweeps are the longer local profile for interpreting stable throughput, tail latency, and
+the next concurrency level. They use one service instance, concurrency levels `8,16,32,64`, 64
+logical clients, 20,000 measured operations and 1,000 warm-up operations at every level.
+`account-pool` uses 1,000 accounts. They write only
+`benchmark-results/sustained-independent.json` or
+`benchmark-results/sustained-account-pool.json`, plus the matching deterministic sidecar
+`*.environment.txt`; neither path overlaps a smoke or baseline artifact. The sidecar captures a
+sanitized database endpoint, effective configured DB pool limits (or the service defaults of min 0
+and max 10), host/software details, PostgreSQL version when `psql` is available, and local service
+metadata. It intentionally omits credentials, complete database URLs, keys, and environment dumps.
+Keep the raw JSON and its identically named environment file together when comparing runs.
+
+Here, **concurrency** is the maximum number of in-flight `POST /transfers` requests. It is not a
+count of Tokio threads, database connections, accounts, or service instances. **Logical clients**
+are the deterministic authenticated identities used to construct the workload; many requests may
+be in flight independently of that count. Use smoke for quick functional confirmation, baseline
+for short local comparisons, and sustained for longer local observations. All local results remain
+specific to the captured host and configuration; they are not production capacity claims or a
+recommendation to change a production pool size.
 
 Raw JSON is written under `benchmark-results/`; local service logs and PID files are at
 `benchmark-results/local-service.log` and `benchmark-results/local-service.pid`. The low-level
