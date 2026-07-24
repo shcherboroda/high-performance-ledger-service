@@ -22,7 +22,12 @@ if [[ -z "${BENCHMARK_DATABASE_URL:-}" ]]; then
   exit 2
 fi
 
-if [[ ! "$BENCHMARK_DATABASE_URL" =~ ^(postgres|postgresql)://[^/?#]+/([A-Za-z0-9_]+)(\?[^#]*)?$ ]]; then
+database_base_url="${BENCHMARK_DATABASE_URL%%\?*}"
+database_query=""
+if [[ "$BENCHMARK_DATABASE_URL" == *\?* ]]; then
+  database_query="?${BENCHMARK_DATABASE_URL#*\?}"
+fi
+if [[ "$database_query" == *#* || ! "$database_base_url" =~ ^(postgres|postgresql)://[^/?#]+/([A-Za-z0-9_]+)$ ]]; then
   echo "error: BENCHMARK_DATABASE_URL must be a PostgreSQL URL with one ASCII database name" >&2
   exit 2
 fi
@@ -31,11 +36,9 @@ if [[ "$benchmark_database_name" != *_benchmark ]]; then
   echo "error: BENCHMARK_DATABASE_URL database name must end in _benchmark" >&2
   exit 2
 fi
-admin_database_url="${BENCHMARK_DATABASE_URL%/$benchmark_database_name*}/postgres"
-if [[ "$BENCHMARK_DATABASE_URL" == *\?* ]]; then
-  admin_database_url+="?${BENCHMARK_DATABASE_URL#*\?}"
-fi
-if [[ "$admin_database_url" == "$BENCHMARK_DATABASE_URL" || "$admin_database_url" == *"/${benchmark_database_name}"* ]]; then
+admin_database_base_url="${database_base_url%/$benchmark_database_name}/postgres"
+admin_database_url="$admin_database_base_url$database_query"
+if [[ "$admin_database_base_url" == "$database_base_url" || "$admin_database_base_url" == *"/${benchmark_database_name}" ]]; then
   echo "error: refusing to use the benchmark database as the SQLx administrative URL" >&2
   exit 2
 fi

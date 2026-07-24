@@ -220,17 +220,17 @@ BENCHMARK_TELEMETRY_MODE=telemetry
         with tempfile.TemporaryDirectory() as temporary:
             root, tools = self.validation_root(temporary)
             key = root / "key.pem"; key.write_text("key", encoding="utf-8")
-            self.write_local_config(root / "benchmarks" / "local.env", key, "postgresql://user:secret@db.example:5544/ledger_benchmark?sslmode=require")
+            self.write_local_config(root / "benchmarks" / "local.env", key, "postgresql://user:secret@db.example:5544/ledger_benchmark?sslmode=require&application_name=/ledger_benchmark")
             calls = root / "sqlx-calls"
             runner = root / "benchmarks" / "run-local.sh"
             runner.write_text("#!/usr/bin/env bash\nprintf runner >>\"$EVENTS\"\n", encoding="utf-8"); runner.chmod(0o755)
             events = root / "events"
-            environment = os.environ | {"PATH": f"{tools}:{os.environ['PATH']}", "SQLX_CALLS": str(calls), "EVENTS": str(events), "DATABASE_URL": "postgresql://user:secret@db.example:5544/postgres?sslmode=require"}
+            environment = os.environ | {"PATH": f"{tools}:{os.environ['PATH']}", "SQLX_CALLS": str(calls), "EVENTS": str(events), "DATABASE_URL": "postgresql://user:secret@db.example:5544/postgres?sslmode=require&application_name=/ledger_benchmark"}
             completed = subprocess.run([str(root / "scripts" / "validate-local.sh")], cwd=root, env=environment, text=True, capture_output=True, check=False)
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(calls.read_text(encoding="utf-8").splitlines(), [
-                "database postgresql://user:secret@db.example:5544/postgres?sslmode=require",
-                "migrate postgresql://user:secret@db.example:5544/ledger_benchmark?sslmode=require",
+                "database postgresql://user:secret@db.example:5544/postgres?sslmode=require&application_name=/ledger_benchmark",
+                "migrate postgresql://user:secret@db.example:5544/ledger_benchmark?sslmode=require&application_name=/ledger_benchmark",
             ])
             self.assertEqual(events.read_text(encoding="utf-8"), "runner")
 
