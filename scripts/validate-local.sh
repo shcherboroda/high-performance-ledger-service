@@ -46,6 +46,7 @@ if [[ -n "${DATABASE_URL:-}" && "$DATABASE_URL" != "$admin_database_url" ]]; the
   echo "error: DATABASE_URL must be unset or exactly the derived PostgreSQL administrative URL" >&2
   exit 2
 fi
+export DATABASE_URL="$admin_database_url"
 
 git diff --check
 cargo fmt --all --check

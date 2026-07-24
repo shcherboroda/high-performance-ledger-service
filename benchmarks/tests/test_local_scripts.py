@@ -31,7 +31,7 @@ BENCHMARK_TELEMETRY_MODE=telemetry
         tools = root / "tools"; tools.mkdir()
         for name, body in {
             "git": "#!/usr/bin/env bash\nexit 0\n",
-            "cargo": "#!/usr/bin/env bash\nexit 0\n",
+            "cargo": "#!/usr/bin/env bash\nprintf '%s|%s\\n' \"$*\" \"${DATABASE_URL:-missing}\" >>\"$CARGO_CALLS\"\n",
             "python3": "#!/usr/bin/env bash\nexit 0\n",
             "sqlx": "#!/usr/bin/env bash\nprintf '%s %s\\n' \"$1\" \"$DATABASE_URL\" >>\"$SQLX_CALLS\"\n",
         }.items():
@@ -223,15 +223,21 @@ BENCHMARK_TELEMETRY_MODE=telemetry
             key = root / "key.pem"; key.write_text("key", encoding="utf-8")
             self.write_local_config(root / "benchmarks" / "local.env", key, "postgresql://user:secret@db.example:5544/ledger_benchmark?sslmode=require&application_name=/ledger_benchmark")
             calls = root / "sqlx-calls"
+            cargo_calls = root / "cargo-calls"
             runner = root / "benchmarks" / "run-local.sh"
             runner.write_text("#!/usr/bin/env bash\nprintf runner >>\"$EVENTS\"\n", encoding="utf-8"); runner.chmod(0o755)
             events = root / "events"
-            environment = os.environ | {"PATH": f"{tools}:{os.environ['PATH']}", "SQLX_CALLS": str(calls), "EVENTS": str(events), "DATABASE_URL": "postgresql://user:secret@db.example:5544/postgres?sslmode=require&application_name=/ledger_benchmark"}
+            environment = os.environ | {"PATH": f"{tools}:{os.environ['PATH']}", "SQLX_CALLS": str(calls), "CARGO_CALLS": str(cargo_calls), "EVENTS": str(events), "DATABASE_URL": "postgresql://user:secret@db.example:5544/postgres?sslmode=require&application_name=/ledger_benchmark"}
             completed = subprocess.run([str(root / "scripts" / "validate-local.sh")], cwd=root, env=environment, text=True, capture_output=True, check=False)
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(calls.read_text(encoding="utf-8").splitlines(), [
                 "database postgresql://user:secret@db.example:5544/postgres?sslmode=require&application_name=/ledger_benchmark",
                 "migrate postgresql://user:secret@db.example:5544/ledger_benchmark?sslmode=require&application_name=/ledger_benchmark",
+            ])
+            self.assertEqual(cargo_calls.read_text(encoding="utf-8").splitlines(), [
+                "fmt --all --check|postgresql://user:secret@db.example:5544/postgres?sslmode=require&application_name=/ledger_benchmark",
+                "clippy --all-targets --all-features -- -D warnings|postgresql://user:secret@db.example:5544/postgres?sslmode=require&application_name=/ledger_benchmark",
+                "test --all-targets --all-features|postgresql://user:secret@db.example:5544/postgres?sslmode=require&application_name=/ledger_benchmark",
             ])
             self.assertEqual(events.read_text(encoding="utf-8"), "runner")
 
