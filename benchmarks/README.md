@@ -14,6 +14,18 @@ Create the database and role according to local PostgreSQL policy, for example:
 createdb -O ledger_benchmark ledger_benchmark
 ```
 
+## Canonical local validation
+
+The one local validation command is:
+
+```bash
+./scripts/validate-local.sh
+```
+
+It loads the ignored `benchmarks/local.env`, runs formatting, lint, Rust tests, and benchmark script tests, derives an administrative PostgreSQL URL by replacing only the dedicated `_benchmark` database name with `postgres`, creates the benchmark database if necessary, applies migrations to that dedicated database, and runs the independent smoke orchestration. Connection credentials, host, port, and query parameters are preserved. `DATABASE_URL` must be unset or exactly that derived administrative URL; any other explicit value is rejected rather than used unsafely. SQLx database creation never uses the `_benchmark` URL itself.
+
+The local service is always stopped after startup. A cleanup failure returns nonzero even when the benchmark itself completed, because a possibly live service must not be reported as a successful clean run. The runner prints a final success or failed-phase line with its exit status.
+
 Generate a benchmark-only fixture key, then configure the service with its matching public key. Do not use a production signing key:
 
 ```bash
@@ -238,11 +250,4 @@ The version-4 JSON output has one complete raw result per requested topology and
 
 All workloads use real `POST /accounts` and `POST /transfers` calls, reusable async connections, and deterministic plans. SQL validation checks scenario-specific transfer/entry counts, balances, conservation and replay side effects; unexpected HTTP, transport, parse, or database-validation failures mark the affected level invalid. `/metrics` collection failures are reported separately from workload failures.
 
-For normal checks (which do not run a load test):
-
-```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-targets --all-features
-cargo build --workspace --release
-```
+For local PR readiness, use the canonical command above rather than running bare cargo checks separately.
