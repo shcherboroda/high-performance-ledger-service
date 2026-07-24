@@ -425,6 +425,7 @@ mod tests {
     use std::{
         io::{self, Write},
         sync::{Arc, Mutex},
+        time::Duration,
     };
 
     use axum::{
@@ -446,6 +447,42 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    fn metric_value(name: &str, labels: &[&str]) -> f64 {
+        metrics_handle()
+            .render()
+            .lines()
+            .find(|line| line.starts_with(name) && labels.iter().all(|label| line.contains(label)))
+            .and_then(|line| line.rsplit_once(' '))
+            .and_then(|(_, value)| value.parse().ok())
+            .unwrap_or(0.0)
+    }
+
+    #[tokio::test]
+    async fn http_duration_covers_downstream_response_construction() {
+        let labels = ["method=\"GET\"", "route=\"/timed-response\""];
+        let before = metric_value("ledger_http_request_duration_seconds_sum", &labels);
+        let app = Router::new()
+            .route(
+                "/timed-response",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    "constructed response"
+                }),
+            )
+            .layer(middleware::from_fn(observe_request));
+
+        let response = app
+            .oneshot(Request::get("/timed-response").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            metric_value("ledger_http_request_duration_seconds_sum", &labels) - before
+                >= Duration::from_millis(20).as_secs_f64()
+        );
     }
 
     #[test]

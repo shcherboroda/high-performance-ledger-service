@@ -62,6 +62,16 @@ def delta(before, after, name, labels):
         return None
     return right - left
 
+def delta_with_absent_as_zero(before, after, name, labels):
+    """Return a counter/histogram delta when an unobserved bounded series is absent."""
+    if before is None or after is None:
+        return None
+    left = metric_value(before, name, labels)
+    right = metric_value(after, name, labels)
+    left = 0 if left is None else left
+    right = 0 if right is None else right
+    return None if right < left else right - left
+
 def metric_deltas(before_snapshot, after_snapshot):
     before, after = parse_prometheus(before_snapshot), parse_prometheus(after_snapshot)
     operation = delta(before, after, "ledger_operations_total", {"operation": "transfer", "outcome": "success"})
@@ -71,12 +81,16 @@ def metric_deltas(before_snapshot, after_snapshot):
     db_sum = delta(before, after, "ledger_database_transaction_duration_seconds_sum", {"operation": "transfer", "outcome": "success"})
     pool_count = delta(before, after, "ledger_database_pool_acquire_duration_seconds_count", {"operation": "transfer", "outcome": "success"})
     pool_sum = delta(before, after, "ledger_database_pool_acquire_duration_seconds_sum", {"operation": "transfer", "outcome": "success"})
+    pool_failure_count = delta_with_absent_as_zero(before, after, "ledger_database_pool_acquire_duration_seconds_count", {"operation": "transfer", "outcome": "failure"})
+    pool_failure_sum = delta_with_absent_as_zero(before, after, "ledger_database_pool_acquire_duration_seconds_sum", {"operation": "transfer", "outcome": "failure"})
     return {"successful transfer operations": operation, "transfer HTTP requests": http_count,
             "transfer HTTP mean ms": None if not http_count else http_sum * 1000 / http_count if http_sum is not None else None,
             "successful transfer DB transactions": db_count,
             "successful transfer DB mean ms": None if not db_count else db_sum * 1000 / db_count if db_sum is not None else None,
             "successful transfer pool acquires": pool_count,
-            "successful transfer pool-acquire mean ms": None if not pool_count else pool_sum * 1000 / pool_count if pool_sum is not None else None}
+            "successful transfer pool-acquire mean ms": None if not pool_count else pool_sum * 1000 / pool_count if pool_sum is not None else None,
+            "failed transfer pool acquires": pool_failure_count,
+            "failed transfer pool-acquire mean ms": None if not pool_failure_count else pool_failure_sum * 1000 / pool_failure_count if pool_failure_sum is not None else None}
 
 def format_latency(latency):
     if not isinstance(latency, dict):

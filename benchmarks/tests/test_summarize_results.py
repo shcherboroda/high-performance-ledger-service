@@ -21,6 +21,8 @@ ledger_database_transaction_duration_seconds_count{outcome="success",operation="
 ledger_database_transaction_duration_seconds_sum{operation="transfer",outcome="success"} 0.02
 ledger_database_pool_acquire_duration_seconds_count{operation="transfer",outcome="success"} 2
 ledger_database_pool_acquire_duration_seconds_sum{operation="transfer",outcome="success"} 0.01
+ledger_database_pool_acquire_duration_seconds_count{operation="transfer",outcome="failure"} 1
+ledger_database_pool_acquire_duration_seconds_sum{operation="transfer",outcome="failure"} 0.02
 '''
 METRICS_AFTER = '''ledger_database_transaction_duration_seconds_sum{outcome="success",operation="transfer"} 0.08
 ledger_operations_total{reason="none",outcome="success",operation="transfer"} 8
@@ -29,6 +31,8 @@ ledger_database_transaction_duration_seconds_count{operation="transfer",outcome=
 ledger_http_request_duration_seconds_sum{route="/transfers",method="POST"} 1.0
 ledger_database_pool_acquire_duration_seconds_count{operation="transfer",outcome="success"} 5
 ledger_database_pool_acquire_duration_seconds_sum{operation="transfer",outcome="success"} 0.07
+ledger_database_pool_acquire_duration_seconds_count{operation="transfer",outcome="failure"} 3
+ledger_database_pool_acquire_duration_seconds_sum{operation="transfer",outcome="failure"} 0.06
 '''
 
 def result(valid=True):
@@ -43,9 +47,10 @@ class SummarizerTests(unittest.TestCase):
     def test_schema_v5_summary(self): self.assertEqual(summarizer.summarize(result()), 0)
     def test_label_aware_metrics_delta(self):
         deltas = summarizer.metric_deltas(METRICS_BEFORE, METRICS_AFTER)
-        self.assertEqual((deltas["successful transfer operations"], deltas["transfer HTTP requests"], deltas["successful transfer DB transactions"], deltas["successful transfer pool acquires"]), (5, 4, 3, 3))
+        self.assertEqual((deltas["successful transfer operations"], deltas["transfer HTTP requests"], deltas["successful transfer DB transactions"], deltas["successful transfer pool acquires"], deltas["failed transfer pool acquires"]), (5, 4, 3, 3, 2))
         self.assertEqual((deltas["transfer HTTP mean ms"], deltas["successful transfer DB mean ms"]), (150, 20))
         self.assertAlmostEqual(deltas["successful transfer pool-acquire mean ms"], 20)
+        self.assertAlmostEqual(deltas["failed transfer pool-acquire mean ms"], 20)
     def test_missing_or_error_metrics_are_unavailable(self): self.assertTrue(all(value is None for value in summarizer.metric_deltas({"Err": "metrics unavailable"}, "not prometheus").values()))
     def test_metric_collection_failure_is_distinct_from_workload_failure(self):
         document = result()
@@ -74,8 +79,8 @@ class SummarizerTests(unittest.TestCase):
     def test_per_instance_metric_deltas_do_not_mix_snapshots(self):
         document = result()
         level = document["topology_levels"][0]["levels"][0]
-        before_b = METRICS_BEFORE.replace("} 3", "} 30").replace("} 4", "} 40").replace("} 0.4", "} 4.0").replace("} 2", "} 20").replace("} 0.02", "} 0.20").replace("} 0.01", "} 0.10")
-        after_b = METRICS_AFTER.replace("} 8", "} 38").replace("} 5", "} 25").replace("} 1.0", "} 5.0").replace("} 0.08", "} 0.80").replace("} 0.07", "} 0.70")
+        before_b = METRICS_BEFORE.replace('ledger_operations_total{operation="transfer",outcome="success",reason="none"} 3', 'ledger_operations_total{operation="transfer",outcome="success",reason="none"} 30').replace('ledger_database_pool_acquire_duration_seconds_count{operation="transfer",outcome="success"} 2', 'ledger_database_pool_acquire_duration_seconds_count{operation="transfer",outcome="success"} 20').replace('ledger_database_pool_acquire_duration_seconds_sum{operation="transfer",outcome="success"} 0.01', 'ledger_database_pool_acquire_duration_seconds_sum{operation="transfer",outcome="success"} 0.10').replace('ledger_database_pool_acquire_duration_seconds_count{operation="transfer",outcome="failure"} 1', 'ledger_database_pool_acquire_duration_seconds_count{operation="transfer",outcome="failure"} 10').replace('ledger_database_pool_acquire_duration_seconds_sum{operation="transfer",outcome="failure"} 0.02', 'ledger_database_pool_acquire_duration_seconds_sum{operation="transfer",outcome="failure"} 0.20')
+        after_b = METRICS_AFTER.replace('ledger_operations_total{reason="none",outcome="success",operation="transfer"} 8', 'ledger_operations_total{reason="none",outcome="success",operation="transfer"} 38').replace('ledger_database_pool_acquire_duration_seconds_count{operation="transfer",outcome="success"} 5', 'ledger_database_pool_acquire_duration_seconds_count{operation="transfer",outcome="success"} 25').replace('ledger_database_pool_acquire_duration_seconds_sum{operation="transfer",outcome="success"} 0.07', 'ledger_database_pool_acquire_duration_seconds_sum{operation="transfer",outcome="success"} 0.30').replace('ledger_database_pool_acquire_duration_seconds_count{operation="transfer",outcome="failure"} 3', 'ledger_database_pool_acquire_duration_seconds_count{operation="transfer",outcome="failure"} 14').replace('ledger_database_pool_acquire_duration_seconds_sum{operation="transfer",outcome="failure"} 0.06', 'ledger_database_pool_acquire_duration_seconds_sum{operation="transfer",outcome="failure"} 0.32')
         level["metrics_before"]["http://b"] = {"Ok": before_b}
         level["metrics_after"]["http://b"] = {"Ok": after_b}
         output = io.StringIO()
@@ -84,6 +89,11 @@ class SummarizerTests(unittest.TestCase):
         self.assertEqual(len(lines), 2)
         self.assertIn("http://a: successful transfer operations=5", lines[0])
         self.assertIn("http://b: successful transfer operations=8", lines[1])
+        self.assertIn("successful transfer pool acquires=5", lines[1])
+        self.assertIn("failed transfer pool acquires=4", lines[1])
+        instance_b = summarizer.metric_deltas(before_b, after_b)
+        self.assertAlmostEqual(instance_b["successful transfer pool-acquire mean ms"], 40)
+        self.assertAlmostEqual(instance_b["failed transfer pool-acquire mean ms"], 30)
 
     def test_comparison_table_renders_adjacent_throughput_ratios(self):
         document = result()

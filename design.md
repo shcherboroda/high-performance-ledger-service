@@ -645,18 +645,24 @@ identifiers, financial values, currencies, rates, fees, fingerprints, and error 
 Transfer requests additionally report
 `ledger_database_pool_acquire_duration_seconds{operation="transfer",outcome}`. It starts
 immediately before SQLx obtains a pool connection and ends when that acquire succeeds or fails;
-`outcome` is exactly `success` or `failure` and never includes database error text. The transfer
-HTTP duration starts at the request-observability middleware and ends after the response is
-constructed, so it covers authentication, extraction, validation, pool acquisition, transaction
-execution, and response handling. The timing order is:
+`outcome` is exactly `success` or `failure` and never includes database error text. SQL `BEGIN`
+starts only after that pool timer stops, and the transaction timer starts only after `BEGIN`
+succeeds; the `BEGIN` interval itself is deliberately measured by neither histogram. The
+transaction timer includes all work after `BEGIN`, including construction of the successful HTTP
+response, and ends after commit or rollback abandonment. The transfer HTTP duration starts after
+request-ID, method, route, and span middleware setup, immediately before the downstream handler,
+and ends as soon as that handler returns its response. It therefore excludes that setup and
+post-response metric recording, logging, and request-ID response-header insertion. The timing
+order is:
 
-`client end-to-end -> service HTTP handler -> pool acquire wait -> database transaction -> remaining response work`
+`client end-to-end -> middleware setup -> service handler -> pool acquire wait -> unmeasured BEGIN -> database transaction (including response construction) -> handler return -> post-response metrics/log/header work`
 
-These durations overlap: HTTP contains both pool-acquire and transaction time, while pool acquire
-precedes (and does not overlap) transaction time. They must not be added together. Benchmark
-reports retain process-local before/after snapshots per service URL and calculate per-instance
-deltas and means for HTTP, pool-acquire, and successful transaction histograms. A failed snapshot
-collection is explicitly recorded separately from workload and correctness validity. Benchmark
+These durations overlap: HTTP contains pool-acquire, unmeasured `BEGIN`, and transaction time,
+while pool acquire precedes (and does not overlap) transaction time. They must not be added
+together. Benchmark reports retain process-local before/after snapshots per service URL and
+calculate per-instance deltas and means for HTTP, successful pool-acquire, failed pool-acquire,
+and successful transaction histograms. A failed snapshot collection is explicitly recorded
+separately from workload and correctness validity. Benchmark
 result schema v5 adds `metrics_collection_valid` for that distinction; schema-v4 readers must be
 upgraded to the paired v5 summarizer rather than interpreting a changed result implicitly.
 
