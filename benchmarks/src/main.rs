@@ -6,11 +6,12 @@ use ledger_benchmarks::{
     config::{Config, Scenario},
     dataset::{self, ScenarioPlan, TransferPlan},
     http,
+    progress::{ProgressPhase, ProgressReporter},
     result::{self, LevelResult, ResultDocument, TopologyLevelResult},
     stats, verify,
 };
 use serde::Serialize;
-use std::{collections::BTreeMap, process::Command, sync::Arc, time::Instant};
+use std::{collections::BTreeMap, io, process::Command, sync::Arc, time::Instant};
 use tokio::{sync::Semaphore, task::JoinSet};
 use uuid::Uuid;
 #[derive(Serialize)]
@@ -39,6 +40,8 @@ async fn run() -> Result<()> {
         .connect(&config.database_url)
         .await?;
     let mut topology_levels = Vec::new();
+    let stderr = io::stderr();
+    let mut progress = ProgressReporter::new(stderr.lock());
     for instances in config.instance_levels()? {
         let urls = config.service_urls[..instances].to_vec();
         let http = Arc::new(http::Http::new(urls.clone(), config.request_timeout())?);
@@ -53,7 +56,7 @@ async fn run() -> Result<()> {
         let mut levels = Vec::new();
         let mut workload_failures = Vec::new();
         for concurrency in config.levels()? {
-            match run_level(&config, &pool, &http, &tokens, concurrency).await {
+            match run_level(&config, &pool, &http, &tokens, concurrency, &mut progress).await {
                 Ok(level) => levels.push(level),
                 Err(error) => workload_failures.push(result::WorkloadFailure {
                     concurrency,
@@ -88,14 +91,14 @@ async fn readiness(http: &http::Http) -> BTreeMap<String, Result<(), String>> {
     }
     results
 }
-async fn run_level(
+async fn run_level<W: io::Write>(
     config: &Config,
     pool: &sqlx::PgPool,
     http: &Arc<http::Http>,
     tokens: &[String],
     concurrency: usize,
+    progress: &mut ProgressReporter<W>,
 ) -> Result<LevelResult> {
-    dataset::migrate_and_clean(pool, config.seed).await?;
     let scenario = match config.scenario {
         Scenario::Independent => ScenarioPlan::Independent,
         Scenario::HotAccount => ScenarioPlan::HotAccount,
@@ -119,18 +122,26 @@ async fn run_level(
             config.operations,
         )
     };
-    let (accounts, pool_ids) = prepare(config, http, tokens, &plans).await?;
+    let mut setup = progress.phase(concurrency, "setup", setup_operations(config, &plans));
+    let setup_started = Instant::now();
+    dataset::migrate_and_clean(pool, config.seed).await?;
+    let (accounts, pool_ids) = prepare(config, http, tokens, &plans, &mut setup).await?;
     let (warmup, prepared_ids, replay_before) = if config.scenario == Scenario::IdempotentReplay {
-        let originals = run_phase(http, tokens, &plans, &accounts, concurrency).await;
+        let originals = run_phase(http, tokens, &plans, &accounts, concurrency, &mut setup).await;
         let prepared_ids = transfer_ids_by_key(&originals)?;
+        setup.finish(setup_started.elapsed());
+        let warmup_started = Instant::now();
+        let mut warmup_progress = progress.phase(concurrency, "warm-up", config.warmup_operations);
         let warmup = run_phase(
             http,
             tokens,
             &plans[..config.warmup_operations],
             &accounts[..config.warmup_operations],
             concurrency,
+            &mut warmup_progress,
         )
         .await;
+        warmup_progress.finish(warmup_started.elapsed());
         let keys = plans
             .iter()
             .map(|plan| plan.key.clone())
@@ -144,22 +155,25 @@ async fn run_level(
         .await?;
         (warmup, prepared_ids, Some(before))
     } else {
-        (
-            run_operations(
+        setup.finish(setup_started.elapsed());
+        let warmup_started = Instant::now();
+        let mut warmup_progress = progress.phase(concurrency, "warm-up", config.warmup_operations);
+        let warmup = run_operations(
                 config,
                 http,
                 tokens,
                 &plans[..config.warmup_operations],
                 &accounts[..config.warmup_operations],
                 concurrency,
+                &mut warmup_progress,
             )
-            .await,
-            BTreeMap::new(),
-            None,
-        )
+            .await;
+        warmup_progress.finish(warmup_started.elapsed());
+        (warmup, BTreeMap::new(), None)
     };
     let metrics_before = metrics(http).await;
     let started = Instant::now();
+    let mut measured_progress = progress.phase(concurrency, "measured", config.operations);
     let measured = run_operations(
         config,
         http,
@@ -167,9 +181,11 @@ async fn run_level(
         &plans[config.warmup_operations..],
         &accounts[config.warmup_operations..],
         concurrency,
+        &mut measured_progress,
     )
     .await;
     let elapsed = started.elapsed();
+    measured_progress.finish(elapsed);
     let metrics_after = metrics(http).await;
     let metrics_valid =
         metrics_before.values().all(Result::is_ok) && metrics_after.values().all(Result::is_ok);
@@ -284,11 +300,20 @@ fn transfer_ids_by_key(operations: &[http::Operation]) -> Result<BTreeMap<String
     }
     Ok(ids)
 }
-async fn prepare(
+fn setup_operations(config: &Config, plans: &[TransferPlan]) -> usize {
+    match config.scenario {
+        Scenario::AccountPool => config.account_pool_size,
+        Scenario::HotAccount => plans.iter().map(|plan| plan.source).max().unwrap_or(0) + 1 + plans.len(),
+        Scenario::Independent => plans.len() * 2,
+        Scenario::IdempotentReplay => plans.len() * 3,
+    }
+}
+async fn prepare<W: io::Write>(
     config: &Config,
     http: &http::Http,
     tokens: &[String],
     plans: &[TransferPlan],
+    progress: &mut ProgressPhase<'_, W>,
 ) -> Result<(Vec<(Uuid, Uuid)>, Option<Vec<Uuid>>)> {
     if config.scenario == Scenario::AccountPool {
         let mut pool_ids = Vec::with_capacity(config.account_pool_size);
@@ -302,6 +327,7 @@ async fn prepare(
                 )
                 .await?,
             );
+            progress.complete_operation();
         }
         return Ok((
             plans
@@ -333,6 +359,7 @@ async fn prepare(
                 )
                 .await?,
             );
+            progress.complete_operation();
         }
         for (index, plan) in plans.iter().enumerate() {
             let destination = http
@@ -343,6 +370,7 @@ async fn prepare(
                     "10.00",
                 )
                 .await?;
+            progress.complete_operation();
             result.push((source_ids[plan.source], destination))
         }
     } else {
@@ -355,6 +383,7 @@ async fn prepare(
                     "10.00",
                 )
                 .await?;
+            progress.complete_operation();
             let destination = http
                 .create_account(
                     index * 2 + 1,
@@ -363,37 +392,40 @@ async fn prepare(
                     "10.00",
                 )
                 .await?;
+            progress.complete_operation();
             result.push((source, destination))
         }
     }
     Ok((result, None))
 }
-async fn run_operations(
+async fn run_operations<W: io::Write>(
     config: &Config,
     http: &Arc<http::Http>,
     tokens: &[String],
     plans: &[TransferPlan],
     accounts: &[(Uuid, Uuid)],
     concurrency: usize,
+    progress: &mut ProgressPhase<'_, W>,
 ) -> Vec<http::Operation> {
     if config.scenario != Scenario::AccountPool {
-        return run_phase(http, tokens, plans, accounts, concurrency).await;
+        return run_phase(http, tokens, plans, accounts, concurrency, progress).await;
     }
     let mut operations = Vec::with_capacity(plans.len());
     for (plans, accounts) in plans
         .chunks(config.account_pool_size)
         .zip(accounts.chunks(config.account_pool_size))
     {
-        operations.extend(run_phase(http, tokens, plans, accounts, concurrency).await);
+        operations.extend(run_phase(http, tokens, plans, accounts, concurrency, progress).await);
     }
     operations
 }
-async fn run_phase(
+async fn run_phase<W: io::Write>(
     http: &Arc<http::Http>,
     tokens: &[String],
     plans: &[TransferPlan],
     accounts: &[(Uuid, Uuid)],
     concurrency: usize,
+    progress: &mut ProgressPhase<'_, W>,
 ) -> Vec<http::Operation> {
     let sem = Arc::new(Semaphore::new(concurrency));
     let mut set = JoinSet::new();
@@ -414,7 +446,8 @@ async fn run_phase(
     }
     let mut operations = Vec::with_capacity(plans.len());
     while let Some(operation) = set.join_next().await {
-        operations.push(operation.expect("benchmark task must not panic"))
+        operations.push(operation.expect("benchmark task must not panic"));
+        progress.complete_operation();
     }
     operations
 }

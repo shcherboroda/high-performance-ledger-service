@@ -242,6 +242,7 @@ mod tests {
         assert_eq!(value["account_pool_size"], 2);
         assert_eq!(value["phase_count"], 2);
         assert_eq!(value["phase_model"], "ring phases");
+        assert!(!value.as_object().unwrap().contains_key("progress"));
     }
     #[test]
     fn topology_summary_compares_each_matching_concurrency_level() {
