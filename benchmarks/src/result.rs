@@ -168,7 +168,25 @@ pub fn write(path: &Path, result: &ResultDocument) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::http::Classifications;
+    use crate::progress::ProgressReporter;
     use crate::verify::Verification;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
     #[test]
     fn matrix_aggregates_levels() {
         let l = |concurrency, throughput, valid| LevelResult {
@@ -197,6 +215,48 @@ mod tests {
         let s = summarize(&[l(1, 10., true), l(2, 15., true)]);
         assert_eq!(s.highest_valid_tested_level, Some(2));
         assert_eq!(s.adjacent_throughput_changes, vec![0.5]);
+    }
+    #[test]
+    fn runner_stderr_progress_does_not_alter_the_json_report() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("result.json");
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        {
+            let mut progress = ProgressReporter::stderr_with(Capture(stderr.clone()));
+            let mut measured = progress.phase(2, "measured", 20);
+            for _ in 0..20 {
+                measured.complete_operation();
+            }
+            measured.finish(Duration::from_millis(1));
+            write(
+                &path,
+                &ResultDocument {
+                    schema_version: SCHEMA_VERSION,
+                    generated_at_utc: Utc::now(),
+                    commit_sha: None,
+                    scenario: "independent".into(),
+                    seed: 1,
+                    topology_levels: vec![],
+                    logical_clients: 2,
+                    request_timeout_secs: 10,
+                    summary: TopologySummary {
+                        adjacent_throughput_ratios: vec![],
+                    },
+                    database_pool_assumptions: None,
+                    telemetry_mode: None,
+                    environment: BTreeMap::new(),
+                    limitations: vec![],
+                },
+            )
+            .unwrap();
+        }
+        let stderr = String::from_utf8(stderr.lock().unwrap().clone()).unwrap();
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(stderr.contains("benchmark: concurrency=2 measured started"));
+        assert!(stderr.contains("benchmark: concurrency=2 measured progress 2/20"));
+        assert_eq!(report["schema_version"], SCHEMA_VERSION);
+        assert!(!report.as_object().unwrap().contains_key("progress"));
     }
     #[test]
     fn topology_summary_serializes_versioned_levels() {

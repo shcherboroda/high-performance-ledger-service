@@ -11,7 +11,7 @@ use ledger_benchmarks::{
     stats, verify,
 };
 use serde::Serialize;
-use std::{collections::BTreeMap, io, process::Command, sync::Arc, time::Instant};
+use std::{collections::BTreeMap, process::Command, sync::Arc, time::Instant};
 use tokio::{sync::Semaphore, task::JoinSet};
 use uuid::Uuid;
 #[derive(Serialize)]
@@ -40,8 +40,7 @@ async fn run() -> Result<()> {
         .connect(&config.database_url)
         .await?;
     let mut topology_levels = Vec::new();
-    let stderr = io::stderr();
-    let mut progress = ProgressReporter::new(stderr.lock());
+    let mut progress = ProgressReporter::stderr();
     for instances in config.instance_levels()? {
         let urls = config.service_urls[..instances].to_vec();
         let http = Arc::new(http::Http::new(urls.clone(), config.request_timeout())?);
@@ -91,13 +90,13 @@ async fn readiness(http: &http::Http) -> BTreeMap<String, Result<(), String>> {
     }
     results
 }
-async fn run_level<W: io::Write>(
+async fn run_level(
     config: &Config,
     pool: &sqlx::PgPool,
     http: &Arc<http::Http>,
     tokens: &[String],
     concurrency: usize,
-    progress: &mut ProgressReporter<W>,
+    progress: &mut ProgressReporter,
 ) -> Result<LevelResult> {
     let scenario = match config.scenario {
         Scenario::Independent => ScenarioPlan::Independent,
@@ -159,21 +158,21 @@ async fn run_level<W: io::Write>(
         let warmup_started = Instant::now();
         let mut warmup_progress = progress.phase(concurrency, "warm-up", config.warmup_operations);
         let warmup = run_operations(
-                config,
-                http,
-                tokens,
-                &plans[..config.warmup_operations],
-                &accounts[..config.warmup_operations],
-                concurrency,
-                &mut warmup_progress,
-            )
-            .await;
+            config,
+            http,
+            tokens,
+            &plans[..config.warmup_operations],
+            &accounts[..config.warmup_operations],
+            concurrency,
+            &mut warmup_progress,
+        )
+        .await;
         warmup_progress.finish(warmup_started.elapsed());
         (warmup, BTreeMap::new(), None)
     };
     let metrics_before = metrics(http).await;
-    let started = Instant::now();
     let mut measured_progress = progress.phase(concurrency, "measured", config.operations);
+    let started = Instant::now();
     let measured = run_operations(
         config,
         http,
@@ -303,17 +302,19 @@ fn transfer_ids_by_key(operations: &[http::Operation]) -> Result<BTreeMap<String
 fn setup_operations(config: &Config, plans: &[TransferPlan]) -> usize {
     match config.scenario {
         Scenario::AccountPool => config.account_pool_size,
-        Scenario::HotAccount => plans.iter().map(|plan| plan.source).max().unwrap_or(0) + 1 + plans.len(),
+        Scenario::HotAccount => {
+            plans.iter().map(|plan| plan.source).max().unwrap_or(0) + 1 + plans.len()
+        }
         Scenario::Independent => plans.len() * 2,
         Scenario::IdempotentReplay => plans.len() * 3,
     }
 }
-async fn prepare<W: io::Write>(
+async fn prepare(
     config: &Config,
     http: &http::Http,
     tokens: &[String],
     plans: &[TransferPlan],
-    progress: &mut ProgressPhase<'_, W>,
+    progress: &mut ProgressPhase<'_>,
 ) -> Result<(Vec<(Uuid, Uuid)>, Option<Vec<Uuid>>)> {
     if config.scenario == Scenario::AccountPool {
         let mut pool_ids = Vec::with_capacity(config.account_pool_size);
@@ -398,14 +399,14 @@ async fn prepare<W: io::Write>(
     }
     Ok((result, None))
 }
-async fn run_operations<W: io::Write>(
+async fn run_operations(
     config: &Config,
     http: &Arc<http::Http>,
     tokens: &[String],
     plans: &[TransferPlan],
     accounts: &[(Uuid, Uuid)],
     concurrency: usize,
-    progress: &mut ProgressPhase<'_, W>,
+    progress: &mut ProgressPhase<'_>,
 ) -> Vec<http::Operation> {
     if config.scenario != Scenario::AccountPool {
         return run_phase(http, tokens, plans, accounts, concurrency, progress).await;
@@ -419,13 +420,13 @@ async fn run_operations<W: io::Write>(
     }
     operations
 }
-async fn run_phase<W: io::Write>(
+async fn run_phase(
     http: &Arc<http::Http>,
     tokens: &[String],
     plans: &[TransferPlan],
     accounts: &[(Uuid, Uuid)],
     concurrency: usize,
-    progress: &mut ProgressPhase<'_, W>,
+    progress: &mut ProgressPhase<'_>,
 ) -> Vec<http::Operation> {
     let sem = Arc::new(Semaphore::new(concurrency));
     let mut set = JoinSet::new();
