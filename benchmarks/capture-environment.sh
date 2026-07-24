@@ -32,9 +32,9 @@ printf 'rust_version=%s
 ' "$(pool DB_MIN_CONNECTIONS 0)"; printf 'db_max_connections=%s
 ' "$(pool DB_MAX_CONNECTIONS 10)"; printf 'database_endpoint=%s://%s
 ' "$scheme" "$endpoint"; printf 'commit_sha=%s
-' "$(git rev-parse HEAD 2>/dev/null || printf unavailable)"; git diff --quiet --ignore-submodules -- 2>/dev/null && git diff --cached --quiet --ignore-submodules -- 2>/dev/null && printf 'dirty_tree=false
-' || printf 'dirty_tree=true
-'; printf 'service_instances=1
+' "$(git rev-parse HEAD 2>/dev/null || printf unavailable)"; if [[ -z "$(git status --porcelain --untracked-files=normal 2>/dev/null)" ]]; then printf 'dirty_tree=false
+'; else printf 'dirty_tree=true
+'; fi; printf 'service_instances=1
 service_url_count=%s
 bind_address=%s
 rust_log=%s
