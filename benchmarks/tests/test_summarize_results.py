@@ -72,7 +72,7 @@ class SummarizerTests(unittest.TestCase):
         self.assertIn("1.000", output.getvalue())
         self.assertIn("1.500", output.getvalue())
 
-    def test_comparison_table_prefers_structurally_matching_stored_ratio(self):
+    def test_comparison_table_ignores_cross_topology_stored_ratio(self):
         document = result()
         levels = document["topology_levels"][0]["levels"]
         next_level = copy.deepcopy(levels[0])
@@ -80,12 +80,12 @@ class SummarizerTests(unittest.TestCase):
         next_level["throughput_operations_per_second"] = 150.0
         levels.append(next_level)
         document["summary"] = {"adjacent_throughput_ratios": [{
-            "from_instances": 1, "to_instances": 1, "concurrency": 4, "throughput_ratio": 9.876,
+            "from_instances": 1, "to_instances": 2, "concurrency": 4, "throughput_ratio": 9.876,
         }]}
         output = io.StringIO()
         with redirect_stdout(output): self.assertEqual(summarizer.summarize(document), 0)
-        self.assertIn("9.876", output.getvalue())
-        self.assertNotIn("| 1.500", output.getvalue())
+        self.assertIn("| 1.500", output.getvalue())
+        self.assertNotIn("9.876", output.getvalue())
 
     def test_comparison_table_handles_zero_or_missing_throughput(self):
         document = result()
