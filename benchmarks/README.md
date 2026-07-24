@@ -78,7 +78,7 @@ summary after a successful run. Summaries can also be rendered directly:
 
 Smoke runs are short functional checks. Baseline sweeps are for local performance comparison and
 may take appreciably longer because setup, verification, and each measured level are isolated.
-Each baseline writes one schema-v4 document containing ascending concurrency levels `1,2,4,8,16,32`.
+Each baseline writes one schema-v5 document containing ascending concurrency levels `1,2,4,8,16,32`.
 Every level has 2,000 measured operations, 100 warm-up operations, and 32 logical clients;
 `account-pool` additionally uses a pool size of 100. Raw results are deterministic and do not
 replace smoke output: `benchmark-results/baseline-independent.json` and
@@ -145,7 +145,7 @@ export SERVICE_URLS=http://127.0.0.1:3000
 ./benchmarks/run-smoke.sh account-pool
 ```
 
-The commands write ignored, deterministic raw version-4 JSON files at
+The commands write ignored, deterministic raw version-5 JSON files at
 `benchmark-results/smoke-independent.json` and `benchmark-results/smoke-account-pool.json`.
 Additional benchmark CLI arguments may follow the scenario. Stop only the recorded service when
 finished:
@@ -242,14 +242,16 @@ BENCHMARK_SCENARIO=hot-account ./benchmarks/run-topology.sh 2 \
   --operations 10 --warmup-operations 2 --concurrency 2
 ```
 
-The ignored `benchmark-results/topology-matrix.json` is schema version 4 and contains both topology levels; `topology-1.json` and `topology-2.json` remain available for a focused single topology. Each result records the configured URLs, readiness outcome, per-instance metrics before/after, exact measured request count per URL, request failures, SQL verification, and validity. The matrix summary has one factual throughput ratio for each matching concurrency level. URLs are deterministically assigned round-robin by operation index, so every URL must receive measured traffic when operations cover the instance count. A readiness, metrics, transport, timeout, parse, unexpected-HTTP, SQL, or distribution failure makes the topology invalid; no failed instance is removed from a run.
+The ignored `benchmark-results/topology-matrix.json` is schema version 5 and contains both topology levels; `topology-1.json` and `topology-2.json` remain available for a focused single topology. Each result records the configured URLs, readiness outcome, per-instance metrics before/after, exact measured request count per URL, request failures, SQL verification, and validity. The matrix summary has one factual throughput ratio for each matching concurrency level. URLs are deterministically assigned round-robin by operation index, so every URL must receive measured traffic when operations cover the instance count. A readiness, metrics, transport, timeout, parse, unexpected-HTTP, SQL, or distribution failure makes the topology invalid; no failed instance is removed from a run.
 
 To compare the raw documents, retain the same seed, operation/warm-up counts, and concurrency. Any throughput ratio or latency difference is an environment-specific observation only, not evidence of linear scaling, maximum capacity, or a production guarantee. Logs are local under `benchmark-results/`; inspect them after a failed readiness check. The trap cleans processes, and leftover release processes can be stopped with their recorded PIDs if the shell itself is forcibly killed.
 
 ## Result and verification
 
-The version-4 JSON output has one complete raw result per requested topology and concurrency level, plus compact factual summaries. Every level records scenario/seed, operation counts, latency, throughput, classifications, per-instance request counts, metrics snapshots, SQL verification, validity, environment and limitations. Account-pool levels additionally record pool and phase metadata. Interpret `valid: true` as the workload and SQL checks passing in that environment; do not treat it as a capacity or production-performance guarantee. Raw results are ignored by default.
+The version-5 JSON output has one complete raw result per requested topology and concurrency level, plus compact factual summaries. Every level records scenario/seed, operation counts, latency, throughput, classifications, per-instance request counts, metrics snapshots, explicit `metrics_collection_valid`, SQL verification, validity, environment and limitations. Account-pool levels additionally record pool and phase metadata. Version 5 deliberately supersedes version 4: use the paired v5 summarizer rather than passing v5 output to a schema-v4 consumer. Interpret `valid: true` as the workload and SQL checks passing in that environment; do not treat it as a capacity or production-performance guarantee. Raw results are ignored by default.
 
-All workloads use real `POST /accounts` and `POST /transfers` calls, reusable async connections, and deterministic plans. SQL validation checks scenario-specific transfer/entry counts, balances, conservation and replay side effects; unexpected HTTP, transport, parse, or database-validation failures mark the affected level invalid. `/metrics` collection failures are reported separately from workload failures.
+All workloads use real `POST /accounts` and `POST /transfers` calls, reusable async connections, and deterministic plans. SQL validation checks scenario-specific transfer/entry counts, balances, conservation and replay side effects; unexpected HTTP, transport, parse, or database-validation failures mark the affected level invalid. `/metrics` collection failures are reported separately from workload failures. For each service URL, the v5 summarizer reports before/after deltas and means for transfer HTTP duration, successful transaction duration, and successful and failed pool-acquire duration. Pool-acquire failure counters are zero when their bounded series was not observed before or after the level.
+
+Transfer timing is ordered as: `client end-to-end -> middleware setup -> handler -> pool acquire -> unmeasured BEGIN -> transaction (including response construction) -> handler return -> post-response metric/log/header work`. HTTP duration begins immediately before downstream handler execution and ends when it returns; it contains pool acquire, `BEGIN`, and transaction time, but not middleware setup or post-response work. Pool-acquire and transaction durations do not overlap, and the three durations must not be added together.
 
 For local PR readiness, use the canonical command above rather than running bare cargo checks separately.

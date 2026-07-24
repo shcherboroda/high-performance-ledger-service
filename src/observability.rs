@@ -40,6 +40,21 @@ pub enum TerminalOutcome {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolAcquireOutcome {
+    Success,
+    Failure,
+}
+
+impl PoolAcquireOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadinessOutcome {
     Ready,
     NotReady,
@@ -251,6 +266,21 @@ pub fn record_operation_without_transaction(
     );
 }
 
+/// Records only the wait to obtain a connection for the `/transfers` handler.
+///
+/// This deliberately uses the fixed `transfer` operation label even before the
+/// request can be classified as same-currency or FX. The outcome says whether
+/// SQLx yielded a connection; it is independent from the workload's HTTP
+/// outcome and contains no database error text.
+pub fn record_transfer_pool_acquire(outcome: PoolAcquireOutcome, duration_seconds: f64) {
+    histogram!(
+        "ledger_database_pool_acquire_duration_seconds",
+        "operation" => FinancialOperation::Transfer.as_str(),
+        "outcome" => outcome.as_str()
+    )
+    .record(duration_seconds);
+}
+
 pub fn record_readiness_check(
     outcome: ReadinessOutcome,
     reason: ReadinessReason,
@@ -395,6 +425,7 @@ mod tests {
     use std::{
         io::{self, Write},
         sync::{Arc, Mutex},
+        time::Duration,
     };
 
     use axum::{
@@ -416,6 +447,42 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    fn metric_value(name: &str, labels: &[&str]) -> f64 {
+        metrics_handle()
+            .render()
+            .lines()
+            .find(|line| line.starts_with(name) && labels.iter().all(|label| line.contains(label)))
+            .and_then(|line| line.rsplit_once(' '))
+            .and_then(|(_, value)| value.parse().ok())
+            .unwrap_or(0.0)
+    }
+
+    #[tokio::test]
+    async fn http_duration_covers_downstream_response_construction() {
+        let labels = ["method=\"GET\"", "route=\"/timed-response\""];
+        let before = metric_value("ledger_http_request_duration_seconds_sum", &labels);
+        let app = Router::new()
+            .route(
+                "/timed-response",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    "constructed response"
+                }),
+            )
+            .layer(middleware::from_fn(observe_request));
+
+        let response = app
+            .oneshot(Request::get("/timed-response").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            metric_value("ledger_http_request_duration_seconds_sum", &labels) - before
+                >= Duration::from_millis(20).as_secs_f64()
+        );
     }
 
     #[test]
@@ -490,6 +557,18 @@ mod tests {
         assert!(metrics.contains("outcome=\"owner\""));
         assert!(metrics.contains("ledger_database_transaction_duration_seconds"));
         assert!(!metrics.contains(&secret));
+    }
+
+    #[test]
+    fn transfer_pool_acquire_failure_uses_only_bounded_labels() {
+        let secret = "postgres://user:password@db.example/ledger?detail=secret";
+        record_transfer_pool_acquire(PoolAcquireOutcome::Failure, 0.01);
+
+        let metrics = metrics_handle().render();
+        assert!(metrics.contains("ledger_database_pool_acquire_duration_seconds"));
+        assert!(metrics.contains("operation=\"transfer\""));
+        assert!(metrics.contains("outcome=\"failure\""));
+        assert!(!metrics.contains(secret));
     }
 
     #[test]

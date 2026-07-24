@@ -196,6 +196,14 @@ async fn financial_handlers_emit_bounded_operation_and_idempotency_metrics(pool:
         "ledger_database_transaction_duration_seconds_count",
         &["operation=\"transfer\"", "outcome=\"success\""],
     );
+    let pool_acquire_before = metric_value(
+        "ledger_database_pool_acquire_duration_seconds_count",
+        &["operation=\"transfer\"", "outcome=\"success\""],
+    );
+    let pool_acquire_failure_before = metric_value(
+        "ledger_database_pool_acquire_duration_seconds_count",
+        &["operation=\"transfer\"", "outcome=\"failure\""],
+    );
     let owner_before = metric_value("ledger_idempotency_outcomes_total", &owner_label);
     let replay_before = metric_value("ledger_idempotency_outcomes_total", &replay_label);
     let conflict_before = metric_value("ledger_idempotency_outcomes_total", &conflict_label);
@@ -219,6 +227,13 @@ async fn financial_handlers_emit_bounded_operation_and_idempotency_metrics(pool:
             &["operation=\"transfer\"", "outcome=\"success\""],
         ),
         success_duration_before + 1.0
+    );
+    assert_eq!(
+        metric_value(
+            "ledger_database_pool_acquire_duration_seconds_count",
+            &["operation=\"transfer\"", "outcome=\"success\""]
+        ),
+        pool_acquire_before + 1.0
     );
     assert_eq!(
         metric_value("ledger_idempotency_outcomes_total", &owner_label),
@@ -404,6 +419,40 @@ async fn financial_handlers_emit_bounded_operation_and_idempotency_metrics(pool:
     assert_eq!(
         metric_value("ledger_operations_total", &internal_operation),
         internal_operation_before + 1.0
+    );
+
+    let transfer_internal_duration_before = metric_value(
+        "ledger_database_transaction_duration_seconds_count",
+        &["operation=\"transfer\"", "outcome=\"internal_error\""],
+    );
+    let unavailable_transfer_pool = PgPoolOptions::new()
+        .acquire_timeout(Duration::from_millis(100))
+        .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/ledger")
+        .unwrap();
+    assert_eq!(
+        transfer_response(
+            unavailable_transfer_pool,
+            &owner,
+            "metrics-acquire-failure",
+            json!({"source_account_id": Uuid::new_v4(), "destination_account_id": Uuid::new_v4(), "amount": "1.00"}),
+        )
+        .await
+        .status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        metric_value(
+            "ledger_database_pool_acquire_duration_seconds_count",
+            &["operation=\"transfer\"", "outcome=\"failure\""]
+        ),
+        pool_acquire_failure_before + 1.0
+    );
+    assert_eq!(
+        metric_value(
+            "ledger_database_transaction_duration_seconds_count",
+            &["operation=\"transfer\"", "outcome=\"internal_error\""]
+        ),
+        transfer_internal_duration_before
     );
 
     let reversal_internal_operation = [
