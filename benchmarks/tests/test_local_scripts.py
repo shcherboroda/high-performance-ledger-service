@@ -1,4 +1,5 @@
 import os
+import stat
 import subprocess
 import tempfile
 import shutil
@@ -9,6 +10,14 @@ BENCHMARKS = Path(__file__).parents[1]
 
 
 class LocalScriptTests(unittest.TestCase):
+    def test_directly_invoked_shell_scripts_are_executable(self):
+        for script in BENCHMARKS.glob("*.sh"):
+            with self.subTest(script=script):
+                self.assertEqual(
+                    stat.S_IMODE(script.stat().st_mode),
+                    0o755,
+                )
+
     def run_script(self, script, scenario):
         with tempfile.TemporaryDirectory() as temporary:
             temporary_path = Path(temporary)
