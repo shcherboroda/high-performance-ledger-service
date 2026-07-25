@@ -33,7 +33,8 @@ def plan(mode):
         "pool": [{"scenario":"independent", "concurrency":64 if not small else 8, "operations":40 if small else 10000, "warmup":4 if small else 500, "pool":p, "instances":1} for p in (32,64) for _ in range(3)],
         "scale": [{"scenario":"account-pool", "concurrency":None, "operations":120 if small else 100000, "warmup":4 if small else 500, "pool":32, "instances":1, "account_pool_size":20 if small else 10000}],
         "hot": [{"scenario":"hot-account", "concurrency":c, "operations":40 if small else 5000, "warmup":4 if small else 500, "pool":32, "instances":1} for c in ([1,8,32] if small else [1,8,32,64])],
-        "topology": [{"scenario":"independent", "concurrency":c, "operations":40 if small else 10000, "warmup":4 if small else 500, "pool":32, "instances":i} for i in (1,2) for c in ([8] if small else [32,64])] + [{"scenario":"independent", "concurrency":64 if not small else 8, "operations":40 if small else 10000, "warmup":4 if small else 500, "pool":32, "instances":i} for i in (1,2) for _ in range(3)],
+        "topology": [{"scenario":"independent", "concurrency":c, "operations":40 if small else 10000, "warmup":4 if small else 500, "pool":32, "instances":i} for i in (1,2) for c in ([8] if small else [32,64])],
+        "topology_repeats": [{"scenario":"independent", "concurrency":64 if not small else 8, "operations":40 if small else 10000, "warmup":4 if small else 500, "pool":32, "instances":i} for i in (1,2) for _ in range(3)],
         "fx_baseline": [{"scenario":"independent", "concurrency":c, "operations":40 if small else 5000, "warmup":4 if small else 500, "pool":32, "instances":1} for c in ([1,8,32] if small else [1,32,64])],
         "fx": [{"scenario":"fx-independent", "concurrency":c, "operations":40 if small else 5000, "warmup":4 if small else 500, "pool":32, "instances":1} for c in ([1,8,32] if small else [1,32,64])],
         "replay": [{"scenario":"idempotent-replay", "concurrency":8 if small else 32, "operations":40 if small else 5000, "warmup":4 if small else 500, "pool":32, "instances":1}],
@@ -95,12 +96,15 @@ def rows_from_raw(raw_dir):
 
 def write_report(out, manifest):
     rows=rows_from_raw(out / "raw")
+    for point in manifest.get("raw_artifacts", []):
+        if point.get("status") != "success" and not any(row.get("raw") == point.get("raw") for row in rows):
+            rows.append({"raw":point.get("raw", point.get("label")), "scenario":point.get("scenario"), "instances":point.get("instances"), "concurrency":point.get("concurrency"), "pool":point.get("pool"), "valid":False, "correct":False, "error":point.get("error", point.get("status"))})
     fields=sorted({k for row in rows for k in row})
     with (out / "summary.csv").open("w", newline="", encoding="utf-8") as f:
         writer=csv.DictWriter(f, fieldnames=fields); writer.writeheader(); writer.writerows(rows)
-    practical=practical_point([r for r in rows if r.get("scenario")=="independent" and r.get("instances")==1 and r.get("pool")==32])
+    practical=practical_point([r for r in rows if r.get("raw", "").startswith("core-")])
     repeated={}
-    for group in ("repeated_low", "repeated_practical", "pool", "topology"):
+    for group in ("repeated_low", "repeated_practical", "pool", "topology_repeats"):
         grouped=defaultdict(list)
         for row in rows:
             if row.get("raw", "").startswith(group + "-"): grouped[(row.get("scenario"),row.get("instances"),row.get("concurrency"),row.get("pool"))].append(row)
@@ -108,16 +112,22 @@ def write_report(out, manifest):
     summary={"schema_version":1,"practical_operating_point":practical,"rows":rows,"repeated_aggregates":repeated,"valid":bool(rows) and all(r.get("valid") for r in rows) and not manifest.get("failed", False)}
     (out / "summary.json").write_text(json.dumps(summary,indent=2)+"\n", encoding="utf-8")
     groups=defaultdict(list)
-    sections=(("Core load curve", "core-"),("Repeated key points", "repeated_"),("Pool tuning", "pool-"),("Account/transfer scale", "scale-"),("Hot-account contention", "hot-"),("Topology 1 vs 2", "topology-"),("Same-currency vs FX", "fx_"),("Idempotent replay", "replay-"),("Correctness and failures", ""))
+    sections=(("Core load curve", ("core-",)),("Repeated key points", ("repeated_","topology_repeats-")),("Pool tuning", ("pool-",)),("Account/transfer scale", ("scale-",)),("Hot-account contention", ("hot-",)),("Topology 1 vs 2", ("topology-","topology_repeats-")),("Same-currency vs FX", ("fx_","fx-")),("Idempotent replay", ("replay-",)),("Correctness and failures", ()))
     text=["# Final benchmark campaign", "", "Primary metrics are end-to-end latency, throughput, failures, and correctness. HTTP, pool-acquire, and DB transaction values are diagnostic stage timings and are not additive.", "", f"Practical operating point: **{practical}** (highest valid core point within 90% of peak throughput).", ""]
-    for name, prefix in sections:
-        items=rows if not prefix else [r for r in rows if r.get("raw", "").startswith(prefix)]
+    for name, prefixes in sections:
+        items=rows if not prefixes else [r for r in rows if r.get("raw", "").startswith(prefixes)]
         text += [f"## {name}", "", "| instances | concurrency | throughput ops/s | p95 ms | failures | correct | valid |", "|---:|---:|---:|---:|---:|---:|---:|"]
         for r in items:
             def ms(k): return "" if r.get(k) is None else round(r[k]/1e6,3)
             text[-2:] = ["| instances | concurrency | throughput | mean | p50 | p95 | p99 | max | HTTP mean ms | pool mean ms | DB mean ms | failures | correct | valid |", "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
-            text.append(f"| {r.get('instances','')} | {r.get('concurrency','')} | {r.get('throughput','')} | {ms('mean_ns')} | {ms('p50_ns')} | {ms('p95_ns')} | {ms('p99_ns')} | {ms('max_ns')} | {r.get('http_mean_ms','')} | {r.get('pool_acquire_mean_ms','')} | {r.get('db_transaction_mean_ms','')} | {r.get('failures','')} | {r.get('correct','')} | {r.get('valid')} |")
+            text.append(f"| {r.get('instances','')} | {r.get('concurrency','')} | {r.get('throughput','')} | {ms('mean_ns')} | {ms('p50_ns')} | {ms('p95_ns')} | {ms('p99_ns')} | {ms('max_ns')} | {r.get('http_mean_ms','')} | {r.get('pool_acquire_mean_ms','')} | {r.get('db_transaction_mean_ms','')} | {r.get('failures','')} | {r.get('correct','')} | {r.get('valid')} | {r.get('error','')} |")
         text.append("")
+    text += ["## FX relative comparison", "", "| concurrency | same-currency ops/s | FX ops/s | throughput ratio FX/same |", "|---:|---:|---:|---:|"]
+    for concurrency in sorted({r.get("concurrency") for r in rows if r.get("raw", "").startswith("fx-")}):
+        ordinary=next((r for r in rows if r.get("raw", "").startswith("fx_baseline-") and r.get("concurrency")==concurrency), {})
+        fx=next((r for r in rows if r.get("raw", "").startswith("fx-") and r.get("concurrency")==concurrency), {})
+        ratio = fx.get("throughput") / ordinary.get("throughput") if ordinary.get("throughput") else None
+        text.append(f"| {concurrency} | {ordinary.get('throughput','')} | {fx.get('throughput','')} | {ratio if ratio is not None else ''} |")
     (out / "report.md").write_text("\n".join(text), encoding="utf-8")
     manifest["summary_valid"] = summary["valid"]
     (out / "manifest.json").write_text(json.dumps(manifest,indent=2)+"\n", encoding="utf-8")
@@ -129,6 +139,6 @@ def main():
     if args.plan_only: print(json.dumps(matrix,indent=2)); return 0
     # The shell runner owns service lifecycle; this command is report-only after
     # it has placed the raw artifacts and a provenance manifest in the directory.
-    manifest=json.loads((args.output / "manifest.json").read_text(encoding="utf-8")); manifest["effective_matrix"]=matrix
+    manifest=json.loads((args.output / "manifest.json").read_text(encoding="utf-8")); manifest["effective_matrix"]=manifest.get("raw_artifacts", matrix)
     return 0 if write_report(args.output, manifest) else 1
 if __name__ == "__main__": sys.exit(main())

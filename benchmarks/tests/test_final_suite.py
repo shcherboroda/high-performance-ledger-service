@@ -11,7 +11,7 @@ suite = importlib.util.module_from_spec(SPEC); SPEC.loader.exec_module(suite)
 class FinalSuiteTests(unittest.TestCase):
     def test_quick_covers_each_campaign_path(self):
         matrix = suite.plan("quick")
-        self.assertEqual(set(matrix), {"core", "repeated_low", "repeated_practical", "pool", "scale", "hot", "topology", "fx_baseline", "fx", "replay"})
+        self.assertEqual(set(matrix), {"core", "repeated_low", "repeated_practical", "pool", "scale", "hot", "topology", "topology_repeats", "fx_baseline", "fx", "replay"})
         self.assertEqual([p["concurrency"] for p in matrix["core"]], [1, 8, 32])
         self.assertEqual({p["instances"] for p in matrix["topology"]}, {1, 2})
 
@@ -35,5 +35,18 @@ class FinalSuiteTests(unittest.TestCase):
             (out/"manifest.json").write_text("{}", encoding="utf-8")
             self.assertFalse(suite.write_report(out, {}))
             self.assertIn("unreadable raw result", (out/"summary.json").read_text(encoding="utf-8"))
+
+    def test_manifest_only_failure_is_in_summary_and_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out=Path(directory); (out/"raw").mkdir()
+            manifest={"failed":True,"raw_artifacts":[{"label":"scale-1","scenario":"account-pool","concurrency":32,"pool":32,"instances":1,"status":"service_start_failed"}]}
+            self.assertFalse(suite.write_report(out, manifest))
+            self.assertIn("service_start_failed", (out/"report.md").read_text(encoding="utf-8"))
+
+    def test_stage_means_selects_only_transfer_success_series(self):
+        metrics='ledger_http_request_duration_seconds_count{method="POST",route="/transfers"} 2\nledger_http_request_duration_seconds_sum{method="POST",route="/transfers"} 0.2\nledger_http_request_duration_seconds_count{method="GET",route="/accounts"} 99\n'
+        later='ledger_http_request_duration_seconds_count{method="POST",route="/transfers"} 4\nledger_http_request_duration_seconds_sum{method="POST",route="/transfers"} 0.6\n'
+        result=suite.stage_means({"metrics_before":{"u":{"Ok":metrics}},"metrics_after":{"u":{"Ok":later}}})
+        self.assertAlmostEqual(result["http_mean_ms"], 200)
 
 if __name__ == "__main__": unittest.main()

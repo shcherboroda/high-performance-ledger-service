@@ -86,6 +86,10 @@ d['raw_artifacts'].append(record); json.dump(d,open(manifest,'w'),indent=2)
 PY
   stop_services
 done <"$out/matrix.tsv"
+PYTHONDONTWRITEBYTECODE=1 python3 - "$out/manifest.json" "$campaign_failed" <<'PY'
+import json,sys
+p=sys.argv[1]; d=json.load(open(p)); d['failed']=sys.argv[2]=='1'; json.dump(d,open(p,'w'),indent=2)
+PY
 PYTHONDONTWRITEBYTECODE=1 python3 benchmarks/final_suite.py "$mode" --output "$out" || campaign_failed=1
 PYTHONDONTWRITEBYTECODE=1 python3 - "$out/manifest.json" "$campaign_failed" <<'PY'
 import datetime,json,sys
