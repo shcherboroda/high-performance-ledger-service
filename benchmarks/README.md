@@ -255,3 +255,20 @@ All workloads use real `POST /accounts` and `POST /transfers` calls, reusable as
 Transfer timing is ordered as: `client end-to-end -> middleware setup -> handler -> pool acquire -> unmeasured BEGIN -> transaction (including response construction) -> handler return -> post-response metric/log/header work`. HTTP duration begins immediately before downstream handler execution and ends when it returns; it contains pool acquire, `BEGIN`, and transaction time, but not middleware setup or post-response work. Pool-acquire and transaction durations do not overlap, and the three durations must not be added together.
 
 For local PR readiness, use the canonical command above rather than running bare cargo checks separately.
+# Final campaign
+
+Run the reproducible assessment campaign with the ignored local configuration:
+
+```bash
+./benchmarks/run-final-suite.sh quick
+./benchmarks/run-final-suite.sh full
+```
+
+The runner requires a clean Git tree and a dedicated `_benchmark` database. It
+starts one or two release services against that same database as required by
+each point, retains raw JSON and service logs on failures, and creates a unique
+`benchmark-results/final-<UTC>-<commit>/` directory. `quick` exercises every
+orchestration path with bounded data; `full` is the submission measurement
+matrix. The report labels client latency/throughput/correctness as primary
+metrics and leaves HTTP, pool-acquire, and database timings diagnostic (they
+must not be added together).
