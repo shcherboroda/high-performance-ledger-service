@@ -12,6 +12,7 @@ pub enum Scenario {
     HotAccount,
     IdempotentReplay,
     AccountPool,
+    FxIndependent,
 }
 impl Scenario {
     pub fn name(self) -> &'static str {
@@ -20,6 +21,7 @@ impl Scenario {
             Self::HotAccount => "hot-account",
             Self::IdempotentReplay => "idempotent-replay",
             Self::AccountPool => "account-pool",
+            Self::FxIndependent => "fx-independent",
         }
     }
 }

@@ -62,6 +62,17 @@ impl Http {
         idempotency_key: &str,
         initial_balance: &str,
     ) -> anyhow::Result<uuid::Uuid> {
+        self.create_account_in_currency(operation, token, idempotency_key, "USD", initial_balance)
+            .await
+    }
+    pub async fn create_account_in_currency(
+        &self,
+        operation: usize,
+        token: &str,
+        idempotency_key: &str,
+        currency: &str,
+        initial_balance: &str,
+    ) -> anyhow::Result<uuid::Uuid> {
         let response = self
             .client
             .post(format!(
@@ -70,7 +81,7 @@ impl Http {
             ))
             .bearer_auth(token)
             .header("Idempotency-Key", idempotency_key)
-            .json(&serde_json::json!({"currency":"USD","initial_balance":initial_balance}))
+            .json(&serde_json::json!({"currency":currency,"initial_balance":initial_balance}))
             .send()
             .await?;
         if response.status() != StatusCode::CREATED {

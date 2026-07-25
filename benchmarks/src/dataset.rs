@@ -7,6 +7,7 @@ pub enum ScenarioPlan {
     HotAccount,
     IdempotentReplay,
     AccountPool,
+    FxIndependent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,11 +38,15 @@ pub fn plans(
             let phase = if index < warmup { "warmup" } else { "measured" };
             let client = match scenario {
                 ScenarioPlan::HotAccount => 0,
-                ScenarioPlan::Independent | ScenarioPlan::IdempotentReplay => index % clients,
+                ScenarioPlan::Independent
+                | ScenarioPlan::IdempotentReplay
+                | ScenarioPlan::FxIndependent => index % clients,
                 ScenarioPlan::AccountPool => unreachable!("use account_pool_plans"),
             };
             let (source, destination) = match scenario {
-                ScenarioPlan::Independent | ScenarioPlan::IdempotentReplay => (index, index),
+                ScenarioPlan::Independent
+                | ScenarioPlan::IdempotentReplay
+                | ScenarioPlan::FxIndependent => (index, index),
                 ScenarioPlan::AccountPool => unreachable!("use account_pool_plans"),
                 ScenarioPlan::HotAccount => (if phase == "warmup" { 0 } else { 1 }, index),
             };
@@ -116,6 +121,26 @@ pub async fn migrate_and_clean(pool: &sqlx::PgPool, seed: u64) -> Result<()> {
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    Ok(())
+}
+
+/// Install one deterministic, long-lived USD→PLN configuration for a benchmark
+/// run. It is namespaced by the benchmark seed and removed before the next run.
+pub async fn seed_fx_configuration(pool: &sqlx::PgPool, seed: u64) -> Result<()> {
+    let rate = deterministic_uuid(seed, 99, 1);
+    let fee = deterministic_uuid(seed, 99, 2);
+    sqlx::query("DELETE FROM fx_fee_rules WHERE id = $1")
+        .bind(fee)
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM exchange_rates WHERE id = $1")
+        .bind(rate)
+        .execute(pool)
+        .await?;
+    sqlx::query("INSERT INTO exchange_rates (id, source_currency, destination_currency, rate, valid_from, valid_until, external_reference) VALUES ($1, 'USD', 'PLN', 4.000000000000, now() - interval '1 hour', now() + interval '24 hours', $2)")
+        .bind(rate).bind(format!("benchmark-{seed}")).execute(pool).await?;
+    sqlx::query("INSERT INTO fx_fee_rules (id, source_currency, destination_currency, fee_bps, valid_from, valid_until) VALUES ($1, 'USD', 'PLN', 100, now() - interval '1 hour', now() + interval '24 hours')")
+        .bind(fee).execute(pool).await?;
     Ok(())
 }
 

@@ -108,6 +108,50 @@ pub fn evaluate_independent(
     ])
 }
 
+pub async fn fx_independent(
+    pool: &sqlx::PgPool,
+    pairs: &[(Uuid, Uuid)],
+    expected: usize,
+) -> anyhow::Result<Verification> {
+    let sources: Vec<Uuid> = pairs.iter().map(|pair| pair.0).collect();
+    let committed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM transfers WHERE source_account_id = ANY($1) AND kind = 'fx_transfer'",
+    )
+    .bind(&sources)
+    .fetch_one(pool)
+    .await?;
+    let entries = entry_count(pool, &sources).await?;
+    let balances = balances(
+        pool,
+        &pairs.iter().flat_map(|(s, d)| [*s, *d]).collect::<Vec<_>>(),
+    )
+    .await?;
+    Ok(finish(vec![
+        check(
+            "committed_measured_fx_transfers",
+            committed == expected as i64,
+            format!("expected {expected}, found {committed}"),
+        ),
+        check(
+            "exactly_two_entries_per_fx_transfer",
+            entries == expected as i64 * 2,
+            format!("expected {}, found {entries}", expected * 2),
+        ),
+        check(
+            "expected_fx_balances",
+            pairs
+                .iter()
+                .all(|(s, d)| balances.get(s) == Some(&1899) && balances.get(d) == Some(&1400)),
+            "each USD/PLN pair must be 18.99 / 14.00 after the 1% fee".into(),
+        ),
+        check(
+            "no_unexpected_overdrafts",
+            balances.values().all(|b| *b >= 0),
+            "all balances non-negative".into(),
+        ),
+    ]))
+}
+
 pub async fn hot_account(
     pool: &sqlx::PgPool,
     source: Uuid,

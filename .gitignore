@@ -35,3 +35,5 @@ target
 # Benchmark output is intentionally local unless explicitly selected for review.
 /benchmark-results/
 /benchmarks/local.env
+/benchmarks/__pycache__/
+*.pyc

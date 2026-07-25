@@ -103,6 +103,7 @@ async fn run_level(
         Scenario::HotAccount => ScenarioPlan::HotAccount,
         Scenario::IdempotentReplay => ScenarioPlan::IdempotentReplay,
         Scenario::AccountPool => ScenarioPlan::AccountPool,
+        Scenario::FxIndependent => ScenarioPlan::FxIndependent,
     };
     let plans = if config.scenario == Scenario::AccountPool {
         dataset::account_pool_plans(
@@ -124,6 +125,9 @@ async fn run_level(
     let mut setup = progress.phase(concurrency, "setup", setup_operations(config, &plans));
     let setup_started = Instant::now();
     dataset::migrate_and_clean(pool, config.seed).await?;
+    if config.scenario == Scenario::FxIndependent {
+        dataset::seed_fx_configuration(pool, config.seed).await?;
+    }
     let (accounts, pool_ids) = prepare(config, http, tokens, &plans, &mut setup).await?;
     let (warmup, prepared_ids, replay_before) = if config.scenario == Scenario::IdempotentReplay {
         let originals = run_phase(http, tokens, &plans, &accounts, concurrency, &mut setup).await;
@@ -251,6 +255,14 @@ async fn run_level(
             )
             .await?
         }
+        Scenario::FxIndependent => {
+            verify::fx_independent(
+                pool,
+                &accounts[config.warmup_operations..],
+                config.operations,
+            )
+            .await?
+        }
     };
     let measured_requests_per_url = http::measured_requests_per_url(&measured);
     let distribution_valid = http::every_instance_received_measured_traffic(
@@ -308,6 +320,7 @@ fn setup_operations(config: &Config, plans: &[TransferPlan]) -> usize {
         }
         Scenario::Independent => plans.len() * 2,
         Scenario::IdempotentReplay => plans.len() * 3,
+        Scenario::FxIndependent => plans.len() * 2,
     }
 }
 async fn prepare(
@@ -378,19 +391,29 @@ async fn prepare(
     } else {
         for (index, plan) in plans.iter().enumerate() {
             let source = http
-                .create_account(
+                .create_account_in_currency(
                     index * 2,
                     &tokens[plan.client],
                     &format!("benchmark-{}-source-{index}", config.seed),
-                    "10.00",
+                    "USD",
+                    if config.scenario == Scenario::FxIndependent {
+                        "20.00"
+                    } else {
+                        "10.00"
+                    },
                 )
                 .await?;
             progress.complete_operation();
             let destination = http
-                .create_account(
+                .create_account_in_currency(
                     index * 2 + 1,
                     &tokens[plan.client],
                     &format!("benchmark-{}-destination-{index}", config.seed),
+                    if config.scenario == Scenario::FxIndependent {
+                        "PLN"
+                    } else {
+                        "USD"
+                    },
                     "10.00",
                 )
                 .await?;
