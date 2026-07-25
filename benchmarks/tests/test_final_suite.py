@@ -22,6 +22,24 @@ class FinalSuiteTests(unittest.TestCase):
         self.assertEqual([p["pool"] for p in matrix["pool"]], [32,32,32,64,64,64])
         self.assertEqual([p["concurrency"] for p in matrix["fx"]], [1,32,64])
 
+    def test_effective_jwt_lifetime_covers_full_core_single_concurrency(self):
+        self.assertEqual(suite.effective_jwt_lifetime_secs(28_800, 10_000, 500, 1, 10), 105_120)
+
+    def test_effective_jwt_lifetime_covers_full_scale_at_32(self):
+        self.assertEqual(suite.effective_jwt_lifetime_secs(28_800, 100_000, 500, 32, 10), 31_530)
+
+    def test_effective_jwt_lifetime_preserves_sufficient_configured_value(self):
+        self.assertEqual(suite.effective_jwt_lifetime_secs(200_000, 10_000, 500, 1, 10), 200_000)
+
+    def test_point_provenance_records_lifetime_and_failed_log(self):
+        point=suite.point_provenance(label="core-1", scenario="independent", concurrency=1, operations=10_000, warmup_operations=500, pool=32, instances=1, service_urls=["http://127.0.0.1:3101"], account_pool_size=None, effective_jwt_lifetime_secs=105_120, exit_status=1, benchmark_log="logs/core-1-benchmark.log", raw="raw/core-1.json")
+        self.assertEqual(point["effective_jwt_lifetime_secs"], 105_120)
+        self.assertEqual(point["status"], "invalid")
+        self.assertEqual(point["exit_status"], 1)
+        self.assertEqual(point["benchmark_log"], "logs/core-1-benchmark.log")
+        self.assertEqual(point["raw"], "raw/core-1.json")
+        self.assertIn("logs/core-1-benchmark.log", point["error"])
+
     def test_practical_selection_is_deterministic_with_fallback(self):
         self.assertEqual(suite.practical_point([]), 1)
         self.assertEqual(suite.practical_point([{"concurrency": 8, "throughput": 100, "valid": True}, {"concurrency": 32, "throughput": 91, "valid": True}, {"concurrency": 64, "throughput": 89, "valid": True}]), 32)
