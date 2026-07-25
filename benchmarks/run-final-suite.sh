@@ -31,7 +31,7 @@ trap cleanup EXIT INT TERM
 start_services() {
   local count="$1" pool="$2"; pids=(); urls=()
   for index in $(seq 1 "$count"); do
-    local port=$((3100 + index)); local log="$out/logs/service-${port}.log"
+    local port=$((3100 + index)); local log="$out/logs/${label}-service-${port}.log"
     RUST_LOG="${RUST_LOG:-warn}" BIND_ADDRESS="127.0.0.1:$port" DATABASE_URL="$BENCHMARK_DATABASE_URL" DB_MAX_CONNECTIONS="$pool" \
       JWT_ISSUER="$BENCHMARK_JWT_ISSUER" JWT_AUDIENCE="$BENCHMARK_JWT_AUDIENCE" JWT_PUBLIC_KEY_PEM="$public_key" \
       ./target/release/rust-backend-technical-assessment >"$log" 2>&1 &
@@ -44,6 +44,7 @@ start_services() {
 }
 stop_services() { for pid in "${pids[@]:-}"; do kill "$pid" 2>/dev/null || true; done; wait 2>/dev/null || true; pids=(); }
 cargo build --release -p rust-backend-technical-assessment -p ledger-benchmarks
+campaign_failed=0
 while IFS=$'\t' read -r scenario concurrency operations warmup pool instances account_pool_size label; do
   if [[ -z "$concurrency" ]]; then
     concurrency="$(PYTHONDONTWRITEBYTECODE=1 python3 - "$out/raw" <<'PY'
@@ -60,17 +61,35 @@ print(practical_point(rows))
 PY
 )"
   fi
-  start_services "$instances" "$pool"
+  if ! start_services "$instances" "$pool"; then
+    campaign_failed=1; stop_services
+    PYTHONDONTWRITEBYTECODE=1 python3 - "$out/manifest.json" "$label" "$scenario" "$concurrency" "$pool" "$instances" <<'PY'
+import json,sys
+p=sys.argv[1]; d=json.load(open(p)); d['raw_artifacts'].append({'label':sys.argv[2],'scenario':sys.argv[3],'concurrency':int(sys.argv[4]),'pool':int(sys.argv[5]),'instances':int(sys.argv[6]),'status':'service_start_failed'}); json.dump(d,open(p,'w'),indent=2)
+PY
+    continue
+  fi
   service_urls="$(IFS=,; echo "${urls[*]}")"
   args=(--scenario "$scenario" --logical-clients 64 --concurrency "$concurrency" --operations "$operations" --warmup-operations "$warmup" --output "$out/raw/$label.json")
   [[ "$scenario" == account-pool ]] && args+=(--account-pool-size "$account_pool_size")
+  status=0
   SERVICE_URLS="$service_urls" BENCHMARK_ALLOW_DESTRUCTIVE=1 DB_MAX_CONNECTIONS="$pool" \
-    cargo run -p ledger-benchmarks --release -- "${args[@]}"
-  PYTHONDONTWRITEBYTECODE=1 python3 - "$out/raw/$label.json" "$pool" <<'PY'
+    cargo run -p ledger-benchmarks --release -- "${args[@]}" || status=$?
+  [[ $status -eq 0 ]] || campaign_failed=1
+  PYTHONDONTWRITEBYTECODE=1 python3 - "$out/manifest.json" "$out/raw/$label.json" "$label" "$scenario" "$concurrency" "$operations" "$warmup" "$pool" "$instances" "$status" "$service_urls" <<'PY'
 import json, sys
-path=sys.argv[1]; document=json.load(open(path)); document['campaign_pool']=int(sys.argv[2]); json.dump(document, open(path, 'w'), indent=2); open(path, 'a').write('\n')
+manifest,path=sys.argv[1],sys.argv[2]; d=json.load(open(manifest)); record={'label':sys.argv[3],'scenario':sys.argv[4],'concurrency':int(sys.argv[5]),'operations':int(sys.argv[6]),'warmup_operations':int(sys.argv[7]),'pool':int(sys.argv[8]),'instances':int(sys.argv[9]),'service_urls':sys.argv[11].split(','),'status':'success' if sys.argv[10]=='0' else 'invalid'}
+try:
+ document=json.load(open(path)); document['campaign_pool']=record['pool']; json.dump(document, open(path,'w'),indent=2); open(path,'a').write('\n'); record['raw']=path.split('/')[-1]
+except (OSError,json.JSONDecodeError): record['error']='benchmark did not produce a readable result'
+d['raw_artifacts'].append(record); json.dump(d,open(manifest,'w'),indent=2)
 PY
   stop_services
 done <"$out/matrix.tsv"
-PYTHONDONTWRITEBYTECODE=1 python3 benchmarks/final_suite.py "$mode" --output "$out"
+PYTHONDONTWRITEBYTECODE=1 python3 benchmarks/final_suite.py "$mode" --output "$out" || campaign_failed=1
+PYTHONDONTWRITEBYTECODE=1 python3 - "$out/manifest.json" "$campaign_failed" <<'PY'
+import datetime,json,sys
+p=sys.argv[1]; d=json.load(open(p)); d['completed_at_utc']=datetime.datetime.now(datetime.UTC).isoformat(); d['failed']=sys.argv[2]=='1'; json.dump(d,open(p,'w'),indent=2); open(p,'a').write('\n')
+PY
 echo "final benchmark artifacts: $repo_root/$out"
+exit "$campaign_failed"

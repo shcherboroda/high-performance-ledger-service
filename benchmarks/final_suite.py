@@ -28,10 +28,13 @@ def plan(mode):
     small = mode == "quick"
     return {
         "core": [{"scenario":"independent", "concurrency": c, "operations": 40 if small else 10000, "warmup": 4 if small else 500, "pool":32, "instances":1} for c in core],
+        "repeated_low": [{"scenario":"independent", "concurrency": 1, "operations":40 if small else 10000, "warmup":4 if small else 500, "pool":32, "instances":1} for _ in range(3)],
+        "repeated_practical": [{"scenario":"independent", "concurrency":None, "operations":40 if small else 10000, "warmup":4 if small else 500, "pool":32, "instances":1} for _ in range(3)],
         "pool": [{"scenario":"independent", "concurrency":64 if not small else 8, "operations":40 if small else 10000, "warmup":4 if small else 500, "pool":p, "instances":1} for p in (32,64) for _ in range(3)],
         "scale": [{"scenario":"account-pool", "concurrency":None, "operations":120 if small else 100000, "warmup":4 if small else 500, "pool":32, "instances":1, "account_pool_size":20 if small else 10000}],
         "hot": [{"scenario":"hot-account", "concurrency":c, "operations":40 if small else 5000, "warmup":4 if small else 500, "pool":32, "instances":1} for c in ([1,8,32] if small else [1,8,32,64])],
-        "topology": [{"scenario":"independent", "concurrency":c, "operations":40 if small else 10000, "warmup":4 if small else 500, "pool":32, "instances":i} for i in (1,2) for c in ([8] if small else [32,64])],
+        "topology": [{"scenario":"independent", "concurrency":c, "operations":40 if small else 10000, "warmup":4 if small else 500, "pool":32, "instances":i} for i in (1,2) for c in ([8] if small else [32,64])] + [{"scenario":"independent", "concurrency":64 if not small else 8, "operations":40 if small else 10000, "warmup":4 if small else 500, "pool":32, "instances":i} for i in (1,2) for _ in range(3)],
+        "fx_baseline": [{"scenario":"independent", "concurrency":c, "operations":40 if small else 5000, "warmup":4 if small else 500, "pool":32, "instances":1} for c in ([1,8,32] if small else [1,32,64])],
         "fx": [{"scenario":"fx-independent", "concurrency":c, "operations":40 if small else 5000, "warmup":4 if small else 500, "pool":32, "instances":1} for c in ([1,8,32] if small else [1,32,64])],
         "replay": [{"scenario":"idempotent-replay", "concurrency":8 if small else 32, "operations":40 if small else 5000, "warmup":4 if small else 500, "pool":32, "instances":1}],
     }
@@ -63,14 +66,17 @@ def stage_means(level):
         for line in value["Ok"].splitlines():
             parts = line.split()
             if not line or line.startswith("#") or len(parts) < 2: continue
-            output[re.sub(r"\\{.*", "", parts[0])] = float(parts[1])
+            name, labels = (parts[0].split("{", 1) + [""])[:2]
+            labels = labels.rstrip("}")
+            output[(name, tuple(sorted(re.findall(r'(\w+)="([^"]*)"', labels))))] = float(parts[1])
         return output
     result = {}
     for url in set(before) & set(after):
         left, right = samples(before[url]), samples(after[url])
-        for label, metric in (("http_mean_ms", "ledger_http_request_duration_seconds"), ("pool_acquire_mean_ms", "ledger_database_pool_acquire_duration_seconds"), ("db_transaction_mean_ms", "ledger_database_transaction_duration_seconds")):
-            count = right.get(metric + "_count") - left.get(metric + "_count") if metric + "_count" in right and metric + "_count" in left else 0
-            total = right.get(metric + "_sum") - left.get(metric + "_sum") if metric + "_sum" in right and metric + "_sum" in left else None
+        for label, metric, required in (("http_mean_ms", "ledger_http_request_duration_seconds", {"method":"POST","route":"/transfers"}), ("pool_acquire_mean_ms", "ledger_database_pool_acquire_duration_seconds", {"operation":"transfer","outcome":"success"}), ("db_transaction_mean_ms", "ledger_database_transaction_duration_seconds", {"operation":"transfer","outcome":"success"})):
+            def value(values, suffix):
+                return sum(v for (n, labels),v in values.items() if n == metric + suffix and required.items() <= dict(labels).items())
+            count, total = value(right, "_count") - value(left, "_count"), value(right, "_sum") - value(left, "_sum")
             if count and total is not None: result.setdefault(label, []).append(total * 1000 / count)
     return {k: sum(v)/len(v) for k,v in result.items()}
 
@@ -93,15 +99,24 @@ def write_report(out, manifest):
     with (out / "summary.csv").open("w", newline="", encoding="utf-8") as f:
         writer=csv.DictWriter(f, fieldnames=fields); writer.writeheader(); writer.writerows(rows)
     practical=practical_point([r for r in rows if r.get("scenario")=="independent" and r.get("instances")==1 and r.get("pool")==32])
-    summary={"schema_version":1,"practical_operating_point":practical,"rows":rows,"valid":bool(rows) and all(r.get("valid") for r in rows)}
+    repeated={}
+    for group in ("repeated_low", "repeated_practical", "pool", "topology"):
+        grouped=defaultdict(list)
+        for row in rows:
+            if row.get("raw", "").startswith(group + "-"): grouped[(row.get("scenario"),row.get("instances"),row.get("concurrency"),row.get("pool"))].append(row)
+        repeated[group]={str(key):aggregate(value) for key,value in grouped.items()}
+    summary={"schema_version":1,"practical_operating_point":practical,"rows":rows,"repeated_aggregates":repeated,"valid":bool(rows) and all(r.get("valid") for r in rows) and not manifest.get("failed", False)}
     (out / "summary.json").write_text(json.dumps(summary,indent=2)+"\n", encoding="utf-8")
     groups=defaultdict(list)
-    for row in rows: groups[row.get("scenario", "invalid")].append(row)
+    sections=(("Core load curve", "core-"),("Repeated key points", "repeated_"),("Pool tuning", "pool-"),("Account/transfer scale", "scale-"),("Hot-account contention", "hot-"),("Topology 1 vs 2", "topology-"),("Same-currency vs FX", "fx_"),("Idempotent replay", "replay-"),("Correctness and failures", ""))
     text=["# Final benchmark campaign", "", "Primary metrics are end-to-end latency, throughput, failures, and correctness. HTTP, pool-acquire, and DB transaction values are diagnostic stage timings and are not additive.", "", f"Practical operating point: **{practical}** (highest valid core point within 90% of peak throughput).", ""]
-    for name, items in groups.items():
+    for name, prefix in sections:
+        items=rows if not prefix else [r for r in rows if r.get("raw", "").startswith(prefix)]
         text += [f"## {name}", "", "| instances | concurrency | throughput ops/s | p95 ms | failures | correct | valid |", "|---:|---:|---:|---:|---:|---:|---:|"]
         for r in items:
-            p95 = r.get("p95_ns"); text.append(f"| {r.get('instances','')} | {r.get('concurrency','')} | {r.get('throughput','')} | {'' if p95 is None else round(p95/1e6,3)} | {r.get('failures','')} | {r.get('correct','')} | {r.get('valid')} |")
+            def ms(k): return "" if r.get(k) is None else round(r[k]/1e6,3)
+            text[-2:] = ["| instances | concurrency | throughput | mean | p50 | p95 | p99 | max | HTTP mean ms | pool mean ms | DB mean ms | failures | correct | valid |", "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+            text.append(f"| {r.get('instances','')} | {r.get('concurrency','')} | {r.get('throughput','')} | {ms('mean_ns')} | {ms('p50_ns')} | {ms('p95_ns')} | {ms('p99_ns')} | {ms('max_ns')} | {r.get('http_mean_ms','')} | {r.get('pool_acquire_mean_ms','')} | {r.get('db_transaction_mean_ms','')} | {r.get('failures','')} | {r.get('correct','')} | {r.get('valid')} |")
         text.append("")
     (out / "report.md").write_text("\n".join(text), encoding="utf-8")
     manifest["summary_valid"] = summary["valid"]

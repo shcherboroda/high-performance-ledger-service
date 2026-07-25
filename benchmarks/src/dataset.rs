@@ -139,7 +139,7 @@ pub async fn seed_fx_configuration(pool: &sqlx::PgPool, seed: u64) -> Result<()>
         .await?;
     sqlx::query("INSERT INTO exchange_rates (id, source_currency, destination_currency, rate, valid_from, valid_until, external_reference) VALUES ($1, 'USD', 'PLN', 4.000000000000, now() - interval '1 hour', now() + interval '24 hours', $2)")
         .bind(rate).bind(format!("benchmark-{seed}")).execute(pool).await?;
-    sqlx::query("INSERT INTO fx_fee_rules (id, source_currency, destination_currency, fee_bps, valid_from, valid_until) VALUES ($1, 'USD', 'PLN', 0, now() - interval '1 hour', now() + interval '24 hours')")
+    sqlx::query("INSERT INTO fx_fee_rules (id, source_currency, destination_currency, fee_bps, valid_from, valid_until) VALUES ($1, 'USD', 'PLN', 100, now() - interval '1 hour', now() + interval '24 hours')")
         .bind(fee).execute(pool).await?;
     Ok(())
 }

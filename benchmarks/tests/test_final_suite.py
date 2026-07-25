@@ -11,7 +11,7 @@ suite = importlib.util.module_from_spec(SPEC); SPEC.loader.exec_module(suite)
 class FinalSuiteTests(unittest.TestCase):
     def test_quick_covers_each_campaign_path(self):
         matrix = suite.plan("quick")
-        self.assertEqual(set(matrix), {"core", "pool", "scale", "hot", "topology", "fx", "replay"})
+        self.assertEqual(set(matrix), {"core", "repeated_low", "repeated_practical", "pool", "scale", "hot", "topology", "fx_baseline", "fx", "replay"})
         self.assertEqual([p["concurrency"] for p in matrix["core"]], [1, 8, 32])
         self.assertEqual({p["instances"] for p in matrix["topology"]}, {1, 2})
 

@@ -141,8 +141,8 @@ pub async fn fx_independent(
             "expected_fx_balances",
             pairs
                 .iter()
-                .all(|(s, d)| balances.get(s) == Some(&1900) && balances.get(d) == Some(&1400)),
-            "each USD/PLN pair must be 19.00 / 14.00".into(),
+                .all(|(s, d)| balances.get(s) == Some(&1899) && balances.get(d) == Some(&1400)),
+            "each USD/PLN pair must be 18.99 / 14.00 after the 1% fee".into(),
         ),
         check(
             "no_unexpected_overdrafts",
