@@ -32,13 +32,23 @@ class FinalSuiteTests(unittest.TestCase):
         self.assertEqual(suite.effective_jwt_lifetime_secs(200_000, 10_000, 500, 1, 10), 200_000)
 
     def test_point_provenance_records_lifetime_and_failed_log(self):
-        point=suite.point_provenance(label="core-1", scenario="independent", concurrency=1, operations=10_000, warmup_operations=500, pool=32, instances=1, service_urls=["http://127.0.0.1:3101"], account_pool_size=None, effective_jwt_lifetime_secs=105_120, exit_status=1, benchmark_log="logs/core-1-benchmark.log", raw="raw/core-1.json")
+        point=suite.point_provenance(label="core-1", scenario="independent", concurrency=1, operations=10_000, warmup_operations=500, pool=32, instances=1, service_urls=["http://127.0.0.1:3101"], account_pool_size=None, effective_jwt_lifetime_secs=105_120, exit_status=1, benchmark_log="logs/core-1-benchmark.log", raw="core-1.json")
         self.assertEqual(point["effective_jwt_lifetime_secs"], 105_120)
         self.assertEqual(point["status"], "invalid")
         self.assertEqual(point["exit_status"], 1)
         self.assertEqual(point["benchmark_log"], "logs/core-1-benchmark.log")
-        self.assertEqual(point["raw"], "raw/core-1.json")
+        self.assertEqual(point["raw"], "core-1.json")
         self.assertIn("logs/core-1-benchmark.log", point["error"])
+
+    def test_readable_invalid_raw_is_not_duplicated_in_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out=Path(directory); raw=out/"raw"; raw.mkdir()
+            document={"scenario":"independent", "campaign_pool":32, "topology_levels":[{"configured_instances":1, "levels":[{"concurrency":1, "throughput_operations_per_second":None, "valid":False, "latency":{}, "verification":{"valid":False}}]}]}
+            (raw/"core-1.json").write_text(json.dumps(document), encoding="utf-8")
+            manifest={"failed":True,"raw_artifacts":[{"label":"core-1","scenario":"independent","concurrency":1,"pool":32,"instances":1,"status":"invalid","raw":"core-1.json"}]}
+            self.assertFalse(suite.write_report(out, manifest))
+            summary=json.loads((out/"summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(summary["rows"]), 1)
 
     def test_practical_selection_is_deterministic_with_fallback(self):
         self.assertEqual(suite.practical_point([]), 1)
