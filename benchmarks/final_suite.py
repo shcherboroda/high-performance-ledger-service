@@ -49,7 +49,10 @@ def practical_point(core):
 
 def aggregate(rows):
     values = sorted(r["throughput"] for r in rows if r.get("throughput") is not None)
-    return {"runs":len(rows), "valid":all(r.get("valid") for r in rows), "throughput_median": values[len(values)//2] if values else None, "throughput_min":values[0] if values else None, "throughput_max":values[-1] if values else None}
+    result={"runs":len(rows), "valid":all(r.get("valid") for r in rows), "failures":sum(r.get("failures", 0) or 0 for r in rows), "throughput_median": values[len(values)//2] if values else None, "throughput_min":values[0] if values else None, "throughput_max":values[-1] if values else None}
+    for key in ("p95_ns", "p99_ns"):
+        values=sorted(r[key] for r in rows if r.get(key) is not None); result[key.replace("_ns", "_median_ns")]=values[len(values)//2] if values else None
+    return result
 
 def latency(level):
     return {key: (level.get("latency") or {}).get(key) for key in ("mean_ns","p50_ns","p95_ns","p99_ns","max_ns")}
@@ -116,18 +119,21 @@ def write_report(out, manifest):
     text=["# Final benchmark campaign", "", "Primary metrics are end-to-end latency, throughput, failures, and correctness. HTTP, pool-acquire, and DB transaction values are diagnostic stage timings and are not additive.", "", f"Practical operating point: **{practical}** (highest valid core point within 90% of peak throughput).", ""]
     for name, prefixes in sections:
         items=rows if not prefixes else [r for r in rows if r.get("raw", "").startswith(prefixes)]
-        text += [f"## {name}", "", "| instances | concurrency | throughput ops/s | p95 ms | failures | correct | valid |", "|---:|---:|---:|---:|---:|---:|---:|"]
+        text += [f"## {name}", "", "| instances | concurrency | throughput | mean | p50 | p95 | p99 | max | HTTP mean ms | pool mean ms | DB mean ms | failures | correct | valid | error |", "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
         for r in items:
             def ms(k): return "" if r.get(k) is None else round(r[k]/1e6,3)
-            text[-2:] = ["| instances | concurrency | throughput | mean | p50 | p95 | p99 | max | HTTP mean ms | pool mean ms | DB mean ms | failures | correct | valid |", "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
             text.append(f"| {r.get('instances','')} | {r.get('concurrency','')} | {r.get('throughput','')} | {ms('mean_ns')} | {ms('p50_ns')} | {ms('p95_ns')} | {ms('p99_ns')} | {ms('max_ns')} | {r.get('http_mean_ms','')} | {r.get('pool_acquire_mean_ms','')} | {r.get('db_transaction_mean_ms','')} | {r.get('failures','')} | {r.get('correct','')} | {r.get('valid')} | {r.get('error','')} |")
         text.append("")
-    text += ["## FX relative comparison", "", "| concurrency | same-currency ops/s | FX ops/s | throughput ratio FX/same |", "|---:|---:|---:|---:|"]
+    comparisons=[]; text += ["## FX relative comparison", "", "| concurrency | same-currency ops/s | FX ops/s | throughput ratio | p95 ratio | p99 ratio |", "|---:|---:|---:|---:|---:|---:|"]
     for concurrency in sorted({r.get("concurrency") for r in rows if r.get("raw", "").startswith("fx-")}):
         ordinary=next((r for r in rows if r.get("raw", "").startswith("fx_baseline-") and r.get("concurrency")==concurrency), {})
         fx=next((r for r in rows if r.get("raw", "").startswith("fx-") and r.get("concurrency")==concurrency), {})
         ratio = fx.get("throughput") / ordinary.get("throughput") if ordinary.get("throughput") else None
-        text.append(f"| {concurrency} | {ordinary.get('throughput','')} | {fx.get('throughput','')} | {ratio if ratio is not None else ''} |")
+        p95=fx.get("p95_ns") / ordinary.get("p95_ns") if ordinary.get("p95_ns") else None; p99=fx.get("p99_ns") / ordinary.get("p99_ns") if ordinary.get("p99_ns") else None
+        comparisons.append({"concurrency":concurrency,"same_currency":ordinary,"fx":fx,"throughput_ratio":ratio,"p95_ratio":p95,"p99_ratio":p99})
+        text.append(f"| {concurrency} | {ordinary.get('throughput','')} | {fx.get('throughput','')} | {ratio if ratio is not None else ''} | {p95 if p95 is not None else ''} | {p99 if p99 is not None else ''} |")
+    summary["fx_comparisons"]=comparisons
+    (out / "summary.json").write_text(json.dumps(summary,indent=2)+"\n", encoding="utf-8")
     (out / "report.md").write_text("\n".join(text), encoding="utf-8")
     manifest["summary_valid"] = summary["valid"]
     (out / "manifest.json").write_text(json.dumps(manifest,indent=2)+"\n", encoding="utf-8")

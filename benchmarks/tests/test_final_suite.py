@@ -26,7 +26,8 @@ class FinalSuiteTests(unittest.TestCase):
         self.assertEqual(suite.practical_point([{"concurrency": 8, "throughput": 100, "valid": True}, {"concurrency": 32, "throughput": 91, "valid": True}, {"concurrency": 64, "throughput": 89, "valid": True}]), 32)
 
     def test_aggregate_reports_median_and_spread(self):
-        self.assertEqual(suite.aggregate([{"throughput": 20,"valid":True},{"throughput":10,"valid":True},{"throughput":30,"valid":True}]), {"runs":3,"valid":True,"throughput_median":20,"throughput_min":10,"throughput_max":30})
+        result=suite.aggregate([{"throughput": 20,"valid":True},{"throughput":10,"valid":True},{"throughput":30,"valid":True}])
+        self.assertEqual((result["runs"],result["throughput_median"],result["throughput_min"],result["throughput_max"]),(3,20,10,30))
 
     def test_invalid_raw_is_preserved_and_fails_summary(self):
         with tempfile.TemporaryDirectory() as directory:

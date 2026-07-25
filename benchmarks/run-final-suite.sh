@@ -23,7 +23,7 @@ out, mode = Path(sys.argv[1]), sys.argv[2]
 with (out / "matrix.tsv").open("w", encoding="utf-8") as target:
     for group, points in plan(mode).items():
         for repeat, point in enumerate(points, 1):
-            target.write("\t".join(str(point.get(key, "")) for key in ("scenario", "concurrency", "operations", "warmup", "pool", "instances", "account_pool_size")) + f"\t{group}-{repeat}\n")
+            target.write("\t".join("__NONE__" if point.get(key) is None else str(point.get(key, "")) for key in ("scenario", "concurrency", "operations", "warmup", "pool", "instances", "account_pool_size")) + f"\t{group}-{repeat}\n")
 PY
 public_key="$(<"$BENCHMARK_JWT_PUBLIC_KEY")"; pids=()
 cleanup() { local status=$?; for pid in "${pids[@]:-}"; do kill "$pid" 2>/dev/null || true; done; wait 2>/dev/null || true; exit "$status"; }
@@ -46,7 +46,7 @@ stop_services() { for pid in "${pids[@]:-}"; do kill "$pid" 2>/dev/null || true;
 cargo build --release -p rust-backend-technical-assessment -p ledger-benchmarks
 campaign_failed=0
 while IFS=$'\t' read -r scenario concurrency operations warmup pool instances account_pool_size label; do
-  if [[ -z "$concurrency" ]]; then
+  if [[ "$concurrency" == "__NONE__" ]]; then
     concurrency="$(PYTHONDONTWRITEBYTECODE=1 python3 - "$out/raw" <<'PY'
 import json, sys
 from pathlib import Path
@@ -76,9 +76,9 @@ PY
   SERVICE_URLS="$service_urls" BENCHMARK_ALLOW_DESTRUCTIVE=1 DB_MAX_CONNECTIONS="$pool" \
     cargo run -p ledger-benchmarks --release -- "${args[@]}" || status=$?
   [[ $status -eq 0 ]] || campaign_failed=1
-  PYTHONDONTWRITEBYTECODE=1 python3 - "$out/manifest.json" "$out/raw/$label.json" "$label" "$scenario" "$concurrency" "$operations" "$warmup" "$pool" "$instances" "$status" "$service_urls" <<'PY'
+  PYTHONDONTWRITEBYTECODE=1 python3 - "$out/manifest.json" "$out/raw/$label.json" "$label" "$scenario" "$concurrency" "$operations" "$warmup" "$pool" "$instances" "$status" "$service_urls" "$account_pool_size" <<'PY'
 import json, sys
-manifest,path=sys.argv[1],sys.argv[2]; d=json.load(open(manifest)); record={'label':sys.argv[3],'scenario':sys.argv[4],'concurrency':int(sys.argv[5]),'operations':int(sys.argv[6]),'warmup_operations':int(sys.argv[7]),'pool':int(sys.argv[8]),'instances':int(sys.argv[9]),'service_urls':sys.argv[11].split(','),'status':'success' if sys.argv[10]=='0' else 'invalid'}
+manifest,path=sys.argv[1],sys.argv[2]; d=json.load(open(manifest)); record={'label':sys.argv[3],'scenario':sys.argv[4],'concurrency':int(sys.argv[5]),'operations':int(sys.argv[6]),'warmup_operations':int(sys.argv[7]),'pool':int(sys.argv[8]),'instances':int(sys.argv[9]),'service_urls':sys.argv[11].split(','),'account_pool_size':None if sys.argv[12]=='__NONE__' else int(sys.argv[12]),'status':'success' if sys.argv[10]=='0' else 'invalid'}
 try:
  document=json.load(open(path)); document['campaign_pool']=record['pool']; json.dump(document, open(path,'w'),indent=2); open(path,'a').write('\n'); record['raw']=path.split('/')[-1]
 except (OSError,json.JSONDecodeError): record['error']='benchmark did not produce a readable result'
