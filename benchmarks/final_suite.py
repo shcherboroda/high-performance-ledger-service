@@ -77,9 +77,9 @@ def stage_means(level):
     result = {}
     for url in set(before) & set(after):
         left, right = samples(before[url]), samples(after[url])
-        for label, metric, required in (("http_mean_ms", "ledger_http_request_duration_seconds", {"method":"POST","route":"/transfers"}), ("pool_acquire_mean_ms", "ledger_database_pool_acquire_duration_seconds", {"operation":"transfer","outcome":"success"}), ("db_transaction_mean_ms", "ledger_database_transaction_duration_seconds", {"operation":"transfer","outcome":"success"})):
+        for label, metric, required in (("http_mean_ms", "ledger_http_request_duration_seconds", {"method":"POST","route":"/transfers"}), ("pool_acquire_mean_ms", "ledger_database_pool_acquire_duration_seconds", {"operation":"transfer","outcome":"success"}), ("db_transaction_mean_ms", "ledger_database_transaction_duration_seconds", {"outcome":"success"})):
             def value(values, suffix):
-                return sum(v for (n, labels),v in values.items() if n == metric + suffix and required.items() <= dict(labels).items())
+                return sum(v for (n, labels),v in values.items() if n == metric + suffix and required.items() <= dict(labels).items() and (label != "db_transaction_mean_ms" or dict(labels).get("operation") in {"transfer", "fx_transfer"}))
             count, total = value(right, "_count") - value(left, "_count"), value(right, "_sum") - value(left, "_sum")
             if count and total is not None: result.setdefault(label, []).append(total * 1000 / count)
     return {k: sum(v)/len(v) for k,v in result.items()}
@@ -124,6 +124,9 @@ def write_report(out, manifest):
             def ms(k): return "" if r.get(k) is None else round(r[k]/1e6,3)
             text.append(f"| {r.get('instances','')} | {r.get('concurrency','')} | {r.get('throughput','')} | {ms('mean_ns')} | {ms('p50_ns')} | {ms('p95_ns')} | {ms('p99_ns')} | {ms('max_ns')} | {r.get('http_mean_ms','')} | {r.get('pool_acquire_mean_ms','')} | {r.get('db_transaction_mean_ms','')} | {r.get('failures','')} | {r.get('correct','')} | {r.get('valid')} | {r.get('error','')} |")
         text.append("")
+    text += ["## Repeated measurement aggregates", "", "| group/configuration | runs | valid | failures | throughput median | min/max | p95 median | p99 median |", "|---|---:|---:|---:|---:|---:|---:|---:|"]
+    for group, configurations in repeated.items():
+        for configuration, values in configurations.items(): text.append(f"| {group} {configuration} | {values['runs']} | {values['valid']} | {values['failures']} | {values['throughput_median']} | {values['throughput_min']}/{values['throughput_max']} | {values['p95_median_ns']} | {values['p99_median_ns']} |")
     comparisons=[]; text += ["## FX relative comparison", "", "| concurrency | same-currency ops/s | FX ops/s | throughput ratio | p95 ratio | p99 ratio |", "|---:|---:|---:|---:|---:|---:|"]
     for concurrency in sorted({r.get("concurrency") for r in rows if r.get("raw", "").startswith("fx-")}):
         ordinary=next((r for r in rows if r.get("raw", "").startswith("fx_baseline-") and r.get("concurrency")==concurrency), {})
@@ -133,6 +136,13 @@ def write_report(out, manifest):
         comparisons.append({"concurrency":concurrency,"same_currency":ordinary,"fx":fx,"throughput_ratio":ratio,"p95_ratio":p95,"p99_ratio":p99})
         text.append(f"| {concurrency} | {ordinary.get('throughput','')} | {fx.get('throughput','')} | {ratio if ratio is not None else ''} | {p95 if p95 is not None else ''} | {p99 if p99 is not None else ''} |")
     summary["fx_comparisons"]=comparisons
+    topology=[]
+    for concurrency in sorted({r.get("concurrency") for r in rows if r.get("raw", "").startswith("topology_repeats-")}):
+        one=[r for r in rows if r.get("raw", "").startswith("topology_repeats-") and r.get("concurrency")==concurrency and r.get("instances")==1]; two=[r for r in rows if r.get("raw", "").startswith("topology_repeats-") and r.get("concurrency")==concurrency and r.get("instances")==2]
+        a,b=aggregate(one),aggregate(two); topology.append({"concurrency":concurrency,"one_instance":a,"two_instances":b,"throughput_ratio":b["throughput_median"]/a["throughput_median"] if a["throughput_median"] else None,"p95_ratio":b["p95_median_ns"]/a["p95_median_ns"] if a["p95_median_ns"] else None,"p99_ratio":b["p99_median_ns"]/a["p99_median_ns"] if a["p99_median_ns"] else None})
+    summary["topology_comparisons"]=topology
+    text += ["", "## Horizontal scalability comparison", "", "| concurrency | one-instance median ops/s | two-instance median ops/s | throughput ratio | p95 ratio | p99 ratio | valid |", "|---:|---:|---:|---:|---:|---:|---:|"]
+    for item in topology: text.append(f"| {item['concurrency']} | {item['one_instance']['throughput_median']} | {item['two_instances']['throughput_median']} | {item['throughput_ratio']} | {item['p95_ratio']} | {item['p99_ratio']} | {item['one_instance']['valid'] and item['two_instances']['valid']} |")
     (out / "summary.json").write_text(json.dumps(summary,indent=2)+"\n", encoding="utf-8")
     (out / "report.md").write_text("\n".join(text), encoding="utf-8")
     manifest["summary_valid"] = summary["valid"]

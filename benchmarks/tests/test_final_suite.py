@@ -50,4 +50,9 @@ class FinalSuiteTests(unittest.TestCase):
         result=suite.stage_means({"metrics_before":{"u":{"Ok":metrics}},"metrics_after":{"u":{"Ok":later}}})
         self.assertAlmostEqual(result["http_mean_ms"], 200)
 
+    def test_stage_means_accepts_actual_fx_transaction_label(self):
+        before='ledger_database_transaction_duration_seconds_count{operation="fx_transfer",outcome="success"} 2\nledger_database_transaction_duration_seconds_sum{operation="fx_transfer",outcome="success"} 0.02\n'
+        after='ledger_database_transaction_duration_seconds_count{operation="fx_transfer",outcome="success"} 4\nledger_database_transaction_duration_seconds_sum{operation="fx_transfer",outcome="success"} 0.08\n'
+        self.assertAlmostEqual(suite.stage_means({"metrics_before":{"u":{"Ok":before}},"metrics_after":{"u":{"Ok":after}}})["db_transaction_mean_ms"],30)
+
 if __name__ == "__main__": unittest.main()

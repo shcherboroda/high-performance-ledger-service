@@ -8,7 +8,7 @@ for name in BENCHMARK_JWT_ISSUER BENCHMARK_JWT_AUDIENCE BENCHMARK_JWT_PRIVATE_KE
 [[ "${BENCHMARK_DATABASE_URL:-}" =~ /[A-Za-z0-9_]+_benchmark([?].*)?$ ]] || { echo "error: BENCHMARK_DATABASE_URL must target a dedicated _benchmark database" >&2; exit 2; }
 dirty="$(git status --porcelain --untracked-files=all | grep -Ev '^(\?\? )?benchmarks/__pycache__/|^(\?\? )?.*\.pyc$' || true)"
 [[ -z "$dirty" ]] || { echo "error: final runs require a clean Git tree" >&2; exit 2; }
-commit="$(git rev-parse --short HEAD)"; stamp="$(date -u +%Y%m%dT%H%M%SZ)"; out="benchmark-results/final-${stamp}-${commit}"
+commit="$(git rev-parse HEAD)"; short_commit="${commit:0:7}"; stamp="$(date -u +%Y%m%dT%H%M%SZ)"; out="benchmark-results/final-${stamp}-${short_commit}"
 mkdir -p "$out"/{environment,raw,logs}; PYTHONDONTWRITEBYTECODE=1 ./benchmarks/capture-environment.sh "$out/environment/environment.txt"
 python3 - "$out/manifest.json" "$mode" "$commit" <<'PY'
 import json,sys,datetime
