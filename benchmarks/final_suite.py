@@ -30,6 +30,7 @@ def plan(mode):
         "core": [{"scenario":"independent", "concurrency": c, "operations": 40 if small else 10000, "warmup": 4 if small else 500, "pool":32, "instances":1} for c in core],
         "repeated_low": [{"scenario":"independent", "concurrency": 1, "operations":40 if small else 10000, "warmup":4 if small else 500, "pool":32, "instances":1} for _ in range(3)],
         "repeated_practical": [{"scenario":"independent", "concurrency":None, "operations":40 if small else 10000, "warmup":4 if small else 500, "pool":32, "instances":1} for _ in range(3)],
+        "repeated_saturation": [{"scenario":"independent", "concurrency":None, "operations":40 if small else 10000, "warmup":4 if small else 500, "pool":32, "instances":1} for _ in range(3)],
         "pool": [{"scenario":"independent", "concurrency":64 if not small else 8, "operations":40 if small else 10000, "warmup":4 if small else 500, "pool":p, "instances":1} for p in (32,64) for _ in range(3)],
         "scale": [{"scenario":"account-pool", "concurrency":None, "operations":120 if small else 100000, "warmup":4 if small else 500, "pool":32, "instances":1, "account_pool_size":20 if small else 10000}],
         "hot": [{"scenario":"hot-account", "concurrency":c, "operations":40 if small else 5000, "warmup":4 if small else 500, "pool":32, "instances":1} for c in ([1,8,32] if small else [1,8,32,64])],
@@ -46,6 +47,13 @@ def practical_point(core):
     if not valid: return 1
     peak = max(r["throughput"] for r in valid)
     return max(r["concurrency"] for r in valid if r["throughput"] >= peak * .9)
+
+def saturation_point(core):
+    """Pick the highest-concurrency valid core point at peak throughput, else 1."""
+    valid = [r for r in core if r.get("valid") and r.get("throughput") is not None]
+    if not valid: return 1
+    peak = max(r["throughput"] for r in valid)
+    return max(r["concurrency"] for r in valid if r["throughput"] == peak)
 
 def aggregate(rows):
     values = sorted(r["throughput"] for r in rows if r.get("throughput") is not None)
@@ -107,7 +115,7 @@ def write_report(out, manifest):
         writer=csv.DictWriter(f, fieldnames=fields); writer.writeheader(); writer.writerows(rows)
     practical=practical_point([r for r in rows if r.get("raw", "").startswith("core-")])
     repeated={}
-    for group in ("repeated_low", "repeated_practical", "pool", "topology_repeats"):
+    for group in ("repeated_low", "repeated_practical", "repeated_saturation", "pool", "topology_repeats"):
         grouped=defaultdict(list)
         for row in rows:
             if row.get("raw", "").startswith(group + "-"): grouped[(row.get("scenario"),row.get("instances"),row.get("concurrency"),row.get("pool"))].append(row)
@@ -124,9 +132,11 @@ def write_report(out, manifest):
             def ms(k): return "" if r.get(k) is None else round(r[k]/1e6,3)
             text.append(f"| {r.get('instances','')} | {r.get('concurrency','')} | {r.get('throughput','')} | {ms('mean_ns')} | {ms('p50_ns')} | {ms('p95_ns')} | {ms('p99_ns')} | {ms('max_ns')} | {r.get('http_mean_ms','')} | {r.get('pool_acquire_mean_ms','')} | {r.get('db_transaction_mean_ms','')} | {r.get('failures','')} | {r.get('correct','')} | {r.get('valid')} | {r.get('error','')} |")
         text.append("")
-    text += ["## Repeated measurement aggregates", "", "| group/configuration | runs | valid | failures | throughput median | min/max | p95 median | p99 median |", "|---|---:|---:|---:|---:|---:|---:|---:|"]
+    text += ["## Repeated measurement aggregates", "", "| group/configuration | runs | valid | failures | throughput median | min/max | p95 median ms | p99 median ms |", "|---|---:|---:|---:|---:|---:|---:|---:|"]
     for group, configurations in repeated.items():
-        for configuration, values in configurations.items(): text.append(f"| {group} {configuration} | {values['runs']} | {values['valid']} | {values['failures']} | {values['throughput_median']} | {values['throughput_min']}/{values['throughput_max']} | {values['p95_median_ns']} | {values['p99_median_ns']} |")
+        for configuration, values in configurations.items():
+            def ms(value): return "" if value is None else round(value / 1e6, 3)
+            text.append(f"| {group} {configuration} | {values['runs']} | {values['valid']} | {values['failures']} | {values['throughput_median']} | {values['throughput_min']}/{values['throughput_max']} | {ms(values['p95_median_ns'])} | {ms(values['p99_median_ns'])} |")
     comparisons=[]; text += ["## FX relative comparison", "", "| concurrency | same-currency ops/s | FX ops/s | throughput ratio | p95 ratio | p99 ratio |", "|---:|---:|---:|---:|---:|---:|"]
     for concurrency in sorted({r.get("concurrency") for r in rows if r.get("raw", "").startswith("fx-")}):
         ordinary=next((r for r in rows if r.get("raw", "").startswith("fx_baseline-") and r.get("concurrency")==concurrency), {})

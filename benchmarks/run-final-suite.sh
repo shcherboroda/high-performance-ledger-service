@@ -47,17 +47,17 @@ cargo build --release -p rust-backend-technical-assessment -p ledger-benchmarks
 campaign_failed=0
 while IFS=$'\t' read -r scenario concurrency operations warmup pool instances account_pool_size label; do
   if [[ "$concurrency" == "__NONE__" ]]; then
-    concurrency="$(PYTHONDONTWRITEBYTECODE=1 python3 - "$out/raw" <<'PY'
+    concurrency="$(PYTHONDONTWRITEBYTECODE=1 python3 - "$out/raw" "$label" <<'PY'
 import json, sys
 from pathlib import Path
 sys.path.insert(0, 'benchmarks')
-from final_suite import practical_point
+from final_suite import practical_point, saturation_point
 rows=[]
 for path in Path(sys.argv[1]).glob('core-*.json'):
     doc=json.loads(path.read_text())
     for topology in doc.get('topology_levels', []):
         for level in topology.get('levels', []): rows.append({'concurrency':level['concurrency'], 'throughput':level.get('throughput_operations_per_second'), 'valid':level.get('valid')})
-print(practical_point(rows))
+print(saturation_point(rows) if sys.argv[2].startswith('repeated_saturation-') else practical_point(rows))
 PY
 )"
   fi
