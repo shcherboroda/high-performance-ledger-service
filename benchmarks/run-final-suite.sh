@@ -5,6 +5,9 @@ mode="${1:-}"; [[ "$mode" == quick || "$mode" == full ]] || { echo "usage: $0 {q
 config="benchmarks/local.env"; [[ -r "$config" ]] || { echo "error: configuration file '$config' is missing or unreadable" >&2; exit 2; }
 set -a; source "$config"; set +a
 for name in BENCHMARK_JWT_ISSUER BENCHMARK_JWT_AUDIENCE BENCHMARK_JWT_PRIVATE_KEY BENCHMARK_JWT_PUBLIC_KEY; do [[ -n "${!name:-}" ]] || { echo "error: set $name in $config" >&2; exit 2; }; done
+[[ "${BENCHMARK_JWT_LIFETIME_SECS:-}" =~ ^[1-9][0-9]*$ ]] || { echo "error: BENCHMARK_JWT_LIFETIME_SECS must be a positive integer" >&2; exit 2; }
+request_timeout_secs="${BENCHMARK_REQUEST_TIMEOUT_SECS:-10}"
+[[ "$request_timeout_secs" =~ ^[1-9][0-9]*$ ]] || { echo "error: BENCHMARK_REQUEST_TIMEOUT_SECS must be a positive integer" >&2; exit 2; }
 [[ "${BENCHMARK_DATABASE_URL:-}" =~ /[A-Za-z0-9_]+_benchmark([?].*)?$ ]] || { echo "error: BENCHMARK_DATABASE_URL must target a dedicated _benchmark database" >&2; exit 2; }
 dirty="$(git status --porcelain --untracked-files=all | grep -Ev '^(\?\? )?benchmarks/__pycache__/|^(\?\? )?.*\.pyc$' || true)"
 [[ -z "$dirty" ]] || { echo "error: final runs require a clean Git tree" >&2; exit 2; }
@@ -72,16 +75,30 @@ PY
   service_urls="$(IFS=,; echo "${urls[*]}")"
   args=(--scenario "$scenario" --logical-clients 64 --concurrency "$concurrency" --operations "$operations" --warmup-operations "$warmup" --output "$out/raw/$label.json")
   [[ "$scenario" == account-pool ]] && args+=(--account-pool-size "$account_pool_size")
+  effective_jwt_lifetime_secs="$(PYTHONDONTWRITEBYTECODE=1 python3 - "$BENCHMARK_JWT_LIFETIME_SECS" "$operations" "$warmup" "$concurrency" "$request_timeout_secs" <<'PY'
+import sys
+sys.path.insert(0, 'benchmarks')
+from final_suite import effective_jwt_lifetime_secs
+print(effective_jwt_lifetime_secs(*(int(value) for value in sys.argv[1:])))
+PY
+)"
+  benchmark_log="logs/${label}-benchmark.log"
   status=0
-  SERVICE_URLS="$service_urls" BENCHMARK_ALLOW_DESTRUCTIVE=1 DB_MAX_CONNECTIONS="$pool" \
-    cargo run -p ledger-benchmarks --release -- "${args[@]}" || status=$?
+  SERVICE_URLS="$service_urls" BENCHMARK_ALLOW_DESTRUCTIVE=1 DB_MAX_CONNECTIONS="$pool" BENCHMARK_REQUEST_TIMEOUT_SECS="$request_timeout_secs" BENCHMARK_JWT_LIFETIME_SECS="$effective_jwt_lifetime_secs" \
+    cargo run -p ledger-benchmarks --release -- "${args[@]}" >"$out/$benchmark_log" 2>&1 || status=$?
   [[ $status -eq 0 ]] || campaign_failed=1
-  PYTHONDONTWRITEBYTECODE=1 python3 - "$out/manifest.json" "$out/raw/$label.json" "$label" "$scenario" "$concurrency" "$operations" "$warmup" "$pool" "$instances" "$status" "$service_urls" "$account_pool_size" <<'PY'
+  PYTHONDONTWRITEBYTECODE=1 python3 - "$out/manifest.json" "$out/raw/$label.json" "$label" "$scenario" "$concurrency" "$operations" "$warmup" "$pool" "$instances" "$status" "$service_urls" "$account_pool_size" "$effective_jwt_lifetime_secs" "$benchmark_log" <<'PY'
 import json, sys
-manifest,path=sys.argv[1],sys.argv[2]; d=json.load(open(manifest)); record={'label':sys.argv[3],'scenario':sys.argv[4],'concurrency':int(sys.argv[5]),'operations':int(sys.argv[6]),'warmup_operations':int(sys.argv[7]),'pool':int(sys.argv[8]),'instances':int(sys.argv[9]),'service_urls':sys.argv[11].split(','),'account_pool_size':None if sys.argv[12]=='__NONE__' else int(sys.argv[12]),'status':'success' if sys.argv[10]=='0' else 'invalid'}
+from pathlib import Path
+sys.path.insert(0, 'benchmarks')
+from final_suite import point_provenance
+manifest,path=sys.argv[1],Path(sys.argv[2]); d=json.load(open(manifest)); record=point_provenance(label=sys.argv[3],scenario=sys.argv[4],concurrency=int(sys.argv[5]),operations=int(sys.argv[6]),warmup_operations=int(sys.argv[7]),pool=int(sys.argv[8]),instances=int(sys.argv[9]),exit_status=int(sys.argv[10]),service_urls=sys.argv[11].split(','),account_pool_size=None if sys.argv[12]=='__NONE__' else int(sys.argv[12]),effective_jwt_lifetime_secs=int(sys.argv[13]),benchmark_log=sys.argv[14],raw=path.name if path.exists() else None)
 try:
- document=json.load(open(path)); document['campaign_pool']=record['pool']; json.dump(document, open(path,'w'),indent=2); open(path,'a').write('\n'); record['raw']=path.split('/')[-1]
-except (OSError,json.JSONDecodeError): record['error']='benchmark did not produce a readable result'
+ with path.open() as source: document=json.load(source)
+ document['campaign_pool']=record['pool']
+ with path.open('w') as target: json.dump(document, target, indent=2); target.write('\n')
+except (OSError,json.JSONDecodeError):
+ if record['status'] == 'success': record['status']='invalid'; record['error']=f'benchmark output is not readable; see {record["benchmark_log"]}'
 d['raw_artifacts'].append(record); json.dump(d,open(manifest,'w'),indent=2)
 PY
   stop_services

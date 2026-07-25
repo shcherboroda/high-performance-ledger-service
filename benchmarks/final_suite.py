@@ -20,6 +20,28 @@ from pathlib import Path
 
 CORE_FULL = [1, 2, 4, 8, 16, 32, 64, 96, 128]
 CORE_QUICK = [1, 8, 32]
+JWT_VALIDATION_GRACE_SECS = 60
+# This covers orchestration overhead after the benchmark's conservative
+# validation duration, without changing the benchmark workload itself.
+JWT_LIFETIME_SAFETY_MARGIN_SECS = 60
+
+def required_jwt_lifetime_secs(operations, warmup_operations, concurrency, request_timeout_secs):
+    """Match the benchmark Config lifetime validation rule."""
+    return request_timeout_secs * ((operations + warmup_operations + concurrency - 1) // concurrency) + JWT_VALIDATION_GRACE_SECS
+
+def effective_jwt_lifetime_secs(configured_lifetime_secs, operations, warmup_operations, concurrency, request_timeout_secs):
+    """Keep a sufficient configured lifetime, otherwise derive one per point."""
+    required = required_jwt_lifetime_secs(operations, warmup_operations, concurrency, request_timeout_secs)
+    return max(configured_lifetime_secs, required + JWT_LIFETIME_SAFETY_MARGIN_SECS)
+
+def point_provenance(*, label, scenario, concurrency, operations, warmup_operations, pool, instances, service_urls, account_pool_size, effective_jwt_lifetime_secs, exit_status, benchmark_log, raw=None):
+    """Return compact, point-specific campaign provenance for the manifest."""
+    record={"label":label,"scenario":scenario,"concurrency":int(concurrency),"operations":int(operations),"warmup_operations":int(warmup_operations),"pool":int(pool),"instances":int(instances),"service_urls":service_urls,"account_pool_size":account_pool_size,"effective_jwt_lifetime_secs":int(effective_jwt_lifetime_secs),"exit_status":int(exit_status),"benchmark_log":benchmark_log,"status":"success" if int(exit_status) == 0 else "invalid"}
+    if raw is not None:
+        record["raw"] = raw
+    if int(exit_status) != 0:
+        record["error"] = f"benchmark exited with status {exit_status}; see {benchmark_log}"
+    return record
 
 def plan(mode):
     if mode not in ("quick", "full"):
