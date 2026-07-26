@@ -45,7 +45,12 @@ def point_provenance(*, label, scenario, concurrency, operations, warmup_operati
 
 def raw_pool(document):
     """Return the raw artifact's effective per-instance pool size, if valid."""
-    pool = (document.get("effective_database_pool") or {}).get("max_connections_per_instance")
+    if "effective_database_pool" in document:
+        pool = (document.get("effective_database_pool") or {}).get("max_connections_per_instance")
+        return pool if isinstance(pool, int) and pool > 0 else None
+    # Legacy schema-v5 final-campaign artifacts have numeric orchestration
+    # provenance but predate the structured raw field.
+    pool = document.get("campaign_pool")
     return pool if isinstance(pool, int) and pool > 0 else None
 
 def apply_campaign_pool(document, expected_pool):

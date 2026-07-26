@@ -11,6 +11,9 @@ pub struct EffectiveDatabasePool {
     /// this measurement. No service environment is serialized.
     pub max_connections_per_instance: u32,
 }
+pub fn database_pool_assumptions(max_connections_per_instance: u32) -> String {
+    format!("DB_MAX_CONNECTIONS={max_connections_per_instance}")
+}
 #[derive(Debug, Serialize)]
 pub struct LevelResult {
     pub scenario: String,
@@ -120,6 +123,9 @@ pub struct ResultDocument {
     /// Added without changing schema_version so schema-v5 consumers that
     /// ignore unknown fields remain compatible.
     pub effective_database_pool: EffectiveDatabasePool,
+    /// Legacy schema-v5 compatibility metadata, now derived from
+    /// `effective_database_pool` instead of a separate benchmark setting.
+    pub database_pool_assumptions: Option<String>,
     pub telemetry_mode: Option<String>,
     pub environment: BTreeMap<String, String>,
     pub limitations: Vec<String>,
@@ -260,6 +266,7 @@ mod tests {
                     effective_database_pool: EffectiveDatabasePool {
                         max_connections_per_instance: 10,
                     },
+                    database_pool_assumptions: Some(database_pool_assumptions(10)),
                     telemetry_mode: None,
                     environment: BTreeMap::new(),
                     limitations: vec![],
@@ -277,6 +284,7 @@ mod tests {
             report["effective_database_pool"]["max_connections_per_instance"],
             10
         );
+        assert_eq!(report["database_pool_assumptions"], "DB_MAX_CONNECTIONS=10");
         assert!(!report.as_object().unwrap().contains_key("progress"));
     }
     #[test]

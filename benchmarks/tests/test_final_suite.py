@@ -119,6 +119,19 @@ class FinalSuiteTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not match"):
             suite.apply_campaign_pool(document, 32)
 
+    def test_legacy_campaign_pool_provenance_remains_reportable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out=Path(directory); raw=out/"raw"; raw.mkdir()
+            for pool in (32, 64):
+                document={"scenario":"independent", "campaign_pool":pool, "topology_levels":[{"configured_instances":1, "levels":[{"concurrency":8, "throughput_operations_per_second":100, "valid":True, "latency":{}, "verification":{"valid":True}}]}]}
+                (raw/f"legacy-pool-{pool}.json").write_text(json.dumps(document), encoding="utf-8")
+            self.assertTrue(suite.write_report(out, {}))
+            rows=json.loads((out/"summary.json").read_text(encoding="utf-8"))["rows"]
+            self.assertEqual([row["pool"] for row in rows], [32, 64])
+
+    def test_raw_pool_does_not_parse_legacy_free_text_assumptions(self):
+        self.assertIsNone(suite.raw_pool({"database_pool_assumptions":"DB_MAX_CONNECTIONS=64"}))
+
     def test_missing_raw_pool_provenance_invalidates_report(self):
         with tempfile.TemporaryDirectory() as directory:
             out=Path(directory); raw=out/"raw"; raw.mkdir()
