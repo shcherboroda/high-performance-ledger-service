@@ -13,7 +13,19 @@ docker compose up -d
 docker compose ps
 ```
 
-Set the required connection string and JWT configuration, then apply the committed migrations:
+### Application runtime configuration
+
+The service reads its configuration from environment variables. For local development, copy the
+safe template and fill in the JWT public key from your issuer; `.env` is ignored and must never be
+committed:
+
+```bash
+cp .env.example .env
+# edit .env, including JWT_PUBLIC_KEY_PEM
+```
+
+Set the required connection string and JWT configuration, then apply the committed migrations
+explicitly before starting the service:
 
 ```bash
 export DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/ledger'
@@ -28,6 +40,20 @@ Start the service:
 ```bash
 cargo run
 ```
+
+### Database-backed tests
+
+From a fresh shell, run the local test bootstrap:
+
+```bash
+./scripts/test-local.sh
+```
+
+It starts or verifies the existing Compose PostgreSQL service, waits until it accepts queries, and
+uses `postgres://postgres:postgres@127.0.0.1:5432/ledger` only when `DATABASE_URL` is unset. An
+explicit `DATABASE_URL` is preserved. The script does not load `.env` and tests do not need JWT
+runtime variables. The `#[sqlx::test]` suite creates isolated databases and applies committed
+migrations; the default Compose `postgres` role has the required create/drop-database privilege.
 
 ## Run with Docker
 
@@ -57,6 +83,12 @@ When the service container connects to the Compose PostgreSQL service, attach it
 Compose network and use the service hostname in `DATABASE_URL` (for example,
 `postgres://postgres:postgres@postgres:5432/ledger`). Do not use `127.0.0.1`: inside the service
 container, that address refers to the service container itself.
+
+### Production and container configuration
+
+Production and container configuration remains externally injected through the environment or a
+secret manager. A local `.env` is only a developer convenience and is neither copied into the image
+nor required by the container. Migrations remain an explicit operation before service startup.
 
 JWT authentication requires `JWT_ISSUER`, `JWT_AUDIENCE`, and `JWT_PUBLIC_KEY_PEM`. The PEM must
 be an RSA public key. The command substitution above preserves a multiline PEM; alternatively use
