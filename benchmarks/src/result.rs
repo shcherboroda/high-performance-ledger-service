@@ -6,6 +6,12 @@ use std::{collections::BTreeMap, path::Path};
 /// unavailable process-local metrics snapshot from workload failure.
 pub const SCHEMA_VERSION: u32 = 5;
 #[derive(Debug, Serialize)]
+pub struct EffectiveDatabasePool {
+    /// Effective DB_MAX_CONNECTIONS supplied to every service instance for
+    /// this measurement. No service environment is serialized.
+    pub max_connections_per_instance: u32,
+}
+#[derive(Debug, Serialize)]
 pub struct LevelResult {
     pub scenario: String,
     pub seed: u64,
@@ -110,7 +116,10 @@ pub struct ResultDocument {
     pub logical_clients: usize,
     pub request_timeout_secs: u64,
     pub summary: TopologySummary,
-    pub database_pool_assumptions: Option<String>,
+    /// Structured, effective service-side database-pool provenance.
+    /// Added without changing schema_version so schema-v5 consumers that
+    /// ignore unknown fields remain compatible.
+    pub effective_database_pool: EffectiveDatabasePool,
     pub telemetry_mode: Option<String>,
     pub environment: BTreeMap<String, String>,
     pub limitations: Vec<String>,
@@ -248,7 +257,9 @@ mod tests {
                     summary: TopologySummary {
                         adjacent_throughput_ratios: vec![],
                     },
-                    database_pool_assumptions: None,
+                    effective_database_pool: EffectiveDatabasePool {
+                        max_connections_per_instance: 10,
+                    },
                     telemetry_mode: None,
                     environment: BTreeMap::new(),
                     limitations: vec![],
@@ -262,6 +273,10 @@ mod tests {
         assert!(stderr.contains("benchmark: concurrency=2 measured started"));
         assert!(stderr.contains("benchmark: concurrency=2 measured progress 2/20"));
         assert_eq!(report["schema_version"], SCHEMA_VERSION);
+        assert_eq!(
+            report["effective_database_pool"]["max_connections_per_instance"],
+            10
+        );
         assert!(!report.as_object().unwrap().contains_key("progress"));
     }
     #[test]

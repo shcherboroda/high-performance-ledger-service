@@ -118,7 +118,7 @@ def summarize(document):
     if not isinstance(document, dict) or document.get("schema_version") != 5 or not isinstance(document.get("topology_levels"), list):
         raise ValueError("unsupported schema version or structurally unusable result")
     print(f"scenario={document.get('scenario')} seed={document.get('seed')} commit={document.get('commit_sha') or 'unavailable'}")
-    for key in ("database_pool_assumptions", "telemetry_mode", "environment"):
+    for key in ("effective_database_pool", "telemetry_mode", "environment"):
         if document.get(key) is not None:
             print(f"{key}: {document[key]}")
     rows, invalid = [], False

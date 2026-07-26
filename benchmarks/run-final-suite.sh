@@ -91,14 +91,14 @@ PY
 import json, sys
 from pathlib import Path
 sys.path.insert(0, 'benchmarks')
-from final_suite import point_provenance
+from final_suite import apply_campaign_pool, point_provenance
 manifest,path=sys.argv[1],Path(sys.argv[2]); d=json.load(open(manifest)); record=point_provenance(label=sys.argv[3],scenario=sys.argv[4],concurrency=int(sys.argv[5]),operations=int(sys.argv[6]),warmup_operations=int(sys.argv[7]),pool=int(sys.argv[8]),instances=int(sys.argv[9]),exit_status=int(sys.argv[10]),service_urls=sys.argv[11].split(','),account_pool_size=None if sys.argv[12]=='__NONE__' else int(sys.argv[12]),effective_jwt_lifetime_secs=int(sys.argv[13]),benchmark_log=sys.argv[14],raw=path.name if path.exists() else None)
 try:
  with path.open() as source: document=json.load(source)
- document['campaign_pool']=record['pool']
+ apply_campaign_pool(document, record['pool'])
  with path.open('w') as target: json.dump(document, target, indent=2); target.write('\n')
-except (OSError,json.JSONDecodeError):
- if record['status'] == 'success': record['status']='invalid'; record['error']=f'benchmark output is not readable; see {record["benchmark_log"]}'
+except (OSError,json.JSONDecodeError,ValueError) as error:
+ if record['status'] == 'success': record['status']='invalid'; record['error']=f'{error}; see {record["benchmark_log"]}'
 d['raw_artifacts'].append(record); json.dump(d,open(manifest,'w'),indent=2)
 PY
   stop_services

@@ -43,7 +43,7 @@ class FinalSuiteTests(unittest.TestCase):
     def test_readable_invalid_raw_is_not_duplicated_in_report(self):
         with tempfile.TemporaryDirectory() as directory:
             out=Path(directory); raw=out/"raw"; raw.mkdir()
-            document={"scenario":"independent", "campaign_pool":32, "topology_levels":[{"configured_instances":1, "levels":[{"concurrency":1, "throughput_operations_per_second":None, "valid":False, "latency":{}, "verification":{"valid":False}}]}]}
+            document={"scenario":"independent", "effective_database_pool":{"max_connections_per_instance":32}, "topology_levels":[{"configured_instances":1, "levels":[{"concurrency":1, "throughput_operations_per_second":None, "valid":False, "latency":{}, "verification":{"valid":False}}]}]}
             (raw/"core-1.json").write_text(json.dumps(document), encoding="utf-8")
             manifest={"failed":True,"raw_artifacts":[{"label":"core-1","scenario":"independent","concurrency":1,"pool":32,"instances":1,"status":"invalid","raw":"core-1.json"}]}
             self.assertFalse(suite.write_report(out, manifest))
@@ -81,7 +81,7 @@ class FinalSuiteTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             out=Path(directory); raw=out/"raw"; raw.mkdir()
             for run, (p95, p99) in enumerate(((12_000_000, 15_000_000), (13_000_000, 16_000_000), (14_000_000, 17_000_000)), 1):
-                document={"scenario":"independent", "campaign_pool":32, "topology_levels":[{"configured_instances":1, "levels":[{"concurrency":64, "throughput_operations_per_second":100.0 + run, "valid":True, "latency":{"p95_ns":p95, "p99_ns":p99}, "verification":{"valid":True}}]}]}
+                document={"scenario":"independent", "effective_database_pool":{"max_connections_per_instance":32}, "topology_levels":[{"configured_instances":1, "levels":[{"concurrency":64, "throughput_operations_per_second":100.0 + run, "valid":True, "latency":{"p95_ns":p95, "p99_ns":p99}, "verification":{"valid":True}}]}]}
                 (raw/f"repeated_saturation-{run}.json").write_text(json.dumps(document), encoding="utf-8")
             self.assertTrue(suite.write_report(out, {}))
             summary=json.loads((out/"summary.json").read_text(encoding="utf-8"))
@@ -102,5 +102,29 @@ class FinalSuiteTests(unittest.TestCase):
         before='ledger_database_transaction_duration_seconds_count{operation="fx_transfer",outcome="success"} 2\nledger_database_transaction_duration_seconds_sum{operation="fx_transfer",outcome="success"} 0.02\n'
         after='ledger_database_transaction_duration_seconds_count{operation="fx_transfer",outcome="success"} 4\nledger_database_transaction_duration_seconds_sum{operation="fx_transfer",outcome="success"} 0.08\n'
         self.assertAlmostEqual(suite.stage_means({"metrics_before":{"u":{"Ok":before}},"metrics_after":{"u":{"Ok":after}}})["db_transaction_mean_ms"],30)
+
+    def test_raw_pool_provenance_is_the_report_source_for_multi_instance_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out=Path(directory); raw=out/"raw"; raw.mkdir()
+            document={"scenario":"independent", "campaign_pool":32, "effective_database_pool":{"max_connections_per_instance":64}, "topology_levels":[{"configured_instances":1, "levels":[{"concurrency":8, "throughput_operations_per_second":100, "valid":True, "latency":{}, "verification":{"valid":True}}]},{"configured_instances":2, "levels":[{"concurrency":8, "throughput_operations_per_second":110, "valid":True, "latency":{}, "verification":{"valid":True}}]}]}
+            (raw/"topology-1.json").write_text(json.dumps(document), encoding="utf-8")
+            self.assertTrue(suite.write_report(out, {}))
+            rows=json.loads((out/"summary.json").read_text(encoding="utf-8"))["rows"]
+            self.assertEqual([row["pool"] for row in rows], [64, 64])
+
+    def test_campaign_provenance_must_match_the_raw_effective_pool(self):
+        document={"effective_database_pool":{"max_connections_per_instance":64}}
+        suite.apply_campaign_pool(document, 64)
+        self.assertEqual(document["campaign_pool"], 64)
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            suite.apply_campaign_pool(document, 32)
+
+    def test_missing_raw_pool_provenance_invalidates_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out=Path(directory); raw=out/"raw"; raw.mkdir()
+            document={"scenario":"independent", "topology_levels":[{"configured_instances":1, "levels":[{"concurrency":8, "throughput_operations_per_second":100, "valid":True, "latency":{}, "verification":{"valid":True}}]}]}
+            (raw/"core-1.json").write_text(json.dumps(document), encoding="utf-8")
+            self.assertFalse(suite.write_report(out, {}))
+            self.assertIn("missing effective database pool provenance", (out/"summary.json").read_text(encoding="utf-8"))
 
 if __name__ == "__main__": unittest.main()
