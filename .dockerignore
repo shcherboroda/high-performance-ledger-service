@@ -1,0 +1,20 @@
+# Build outputs and benchmark artifacts
+/target
+/benchmark-results
+/benchmarks/local.env
+
+# Local secrets
+/.env
+
+# Version-control, editor, and temporary files
+/.git
+/.github
+/.gitignore
+.idea
+.vscode
+.DS_Store
+*.swp
+*.swo
+*~
+__pycache__
+.pytest_cache
