@@ -23,9 +23,9 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
       - name: Check formatting
-        run: cargo fmt -- --check
+        run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   audit:
     name: Security Audit
@@ -71,7 +71,7 @@ jobs:
         run: sqlx migrate run
 
       - name: Build
-        run: cargo build --verbose
+        run: cargo build --workspace --release
 
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --workspace --all-targets --all-features
