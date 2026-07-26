@@ -10,7 +10,6 @@ COPY Cargo.toml Cargo.lock ./
 COPY benchmarks/Cargo.toml benchmarks/Cargo.toml
 COPY src ./src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/app/target \
     cargo build --release --locked --package rust-backend-technical-assessment --bin rust-backend-technical-assessment
 
 FROM debian:bookworm-slim AS runtime
