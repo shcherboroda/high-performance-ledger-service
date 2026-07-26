@@ -86,9 +86,9 @@ The matching pool32 boundary points make this comparison much less confounded
 by temporal drift than the original sequential experiment. Pool64 increased
 average throughput by about 12.6% locally and nearly eliminated application-side
 pool wait, but DB transaction time rose to roughly 1.8× the pool32 value. Tail
-latency was not uniformly better. `DB_MAX_CONNECTIONS=32` remains the
-conservative repository default; pool64 is deployment-specific tuning after
-environment-specific capacity testing, not a universal improvement.
+latency was not uniformly better. `DB_MAX_CONNECTIONS=32` was the conservative
+baseline used for the final benchmark campaign; pool64 is deployment-specific
+tuning after environment-specific capacity testing, not a universal improvement.
 
 ## Contention, scale, and workload comparisons
 
