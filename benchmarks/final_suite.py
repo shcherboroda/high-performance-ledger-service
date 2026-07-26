@@ -43,6 +43,29 @@ def point_provenance(*, label, scenario, concurrency, operations, warmup_operati
         record["error"] = f"benchmark exited with status {exit_status}; see {benchmark_log}"
     return record
 
+def raw_pool(document):
+    """Return the raw artifact's effective per-instance pool size, if valid."""
+    if "effective_database_pool" in document:
+        pool = (document.get("effective_database_pool") or {}).get("max_connections_per_instance")
+        return pool if isinstance(pool, int) and pool > 0 else None
+    # Legacy schema-v5 final-campaign artifacts have numeric orchestration
+    # provenance but predate the structured raw field.
+    pool = document.get("campaign_pool")
+    return pool if isinstance(pool, int) and pool > 0 else None
+
+def apply_campaign_pool(document, expected_pool):
+    """Validate campaign and raw pool provenance before retaining legacy metadata."""
+    pool = raw_pool(document)
+    if pool is None:
+        raise ValueError("raw artifact is missing effective database pool provenance")
+    if pool != expected_pool:
+        raise ValueError(
+            f"raw artifact effective DB_MAX_CONNECTIONS={pool} does not match campaign pool={expected_pool}"
+        )
+    # Existing campaign consumers read this field. It is derived from, rather
+    # than independently configured from, the raw service-side provenance.
+    document["campaign_pool"] = pool
+
 def plan(mode):
     if mode not in ("quick", "full"):
         raise ValueError("mode must be quick or full")
@@ -123,7 +146,9 @@ def rows_from_raw(raw_dir):
             if not topology.get("levels"):
                 rows.append({"raw":path.name,"scenario":doc.get("scenario"),"instances":topology.get("configured_instances"),"valid":False,"error":topology.get("workload_skipped_reason") or "workload failure"})
             for level in topology.get("levels",[]):
-                row={"raw":path.name,"scenario":doc.get("scenario"),"instances":topology.get("configured_instances"),"concurrency":level.get("concurrency"),"pool":doc.get("campaign_pool"),"throughput":level.get("throughput_operations_per_second"),"failures":failures(level),"valid":bool(level.get("valid")),"correct":bool((level.get("verification") or {}).get("valid")), **latency(level), **stage_means(level)}
+                pool = raw_pool(doc)
+                row={"raw":path.name,"scenario":doc.get("scenario"),"instances":topology.get("configured_instances"),"concurrency":level.get("concurrency"),"pool":pool,"throughput":level.get("throughput_operations_per_second"),"failures":failures(level),"valid":bool(level.get("valid")) and pool is not None,"correct":bool((level.get("verification") or {}).get("valid")), **latency(level), **stage_means(level)}
+                if pool is None: row["error"] = "raw artifact is missing effective database pool provenance"
                 rows.append(row)
     return rows
 

@@ -7,7 +7,7 @@ use ledger_benchmarks::{
     dataset::{self, ScenarioPlan, TransferPlan},
     http,
     progress::{ProgressPhase, ProgressReporter},
-    result::{self, LevelResult, ResultDocument, TopologyLevelResult},
+    result::{self, EffectiveDatabasePool, LevelResult, ResultDocument, TopologyLevelResult},
     stats, verify,
 };
 use serde::Serialize;
@@ -73,7 +73,7 @@ async fn run() -> Result<()> {
             levels,
         });
     }
-    let document=ResultDocument{schema_version:result::SCHEMA_VERSION,generated_at_utc:Utc::now(),commit_sha:git_sha(),scenario:config.scenario.name().into(),seed:config.seed,logical_clients:config.logical_clients,request_timeout_secs:config.request_timeout_secs,summary:result::summarize_topologies(&topology_levels),topology_levels,database_pool_assumptions:config.db_pool_assumptions.clone(),telemetry_mode:config.telemetry_mode.clone(),environment:environment(&pool).await,limitations:vec!["Results are environment-specific and are not production performance guarantees.".into(),"Metrics are raw process-local snapshots and are not used for client latency percentiles.".into()]};
+    let document=ResultDocument{schema_version:result::SCHEMA_VERSION,generated_at_utc:Utc::now(),commit_sha:git_sha(),scenario:config.scenario.name().into(),seed:config.seed,logical_clients:config.logical_clients,request_timeout_secs:config.request_timeout_secs,summary:result::summarize_topologies(&topology_levels),topology_levels,effective_database_pool:EffectiveDatabasePool{max_connections_per_instance:config.db_max_connections},database_pool_assumptions:Some(result::database_pool_assumptions(config.db_max_connections)),telemetry_mode:config.telemetry_mode.clone(),environment:environment(&pool).await,limitations:vec!["Results are environment-specific and are not production performance guarantees.".into(),"Metrics are raw process-local snapshots and are not used for client latency percentiles.".into()]};
     result::write(&config.output, &document)?;
     if document.topology_levels.iter().any(|level| !level.valid) {
         anyhow::bail!(

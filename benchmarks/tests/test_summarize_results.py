@@ -37,12 +37,12 @@ ledger_database_pool_acquire_duration_seconds_sum{operation="transfer",outcome="
 
 def result(valid=True):
     level = {"concurrency": 2, "warmup_operations": 4, "measured_operations": 20, "completed_measured_operations": 20, "throughput_operations_per_second": 100.0, "latency": {"min_ns": 1_000_000, "mean_ns": 2_000_000, "p50_ns": 2_000_000, "p95_ns": 3_000_000, "p99_ns": 4_000_000, "max_ns": 5_000_000}, "classifications": {"http_statuses": {"201": 20}, "expected_business_rejections": 0, "transport_failures": 0, "timeout_failures": 0, "parsing_failures": 0, "unexpected_http_failures": 0}, "verification": {"valid": valid, "checks": [{"name": "transfers", "passed": valid, "detail": "ok"}]}, "valid": valid, "metrics_collection_valid": True, "metrics_before": {"http://a": {"Ok": METRICS_BEFORE}}, "metrics_after": {"http://a": {"Ok": METRICS_AFTER}}}
-    return {"schema_version": 5, "scenario": "independent", "seed": 1, "commit_sha": "abc", "topology_levels": [{"configured_instances": 1, "service_urls": ["http://a"], "valid": valid, "levels": [level]}]}
+    return {"schema_version": 5, "scenario": "independent", "seed": 1, "commit_sha": "abc", "effective_database_pool": {"max_connections_per_instance": 32}, "database_pool_assumptions":"DB_MAX_CONNECTIONS=32", "topology_levels": [{"configured_instances": 1, "service_urls": ["http://a"], "valid": valid, "levels": [level]}]}
 
 class SummarizerTests(unittest.TestCase):
     def test_local_config_example_is_sourceable(self):
         self.assertIn("BENCHMARK_JWT_LIFETIME_SECS=28800", CONFIG_EXAMPLE.read_text(encoding="utf-8"))
-        completed = subprocess.run(["bash", "-c", 'source "$1" && [[ "$BENCHMARK_JWT_LIFETIME_SECS" == "28800" ]] && [[ "$BENCHMARK_DB_POOL_ASSUMPTIONS" == "1 local service instance; application default DB pool configuration" ]] && [[ "$BENCHMARK_TELEMETRY_MODE" == "RUST_LOG=warn; process-local Prometheus snapshots before and after each measured level" ]]', "bash", str(CONFIG_EXAMPLE)], capture_output=True, text=True, check=False)
+        completed = subprocess.run(["bash", "-c", 'source "$1" && [[ "$BENCHMARK_JWT_LIFETIME_SECS" == "28800" ]] && [[ "$BENCHMARK_TELEMETRY_MODE" == "RUST_LOG=warn; process-local Prometheus snapshots before and after each measured level" ]]', "bash", str(CONFIG_EXAMPLE)], capture_output=True, text=True, check=False)
         self.assertEqual(completed.returncode, 0, completed.stderr)
     def test_schema_v5_summary(self): self.assertEqual(summarizer.summarize(result()), 0)
     def test_label_aware_metrics_delta(self):

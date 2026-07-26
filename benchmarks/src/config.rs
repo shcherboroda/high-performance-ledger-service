@@ -69,8 +69,11 @@ pub struct Config {
     pub jwt_private_key: PathBuf,
     #[arg(long, env = "BENCHMARK_JWT_LIFETIME_SECS", default_value_t = 3600)]
     pub jwt_lifetime_secs: u64,
-    #[arg(long, env = "BENCHMARK_DB_POOL_ASSUMPTIONS")]
-    pub db_pool_assumptions: Option<String>,
+    /// Must match the DB_MAX_CONNECTIONS value used to start the service(s).
+    /// This is recorded as structured result provenance rather than a separate
+    /// benchmark-only assumption so the two values cannot drift.
+    #[arg(long, env = "DB_MAX_CONNECTIONS", default_value_t = 10)]
+    pub db_max_connections: u32,
     #[arg(long, env = "BENCHMARK_TELEMETRY_MODE")]
     pub telemetry_mode: Option<String>,
 }
@@ -142,6 +145,9 @@ impl Config {
         parse_concurrency_levels(&self.concurrency_levels)?;
         if self.request_timeout_secs == 0 || self.jwt_lifetime_secs == 0 {
             bail!("request timeout and JWT lifetime must be greater than zero")
+        }
+        if self.db_max_connections == 0 {
+            bail!("DB_MAX_CONNECTIONS must be greater than zero")
         }
         if self.jwt_issuer.trim().is_empty() || self.jwt_audience.trim().is_empty() {
             bail!("JWT issuer and audience must not be blank")
@@ -231,7 +237,7 @@ mod tests {
             jwt_private_key: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../tests/fixtures/jwt-test-private.pem"),
             jwt_lifetime_secs: 61,
-            db_pool_assumptions: None,
+            db_max_connections: 10,
             telemetry_mode: None,
         }
     }
@@ -274,6 +280,24 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(parsed.scenario, Scenario::HotAccount);
+        assert_eq!(parsed.db_max_connections, 10);
+        let overridden = Config::try_parse_from([
+            "ledger-benchmark",
+            "--service-urls",
+            "http://localhost:3000",
+            "--database-url",
+            "postgres://localhost/ledger_benchmark",
+            "--jwt-issuer",
+            "issuer",
+            "--jwt-audience",
+            "audience",
+            "--jwt-private-key",
+            "key.pem",
+            "--db-max-connections",
+            "64",
+        ])
+        .unwrap();
+        assert_eq!(overridden.db_max_connections, 64);
         assert!(
             Config::try_parse_from([
                 "ledger-benchmark",
@@ -347,6 +371,10 @@ mod tests {
 
         let mut config = valid();
         config.jwt_lifetime_secs = 1;
+        assert!(config.validate().is_err());
+
+        let mut config = valid();
+        config.db_max_connections = 0;
         assert!(config.validate().is_err());
     }
 }
