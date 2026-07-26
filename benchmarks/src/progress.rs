@@ -121,7 +121,7 @@ impl ProgressPhase<'_> {
 fn should_report_progress(completed: usize, expected: usize) -> bool {
     expected >= MIN_OPERATIONS_FOR_PROGRESS
         && completed < expected
-        && completed % expected.div_ceil(MAX_PROGRESS_UPDATES) == 0
+        && completed.is_multiple_of(expected.div_ceil(MAX_PROGRESS_UPDATES))
 }
 
 #[cfg(test)]
