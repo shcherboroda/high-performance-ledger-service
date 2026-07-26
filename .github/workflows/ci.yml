@@ -73,5 +73,11 @@ jobs:
       - name: Build
         run: cargo build --workspace --release
 
+      - name: Build Docker image
+        run: docker build -t ledger-service:ci .
+
+      - name: Run benchmark tooling tests
+        run: python3 -m unittest discover -s benchmarks/tests
+
       - name: Run tests
         run: cargo test --workspace --all-targets --all-features
