@@ -257,6 +257,12 @@ Transfer timing is ordered as: `client end-to-end -> middleware setup -> handler
 For local PR readiness, use the canonical command above rather than running bare cargo checks separately.
 # Final campaign
 
+For the curated interpretation of the final measured campaign, including its
+limitations and the resulting engineering decision, see the [final performance
+report](../docs/performance.md). This README documents the reproducible harness
+and generated environment-specific artifacts; the report does not replace those
+raw results.
+
 Run the reproducible assessment campaign with the ignored local configuration:
 
 ```bash
