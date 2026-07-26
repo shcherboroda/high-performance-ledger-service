@@ -560,6 +560,7 @@ POST /transfers/{transfer_id}/reversal
 GET  /health
 GET  /ready
 GET  /metrics
+GET  /openapi.json
 ```
 
 The complete request, response and error schemas belong in OpenAPI 3.1.
