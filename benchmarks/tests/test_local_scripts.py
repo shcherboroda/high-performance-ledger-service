@@ -31,8 +31,10 @@ BENCHMARK_TELEMETRY_MODE=telemetry
         for name, body in {
             "git": "#!/usr/bin/env bash\nexit 0\n",
             "cargo": "#!/usr/bin/env bash\nprintf '%s|%s\\n' \"$*\" \"${DATABASE_URL:-missing}\" >>\"$CARGO_CALLS\"\n",
+            "cargo-audit": "#!/usr/bin/env bash\nexit 0\n",
             "python3": "#!/usr/bin/env bash\nexit 0\n",
             "sqlx": "#!/usr/bin/env bash\nprintf '%s %s\\n' \"$1\" \"$DATABASE_URL\" >>\"$SQLX_CALLS\"\n",
+            "docker": "#!/usr/bin/env bash\nif [[ \"$1\" == \"compose\" && \"$2\" == \"version\" ]]; then exit 0; fi\nexit 0\n",
         }.items():
             tool = tools / name
             tool.write_text(body, encoding="utf-8")
@@ -235,8 +237,10 @@ BENCHMARK_TELEMETRY_MODE=telemetry
             ])
             self.assertEqual(cargo_calls.read_text(encoding="utf-8").splitlines(), [
                 "fmt --all --check|postgresql://user:secret@db.example:5544/postgres?sslmode=require&application_name=/ledger_benchmark",
-                "clippy --all-targets --all-features -- -D warnings|postgresql://user:secret@db.example:5544/postgres?sslmode=require&application_name=/ledger_benchmark",
-                "test --all-targets --all-features|postgresql://user:secret@db.example:5544/postgres?sslmode=require&application_name=/ledger_benchmark",
+                "clippy --workspace --all-targets --all-features -- -D warnings|postgresql://user:secret@db.example:5544/postgres?sslmode=require&application_name=/ledger_benchmark",
+                "test --workspace --all-targets --all-features|postgresql://user:secret@db.example:5544/postgres?sslmode=require&application_name=/ledger_benchmark",
+                "build --workspace --release|postgresql://user:secret@db.example:5544/postgres?sslmode=require&application_name=/ledger_benchmark",
+                "audit|postgresql://user:secret@db.example:5544/postgres?sslmode=require&application_name=/ledger_benchmark",
             ])
             self.assertEqual(events.read_text(encoding="utf-8"), "runner")
 

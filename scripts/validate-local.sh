@@ -48,10 +48,31 @@ if [[ -n "${DATABASE_URL:-}" && "$DATABASE_URL" != "$admin_database_url" ]]; the
 fi
 export DATABASE_URL="$admin_database_url"
 
+require_command() {
+  local command_name="$1"
+  local diagnostic="$2"
+  if ! command -v "$command_name" >/dev/null 2>&1; then
+    echo "error: $diagnostic" >&2
+    exit 2
+  fi
+}
+
+require_command cargo "Rust Cargo is required"
+require_command cargo-audit "cargo-audit is required; install it with: cargo install cargo-audit"
+require_command sqlx "SQLx CLI is required; install it with: cargo install sqlx-cli --no-default-features --features postgres"
+require_command docker "Docker is required for the container validation build"
+if ! docker compose version >/dev/null 2>&1; then
+  echo "error: Docker Compose v2 is required (docker compose) for local benchmark validation" >&2
+  exit 2
+fi
+
 git diff --check
 cargo fmt --all --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+env -u DB_MIN_CONNECTIONS -u DB_MAX_CONNECTIONS cargo test --workspace --all-targets --all-features
+cargo build --workspace --release
+cargo audit
+docker build -t ledger-service:validation .
 python3 -m unittest discover -s benchmarks/tests
 
 echo "creating benchmark database with derived SQLx administrative URL"
