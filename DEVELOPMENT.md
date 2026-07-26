@@ -13,21 +13,45 @@ docker compose up -d
 docker compose ps
 ```
 
-Set the required connection string and JWT configuration, then apply the committed migrations:
+### Application runtime configuration
+
+The service reads its configuration from environment variables. For local development, copy the
+safe template and fill in the JWT public key from your issuer; `.env` is ignored and must never be
+committed:
 
 ```bash
-export DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/ledger'
-export JWT_ISSUER='https://issuer.example'
-export JWT_AUDIENCE='ledger-service'
-export JWT_PUBLIC_KEY_PEM="$(cat ./path/to/issuer-public-key.pem)"
-cargo sqlx migrate run
+cp .env.example .env
+# edit .env and replace the JWT_PUBLIC_KEY_PEM placeholder with your issuer's public key
 ```
 
-Start the service:
+`JWT_PUBLIC_KEY_PEM` must contain the literal RSA public key. In a quoted dotenv value, preserve
+line breaks as `\n` escapes (as in `.env.example`) or use dotenv-supported multiline quoting. Never
+commit the resulting `.env` or a real key.
+
+With the local `.env` in place, apply the committed migrations explicitly before starting the
+service:
 
 ```bash
+cargo sqlx migrate run
 cargo run
 ```
+
+Shell environment variables remain an alternative for local runtime configuration and take
+precedence over values from `.env`.
+
+### Database-backed tests
+
+From a fresh shell, run the local test bootstrap:
+
+```bash
+./scripts/test-local.sh
+```
+
+It starts or verifies the existing Compose PostgreSQL service, waits until it accepts queries, and
+uses `postgres://postgres:postgres@127.0.0.1:5432/ledger` only when `DATABASE_URL` is unset. An
+explicit `DATABASE_URL` is preserved. The script does not load `.env` and tests do not need JWT
+runtime variables. The `#[sqlx::test]` suite creates isolated databases and applies committed
+migrations; the default Compose `postgres` role has the required create/drop-database privilege.
 
 ## Run with Docker
 
@@ -58,9 +82,15 @@ Compose network and use the service hostname in `DATABASE_URL` (for example,
 `postgres://postgres:postgres@postgres:5432/ledger`). Do not use `127.0.0.1`: inside the service
 container, that address refers to the service container itself.
 
+### Production and container configuration
+
+Production and container configuration remains externally injected through the environment or a
+secret manager. A local `.env` is only a developer convenience and is neither copied into the image
+nor required by the container. Migrations remain an explicit operation before service startup.
+
 JWT authentication requires `JWT_ISSUER`, `JWT_AUDIENCE`, and `JWT_PUBLIC_KEY_PEM`. The PEM must
-be an RSA public key. The command substitution above preserves a multiline PEM; alternatively use
-your secret manager's multiline environment-value support. Never commit keys or use a private key.
+be an RSA public key. Use your deployment's secret manager or multiline environment-value support;
+never commit keys or use a private key.
 
 The service validates externally issued RS256 bearer tokens only. It verifies the signature,
 expiration, issuer, audience, and a nonblank `sub` client identifier; it does not issue, refresh,
