@@ -29,6 +29,35 @@ Start the service:
 cargo run
 ```
 
+## Run with Docker
+
+Build the production image from the repository root:
+
+```bash
+docker build -t ledger-service:local .
+```
+
+Supply configuration from your shell or secret manager; it is not embedded in the image. Apply
+migrations explicitly before starting the container, then run it:
+
+```bash
+cargo sqlx migrate run
+docker run --rm --name ledger-service -p 3000:3000 \
+  -e DATABASE_URL \
+  -e JWT_ISSUER \
+  -e JWT_AUDIENCE \
+  -e JWT_PUBLIC_KEY_PEM \
+  ledger-service:local
+```
+
+The container does not run migrations automatically. The database must already be reachable and
+up to date before the service starts.
+
+When the service container connects to the Compose PostgreSQL service, attach it to the same
+Compose network and use the service hostname in `DATABASE_URL` (for example,
+`postgres://postgres:postgres@postgres:5432/ledger`). Do not use `127.0.0.1`: inside the service
+container, that address refers to the service container itself.
+
 JWT authentication requires `JWT_ISSUER`, `JWT_AUDIENCE`, and `JWT_PUBLIC_KEY_PEM`. The PEM must
 be an RSA public key. The command substitution above preserves a multiline PEM; alternatively use
 your secret manager's multiline environment-value support. Never commit keys or use a private key.
