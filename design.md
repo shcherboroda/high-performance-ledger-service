@@ -313,7 +313,9 @@ There is no `processing` state, lease, claim token, takeover protocol or persist
 
 ## 8. Success-only idempotency
 
-Account creation, transfer, FX transfer and reversal accept an `Idempotency-Key` where applicable.
+Account creation, transfers, and reversal accept an `Idempotency-Key` where applicable. The unified
+transfer endpoint determines whether an operation is same-currency or FX from the participating
+account currencies.
 
 The key scope is:
 
@@ -511,7 +513,7 @@ LIMIT $5;
 
 History is account-relative, so one business operation appears once from the selected account's perspective.
 
-Full transfer, FX and reversal details are returned by `GET /v1/transfers/{transfer_id}`.
+Full transfer, FX and reversal details are returned by `GET /transfers/{transfer_id}`.
 
 ### Cursor pagination
 
@@ -549,18 +551,16 @@ A business or technical failure commits none of them.
 ```text
 POST /accounts
 GET  /accounts/{account_id}/balance
+GET  /accounts/{account_id}/entries
 
-POST /v1/transfers
-POST /v1/fx-transfers
-GET  /v1/transfers/{transfer_id}
-POST /v1/transfers/{transfer_id}/reversal
-
-GET  /v1/accounts/{account_id}/entries
-GET  /v1/accounts/{account_id}/entries?counterparty_account_id=...
+POST /transfers
+GET  /transfers/{transfer_id}
+POST /transfers/{transfer_id}/reversal
 
 GET  /health
 GET  /ready
 GET  /metrics
+GET  /openapi.json
 ```
 
 The complete request, response and error schemas belong in OpenAPI 3.1.

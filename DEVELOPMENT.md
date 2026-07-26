@@ -13,13 +13,19 @@ docker compose up -d
 docker compose ps
 ```
 
-Set the required connection string and start the service:
+Set the required connection string and JWT configuration, then apply the committed migrations:
 
 ```bash
 export DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/ledger'
 export JWT_ISSUER='https://issuer.example'
 export JWT_AUDIENCE='ledger-service'
 export JWT_PUBLIC_KEY_PEM="$(cat ./path/to/issuer-public-key.pem)"
+cargo sqlx migrate run
+```
+
+Start the service:
+
+```bash
 cargo run
 ```
 
@@ -45,7 +51,8 @@ curl --fail --silent --show-error http://127.0.0.1:3000/openapi.json
 
 API failures use a shared JSON envelope with a stable `error.code`, safe client-facing
 `error.message`, and optional `error.details` and `error.request_id` fields. Internal
-causes are logged by the service and are not returned to clients.
+error causes and chains are not logged or returned to clients; the service emits only bounded,
+safe diagnostic categories.
 
 ## Database migrations
 
