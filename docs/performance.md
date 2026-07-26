@@ -38,11 +38,11 @@ Representative initial full-campaign independent, one-instance, pool32 points:
 | Concurrency | Throughput (ops/s) | HTTP mean (ms) | DB txn mean (ms) | Pool acquire mean (ms) | p95 (ms) | p99 (ms) |
 |---:|---:|---:|---:|---:|---:|---:|
 | 1 | 163.479 | 5.734 | 5.092 | 0.277 | 9.746 | 12.835 |
-| 2 | 307.912 | | | | | |
-| 4 | 449.908 | | | | | |
-| 8 | 679.136 | | | | | |
+| 2 | 307.912 | 6.143 | 5.470 | 0.282 | 8.154 | 9.477 |
+| 4 | 449.908 | 8.477 | 7.572 | 0.383 | 10.454 | 11.712 |
+| 8 | 679.136 | 11.296 | 10.091 | 0.528 | 13.966 | 15.579 |
 | 16 | 1124.708 | 13.669 | 12.131 | 0.685 | 16.953 | 18.961 |
-| 32 | 929.061 | 33.148 | 28.926 | 2.234 | | |
+| 32 | 929.061 | 33.148 | 28.926 | 2.234 | 51.313 | 57.897 |
 | 64 | 1192.953 | 52.362 | 22.631 | 28.221 | 81.868 | 123.241 |
 | 96 | 1525.411 | 61.816 | 17.781 | 42.842 | 71.964 | 76.969 |
 | 128 | 1454.172 | 86.665 | 18.657 | 66.757 | 101.634 | 153.990 |
@@ -116,10 +116,18 @@ should be removed.
 Repeated c64 topology comparison had median throughput about 504.221 ops/s with
 one instance and 895.795 ops/s with two: approximately 1.78×. That demonstrates
 substantial local two-instance scaling against shared PostgreSQL, not linear
-scaling or a universal ratio. The campaign also completed the
-10,000-account/100,000-transfer sustained account-pool scenario with full
-correctness verification. This supports the assessment-scale requirement, not an
-environment-independent capacity claim.
+scaling or a universal ratio. The campaign also completed the 10,000-account/
+100,000-transfer sustained account-pool scenario with full correctness
+verification:
+
+| Accounts | Measured transfers | Concurrency | DB pool | Throughput (ops/s) | Mean (ms) | p50 (ms) | p95 (ms) | p99 (ms) | Max (ms) |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 10,000 | 100,000 | 128 | 32 | 444.645 | 286.032 | 276.132 | 404.509 | 525.719 | 1014.319 |
+
+HTTP mean was 284.232 ms, pool-acquire mean 217.454 ms, and DB transaction mean
+63.684 ms. The run had zero failures and was correct and valid. This is
+environment-specific evidence for the assessment-scale requirement, not a
+universal capacity claim or stable practical operating point.
 
 | Workload | c1 (ops/s) | c32 (ops/s) | c64 (ops/s) |
 |---|---:|---:|---:|
