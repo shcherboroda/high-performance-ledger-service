@@ -41,8 +41,44 @@ impl Modify for SecuritySchemeAddon {
     }
 }
 
-static OPENAPI: LazyLock<utoipa::openapi::OpenApi> = LazyLock::new(ApiDoc::openapi);
+pub fn document() -> utoipa::openapi::OpenApi {
+    ApiDoc::openapi()
+}
+
+pub fn generated_document() -> Result<String, serde_json::Error> {
+    let document = serde_json::to_string_pretty(&document())?;
+    Ok(format!("{document}\n"))
+}
+
+pub fn matches_generated_document(tracked_document: &str) -> Result<bool, serde_json::Error> {
+    Ok(tracked_document == generated_document()?)
+}
+
+static OPENAPI: LazyLock<utoipa::openapi::OpenApi> = LazyLock::new(document);
 
 pub(crate) async fn openapi() -> Json<utoipa::openapi::OpenApi> {
     Json(OPENAPI.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::Value;
+
+    use super::{generated_document, matches_generated_document};
+
+    #[test]
+    fn generated_document_is_valid_openapi_31_json() {
+        let document = generated_document().unwrap();
+        let value: Value = serde_json::from_str(&document).unwrap();
+
+        assert_eq!(value["openapi"], "3.1.0");
+    }
+
+    #[test]
+    fn stale_document_does_not_match_generated_document() {
+        let document = generated_document().unwrap();
+
+        assert!(matches_generated_document(&document).unwrap());
+        assert!(!matches_generated_document("{}").unwrap());
+    }
 }

@@ -1,0 +1,1126 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "FJX High-Performance Ledger Service",
+    "description": "",
+    "license": {
+      "name": ""
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/accounts": {
+      "post": {
+        "tags": [
+          "crate::api::accounts"
+        ],
+        "operationId": "create_account",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Visible ASCII key, 1 to 255 characters",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAccountRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Account created or stored successful replay",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountCreatedResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid currency, initial balance, or Idempotency-Key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication is required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Idempotency key was previously used with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/accounts/{account_id}/balance": {
+      "get": {
+        "tags": [
+          "crate::api::accounts"
+        ],
+        "operationId": "get_balance",
+        "parameters": [
+          {
+            "name": "account_id",
+            "in": "path",
+            "description": "Account UUID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current account balance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountBalanceResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid account ID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication is required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Account not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/accounts/{account_id}/entries": {
+      "get": {
+        "tags": [
+          "crate::api::history"
+        ],
+        "operationId": "get_account_history",
+        "parameters": [
+          {
+            "name": "account_id",
+            "in": "path",
+            "description": "Account UUID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "counterparty_account_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Account-relative immutable ledger entries",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountHistoryResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid account ID or pagination query",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication is required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Account not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/health": {
+      "get": {
+        "tags": [
+          "crate::api::health"
+        ],
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": "Process is healthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ready": {
+      "get": {
+        "tags": [
+          "crate::api::health"
+        ],
+        "operationId": "ready",
+        "responses": {
+          "200": {
+            "description": "Database is reachable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Database is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/transfers": {
+      "post": {
+        "tags": [
+          "crate::api::transfers"
+        ],
+        "operationId": "create_transfer",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Visible ASCII key, 1 to 255 characters",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTransferRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Transfer created or stored successful replay",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransferCreatedResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid transfer request or Idempotency-Key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication is required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "A requested account is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Idempotency key was previously used with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Transfer cannot be completed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/transfers/{transfer_id}": {
+      "get": {
+        "tags": [
+          "crate::api::transfers"
+        ],
+        "operationId": "get_transfer",
+        "parameters": [
+          {
+            "name": "transfer_id",
+            "in": "path",
+            "description": "Transfer UUID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Immutable transfer snapshot",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransferDetailsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid transfer ID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication is required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Transfer not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/transfers/{transfer_id}/reversal": {
+      "post": {
+        "tags": [
+          "crate::api::reversals"
+        ],
+        "operationId": "reverse_transfer",
+        "parameters": [
+          {
+            "name": "transfer_id",
+            "in": "path",
+            "description": "Original transfer UUID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Visible ASCII key, 1 to 255 characters",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "Reversal created or stored successful replay",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReversalCreatedResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid transfer ID or Idempotency-Key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication is required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Original transfer or a participating account is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Idempotency key was previously used with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Transfer cannot be reversed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AccountBalanceResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "currency",
+          "balance",
+          "version"
+        ],
+        "properties": {
+          "balance": {
+            "type": "string",
+            "example": "10.25"
+          },
+          "currency": {
+            "type": "string",
+            "example": "PLN"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "AccountCreatedResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "currency",
+          "balance"
+        ],
+        "properties": {
+          "balance": {
+            "type": "string",
+            "example": "10.25"
+          },
+          "currency": {
+            "type": "string",
+            "example": "PLN"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "AccountEntryResponse": {
+        "type": "object",
+        "required": [
+          "entry_id",
+          "transfer_id",
+          "account_id",
+          "counterparty_account_id",
+          "direction",
+          "operation_kind",
+          "amount",
+          "currency",
+          "created_at"
+        ],
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "amount": {
+            "type": "string",
+            "example": "10.25"
+          },
+          "counterparty_account_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "direction": {
+            "type": "string"
+          },
+          "entry_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "fee_amount": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "example": "0.25"
+          },
+          "operation_kind": {
+            "type": "string"
+          },
+          "principal_amount": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "example": "10.00"
+          },
+          "transfer_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "AccountHistoryResponse": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AccountEntryResponse"
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "ApiErrorBody": {
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "A stable, machine-readable error identifier."
+          },
+          "details": {
+            "description": "Optional structured context, for example future validation errors."
+          },
+          "message": {
+            "type": "string",
+            "description": "A safe description intended for API clients."
+          },
+          "request_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Reserved for request correlation once request IDs are introduced."
+          }
+        }
+      },
+      "CreateAccountRequest": {
+        "type": "object",
+        "required": [
+          "currency",
+          "initial_balance"
+        ],
+        "properties": {
+          "currency": {
+            "type": "string",
+            "example": "PLN"
+          },
+          "initial_balance": {
+            "type": "string",
+            "example": "10.25"
+          }
+        }
+      },
+      "CreateTransferRequest": {
+        "type": "object",
+        "required": [
+          "source_account_id",
+          "destination_account_id",
+          "amount"
+        ],
+        "properties": {
+          "amount": {
+            "type": "string",
+            "example": "10.25"
+          },
+          "destination_account_id": {
+            "type": "string"
+          },
+          "source_account_id": {
+            "type": "string"
+          }
+        }
+      },
+      "ErrorEnvelope": {
+        "type": "object",
+        "description": "The stable JSON envelope returned when an API operation cannot succeed.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ApiErrorBody"
+          }
+        }
+      },
+      "ReversalCreatedResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "original_transfer_id",
+          "source_account_id",
+          "destination_account_id",
+          "source_currency",
+          "destination_currency",
+          "source_amount",
+          "destination_amount",
+          "original_fee_amount",
+          "total_source_debit",
+          "kind",
+          "status",
+          "resulting_source_balance",
+          "resulting_destination_balance",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "destination_account_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "destination_amount": {
+            "type": "string",
+            "example": "10.25"
+          },
+          "destination_currency": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "original_fee_amount": {
+            "type": "string",
+            "description": "Fee snapshot from the original operation; no fee is charged by the reversal itself.",
+            "example": "0.00"
+          },
+          "original_transfer_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "resulting_destination_balance": {
+            "type": "string"
+          },
+          "resulting_source_balance": {
+            "type": "string"
+          },
+          "source_account_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "source_amount": {
+            "type": "string",
+            "example": "10.25"
+          },
+          "source_currency": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "total_source_debit": {
+            "type": "string",
+            "example": "10.25"
+          }
+        }
+      },
+      "StatusResponse": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "type": "string"
+          }
+        }
+      },
+      "TransferCreatedResponse": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "id",
+              "status",
+              "source_account_id",
+              "destination_account_id",
+              "currency",
+              "amount",
+              "created_at",
+              "kind"
+            ],
+            "properties": {
+              "amount": {
+                "type": "string",
+                "example": "100.00"
+              },
+              "created_at": {
+                "type": "string"
+              },
+              "currency": {
+                "type": "string",
+                "example": "EUR"
+              },
+              "destination_account_id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "transfer"
+                ]
+              },
+              "source_account_id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "status": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "id",
+              "status",
+              "source_account_id",
+              "destination_account_id",
+              "source_currency",
+              "source_amount",
+              "destination_currency",
+              "destination_amount",
+              "fee_amount",
+              "total_source_debit",
+              "created_at",
+              "kind"
+            ],
+            "properties": {
+              "created_at": {
+                "type": "string"
+              },
+              "destination_account_id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "destination_amount": {
+                "type": "string",
+                "example": "432.15"
+              },
+              "destination_currency": {
+                "type": "string",
+                "example": "PLN"
+              },
+              "fee_amount": {
+                "type": "string",
+                "example": "1.00"
+              },
+              "id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "fx_transfer"
+                ]
+              },
+              "source_account_id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "source_amount": {
+                "type": "string",
+                "example": "100.00"
+              },
+              "source_currency": {
+                "type": "string",
+                "example": "EUR"
+              },
+              "status": {
+                "type": "string"
+              },
+              "total_source_debit": {
+                "type": "string",
+                "example": "101.00"
+              }
+            }
+          }
+        ]
+      },
+      "TransferDetailsResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "source_account_id",
+          "destination_account_id",
+          "source_currency",
+          "destination_currency",
+          "source_amount",
+          "destination_amount",
+          "fee_amount",
+          "total_source_debit",
+          "kind",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "destination_account_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "destination_amount": {
+            "type": "string",
+            "example": "10.25"
+          },
+          "destination_currency": {
+            "type": "string"
+          },
+          "exchange_rate": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "example": "1.083500000000"
+          },
+          "exchange_rate_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "fee_amount": {
+            "type": "string",
+            "example": "0.00"
+          },
+          "fee_bps": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "reverses_transfer_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "source_account_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "source_amount": {
+            "type": "string",
+            "example": "10.25"
+          },
+          "source_currency": {
+            "type": "string"
+          },
+          "total_source_debit": {
+            "type": "string",
+            "example": "10.25"
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    }
+  }
+}
