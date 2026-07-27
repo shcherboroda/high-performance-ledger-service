@@ -8,4 +8,4 @@ pub mod fx;
 pub mod idempotency;
 pub mod money;
 pub mod observability;
-pub(crate) mod openapi;
+pub mod openapi;
