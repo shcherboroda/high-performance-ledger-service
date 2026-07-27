@@ -75,8 +75,8 @@ cargo audit
 docker build -t ledger-service:validation .
 python3 -m unittest discover -s benchmarks/tests
 
-echo "creating benchmark database with derived SQLx administrative URL"
-DATABASE_URL="$admin_database_url" sqlx database create
+echo "creating dedicated benchmark database"
+DATABASE_URL="$BENCHMARK_DATABASE_URL" sqlx database create
 echo "applying migrations to the dedicated benchmark database"
 DATABASE_URL="$BENCHMARK_DATABASE_URL" sqlx migrate run
 ./benchmarks/run-local.sh smoke independent
