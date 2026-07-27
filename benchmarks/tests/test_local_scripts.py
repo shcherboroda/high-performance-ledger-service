@@ -218,7 +218,7 @@ BENCHMARK_TELEMETRY_MODE=telemetry
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 self.assertIn(expected, events.read_text(encoding="utf-8"))
 
-    def test_validate_local_derives_admin_url_and_preserves_connection_parts(self):
+    def test_validate_local_creates_dedicated_database_and_preserves_connection_parts(self):
         with tempfile.TemporaryDirectory() as temporary:
             root, tools = self.validation_root(temporary)
             key = root / "key.pem"; key.write_text("key", encoding="utf-8")
@@ -232,7 +232,7 @@ BENCHMARK_TELEMETRY_MODE=telemetry
             completed = subprocess.run([str(root / "scripts" / "validate-local.sh")], cwd=root, env=environment, text=True, capture_output=True, check=False)
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(calls.read_text(encoding="utf-8").splitlines(), [
-                "database postgresql://user:secret@db.example:5544/postgres?sslmode=require&application_name=/ledger_benchmark",
+                "database postgresql://user:secret@db.example:5544/ledger_benchmark?sslmode=require&application_name=/ledger_benchmark",
                 "migrate postgresql://user:secret@db.example:5544/ledger_benchmark?sslmode=require&application_name=/ledger_benchmark",
             ])
             self.assertEqual(cargo_calls.read_text(encoding="utf-8").splitlines(), [
