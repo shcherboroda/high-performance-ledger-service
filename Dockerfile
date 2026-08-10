@@ -10,7 +10,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY benchmarks/Cargo.toml benchmarks/Cargo.toml
 COPY src ./src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    cargo build --release --locked --package rust-backend-technical-assessment --bin rust-backend-technical-assessment
+    cargo build --release --locked --package ledger-service --bin ledger-service
 
 FROM debian:bookworm-slim AS runtime
 
@@ -20,7 +20,7 @@ RUN apt-get update \
     && groupadd --system --gid 10001 ledger \
     && useradd --system --uid 10001 --gid ledger --no-create-home --shell /usr/sbin/nologin ledger
 
-COPY --from=builder --chown=ledger:ledger /app/target/release/rust-backend-technical-assessment /usr/local/bin/ledger-service
+COPY --from=builder --chown=ledger:ledger /app/target/release/ledger-service /usr/local/bin/ledger-service
 
 USER ledger
 EXPOSE 3000

@@ -1,7 +1,5 @@
 use chrono::{TimeZone, Utc};
-use rust_backend_technical_assessment::fx::{
-    ConfigurationError, select_exchange_rate, select_fee_rule,
-};
+use ledger_service::fx::{ConfigurationError, select_exchange_rate, select_fee_rule};
 use sqlx::PgPool;
 use uuid::Uuid;
 

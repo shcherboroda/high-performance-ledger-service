@@ -1,7 +1,7 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "FJX High-Performance Ledger Service",
+    "title": "High-Performance Ledger Service",
     "description": "",
     "license": {
       "name": ""

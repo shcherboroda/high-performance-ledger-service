@@ -8,7 +8,7 @@ use utoipa::{Modify, OpenApi};
 
 use crate::api_error::{ApiErrorBody, ErrorEnvelope};
 
-pub const SERVICE_TITLE: &str = "FJX High-Performance Ledger Service";
+pub const SERVICE_TITLE: &str = "High-Performance Ledger Service";
 
 pub const SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
 

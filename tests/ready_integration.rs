@@ -2,7 +2,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
-use rust_backend_technical_assessment::{
+use ledger_service::{
     app,
     auth::AuthVerifier,
     config::{AuthConfig, PoolConfig},
@@ -12,7 +12,7 @@ use std::time::Duration;
 use tower::ServiceExt;
 
 fn metric_value(name: &str, labels: &[&str]) -> f64 {
-    rust_backend_technical_assessment::observability::metrics_handle()
+    ledger_service::observability::metrics_handle()
         .render()
         .lines()
         .find(|line| line.starts_with(name) && labels.iter().all(|label| line.contains(label)))

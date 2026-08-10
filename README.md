@@ -1,97 +1,78 @@
-# Technical Assessment: High-Performance Ledger Service (Rust)
+# High-Performance Ledger Service
 
-## Overview
+A transactional Rust/PostgreSQL ledger that explores correctness under concurrent writes, stateless horizontal scaling, observable operation, and reproducible local performance measurements.
 
-Your task is to develop a simplified Ledger Service using Rust. This service handles financial transactions between accounts. You must ensure data consistency, handle high concurrency, and implement safety mechanisms.
+It is an engineering project, not a production financial system. The included benchmarks are local, environment-specific observations rather than capacity guarantees or latency SLOs.
 
-**Important:** Use of LLM tools is permitted.
-However, you are responsible for the final architecture, code quality, and the ability to explain every decision.
+## Highlights
 
-## Tech Stack Requirements
+- Atomic same-currency and FX transfers backed by PostgreSQL transactions and SQLx.
+- Deterministic account-row locking to preserve balance consistency under concurrent operations.
+- Success-only idempotency: concurrent retries produce one committed business side effect.
+- One-time reversals with explicit overdraft semantics for the original destination account.
+- RS256 JWT validation for issuer, audience, expiration, and subject; token issuance stays outside the service.
+- OpenAPI 3.1 contract, structured JSON logs, Prometheus metrics, readiness checks, Docker image, and migration-backed tests.
 
-- _Rust_ v1.92+
-- _Runtime_ `tokio` v1.49+
-- _Web Framework_ `axum` v0.8+
-- _Database_ `PostgreSQL` v18+
-- _Database Wrapper_ `sqlx` v0.8+
+## Architecture and guarantees
 
-## Functional Requirements
+The service instances are stateless; PostgreSQL is the authoritative store and concurrency coordinator.
 
-The service must expose a REST API to perform the following operations.
-The API must be described using OpenAPI 3.1.0+.
+```text
+Clients -> HTTPS + JWT -> stateless Axum instances -> PostgreSQL
+```
 
-### Account Management
+Multi-account operations lock account rows in ascending ID order. A successful operation commits its balance changes, immutable transfer and account-entry records, and idempotency result in one transaction. A failed operation commits none of those effects. The design and its trade-offs are documented in [design.md](design.md).
 
-The system must support the initialization of accounts with an initial balance.
+## API
 
-- **Create Account**: The API must accept an initial balance and currency and return the new account ID.
-- **Get Balance**: The API must return the current balance for any given account ID.
+The tracked [OpenAPI 3.1 specification](openapi.json) describes all request, response, error, and JWT-security schemas. The running service also exposes it at `GET /openapi.json`.
 
-### Money Transfer
+Core endpoints include account creation and balance reads, transfers, reversals, account history, health/readiness, and metrics.
 
-The system must reliably transfer funds between two _distinct_ accounts.
+## Run locally
 
-The transfer must be atomic. It either succeeds completely or fails without side effects.
+Prerequisites: Rust 1.94+, Docker Compose, and `curl`.
 
-The system must prevent overdrafts.
-The system must prevent transfers between accounts with different currencies.
+```bash
+docker compose up -d
+cp .env.example .env
+# Edit .env: provide an issuer's RSA public key; do not commit this file.
+cargo sqlx migrate run
+cargo run
+```
 
-#### Bonus: Cross-Currency Transfer
+The runtime validates externally issued RS256 tokens and does not issue, store, refresh, or revoke them. Configuration and container instructions, including secure handling of `JWT_PUBLIC_KEY_PEM`, are in [DEVELOPMENT.md](DEVELOPMENT.md).
 
-The system must support transfers between accounts with different currencies.
-The system must apply a conversion fee.
+## Verify
 
-### Transfer Rollback
+With PostgreSQL available, run:
 
-The system must support the reversal of a previously completed transfer.
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets --all-features
+python3 -m unittest discover -s benchmarks/tests
+cargo run --bin generate-openapi -- --check
+```
 
-- **Reverse Transfer**: The API must accept a transfer ID and initiate a reversal.
-- **Flow**: The system must deduct `amount` from the original destination account and return it to the original source account.
-- **Overdraft**: The system must allow overdraft for the original destination account.
+`./scripts/validate-local.sh` is the documented end-to-end local validation workflow. It additionally requires an ignored `benchmarks/local.env` file and a dedicated database whose name ends in `_benchmark`.
 
-### Transfer History
+## Performance work
 
-The system must provide an audit trail of transactions.
+The repository includes a reproducible HTTP/PostgreSQL benchmark harness with correctness verification and guarded destructive setup. Its raw results, logs, JWT keys, and local database URLs are ignored by default.
 
-- **Account history**: The API must return a list of all transfers for a specific account ID.
-- **List Transfers**: The API must return a list of all transfers between two specific account IDs.
+The curated [performance engineering report](docs/performance.md) records the measured environment, methodology, results, limitations, and follow-up decisions. For example, its measured two-instance topology reached approximately 1.78x the one-instance median throughput in that local environment; it explicitly does not claim linear scaling or production capacity.
 
-## Non-Functional Requirements
+See [benchmarks/README.md](benchmarks/README.md) for setup, safety controls, workloads, and reproduction commands.
 
-### Error Handling
+## Project documentation
 
-The system must handle errors gracefully.
-The API must return structured error objects including a code and a message.
+- [Design and consistency model](design.md)
+- [Development, configuration, Docker, and migrations](DEVELOPMENT.md)
+- [OpenAPI contract](openapi.json)
+- [Benchmark harness and methodology](benchmarks/README.md)
+- [Performance engineering report](docs/performance.md)
 
-### Security
+## License
 
-The REST API must require JWT authorization to perform any operation.
-
-### Performance
-
-- **Concurrency**: The system must handle high concurrency.
-- **Scale**: The system must handle scenarios with a large number of accounts and transfers.
-- **Latency**: The system must show the lowest possible latency under any load.
-
-### Scalability
-
-The system must be horizontally scalable against the single database.
-
-### Bonus: Observability
-
-The system must provide visibility into its internal state.
-
-- **Tracing**: The system must generate structured logs and traces.
-- **Metrics**: The system must expose metrics.
-
-## Deliverables
-
-The solution must contain the following artifacts.
-
-- **Design Document** (`design.md`): A detailed explanation of design choices, trade-offs, and compromises.
-- **Source Code**: The complete Rust implementation. Comprehensive documentation is preferred.
-- **OpenAPI Specification**: The API definition file.
-- **Dockerfile**: A file to containerize the service (Preferred).
-- **Test Suite**: A comprehensive set of tests (Preferred).
-- **Benchmarks**: A set of performance benchmarks (Preferred).
-- **Agent Context and Instructions**: A file containing the agent context and instructions (If applicable).
+The repository currently includes an MIT license with the copyright notice in [LICENSE](LICENSE). Confirm that the notice and licensing scope match your ownership and publication rights before making the repository public.

@@ -23,7 +23,7 @@ if ! kill -0 "$service_pid" 2>/dev/null; then
   exit 0
 fi
 
-if ! ps -p "$service_pid" -o args= 2>/dev/null | grep -Fq -- "rust-backend-technical-assessment"; then
+if ! ps -p "$service_pid" -o args= 2>/dev/null | grep -Fq -- "ledger-service"; then
   echo "removing stale local benchmark service PID file (PID $service_pid is not the benchmark service)"
   rm -f "$pid_file"
   exit 0

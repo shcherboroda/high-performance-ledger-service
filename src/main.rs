@@ -2,7 +2,7 @@
 use std::future::pending;
 
 use anyhow::Result;
-use rust_backend_technical_assessment::{app, auth::AuthVerifier, config::Config, db};
+use ledger_service::{app, auth::AuthVerifier, config::Config, db};
 use tracing::info;
 
 #[tokio::main]
@@ -15,14 +15,13 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let config = Config::from_env()?;
-    let _log_guard =
-        rust_backend_technical_assessment::observability::init_logging(&config.log_filter)?;
+    let _log_guard = ledger_service::observability::init_logging(&config.log_filter)?;
     finish_post_logging_startup(start(config).await)
 }
 
 fn finish_post_logging_startup<T>(result: Result<T>) -> Result<T> {
     if result.is_err() {
-        rust_backend_technical_assessment::observability::log_startup_failure();
+        ledger_service::observability::log_startup_failure();
     }
     result
 }

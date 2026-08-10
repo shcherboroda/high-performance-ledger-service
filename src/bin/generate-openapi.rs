@@ -13,10 +13,8 @@ fn main() -> Result<()> {
     if check {
         let tracked_document = fs::read_to_string(OPENAPI_PATH)
             .with_context(|| format!("failed to read {OPENAPI_PATH}"))?;
-        if !rust_backend_technical_assessment::openapi::matches_generated_document(
-            &tracked_document,
-        )
-        .context("failed to serialize generated OpenAPI document")?
+        if !ledger_service::openapi::matches_generated_document(&tracked_document)
+            .context("failed to serialize generated OpenAPI document")?
         {
             bail!(
                 "{OPENAPI_PATH} is out of date; run `cargo run --bin generate-openapi` to regenerate it"
@@ -25,7 +23,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let generated_document = rust_backend_technical_assessment::openapi::generated_document()
+    let generated_document = ledger_service::openapi::generated_document()
         .context("failed to serialize generated OpenAPI document")?;
     fs::write(OPENAPI_PATH, generated_document)
         .with_context(|| format!("failed to write {OPENAPI_PATH}"))?;
