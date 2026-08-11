@@ -1,106 +1,61 @@
-# AGENTS.md
+# Repository guidance
 
-## Project scope
+Keep changes focused, reviewable, and aligned with the documented design. Do not change the service's correctness, atomicity, idempotency, or consistency guarantees without updating the implementation, tests, and relevant documentation together.
 
-This repository contains the FJX High-Performance Ledger Service technical assessment.
+## Scope and sources of truth
 
-Implement only work explicitly requested by the current GitHub issue or user instruction. Do not broaden the scope, add speculative features, or redesign agreed architecture without first reporting the conflict.
+Implement only the work explicitly requested by the user or the current GitHub issue. Do not broaden scope, redesign agreed architecture, or add speculative features without first explaining the conflict.
 
-## Sources of truth
+When sources conflict, use this order:
 
-Use the following precedence:
-
-1. `README.md` — official assessment requirements;
-2. the current GitHub issue or explicit user instruction;
-3. `design.md` — approved design and implementation direction;
-4. existing tests, workflows, configuration, infrastructure, and code;
+1. explicit user or issue requirements;
+2. `design.md` for architecture, invariants, and trade-offs;
+3. relevant README and operational documentation for supported behavior and workflows;
+4. existing tests, workflows, configuration, and code;
 5. this file.
 
-Do not modify `README.md`. It is provided by the assessment owner and represents the original task requirements.
-
-Do not modify, rename, replace, reformat, or delete `LICENSE`. It is outside the implementation scope.
-
-For tasks that do not explicitly concern architecture or design, treat `design.md` as authoritative. Follow its decisions and constraints rather than introducing alternative designs.
-
-For a task explicitly intended to change the design, update `design.md` first or as part of the same focused change. Do not silently make the implementation diverge from the documented design.
-
-If sources conflict, report the conflict before making a design-changing implementation.
+If an implementation would diverge from the documented design, update the relevant design documentation as part of the same focused change or report the conflict first.
 
 ## Context loading
 
-- Treat this file as persistent repository guidance; do not repeatedly reopen it during the same task unless it changed or a rule needs exact verification.
-- Do not read `LICENSE` during normal implementation work. Its only project-specific rule is that the file must remain unchanged.
-- Do not reread the complete `README.md` for every task. Consult only the relevant requirement section when the issue does not already provide sufficient task context, when requirement compliance is uncertain, or during final delivery verification.
-- Do not reread the complete `design.md` for every task. Inspect only the sections relevant to the component or decision being changed. Read it more broadly only for architecture work, cross-cutting changes, or when the issue may conflict with the approved design.
-- Start from the current issue and the files directly involved in the requested change. Expand repository inspection only as needed to understand dependencies, existing behavior, tests, or risks.
-- Reuse information already established in the current task or review instead of fetching the same unchanged content again.
-- Never skip necessary verification merely to save tokens; optimize by reading narrowly, not by guessing.
+- Start with the current task and the files it directly affects; expand inspection only as needed to understand dependencies, behavior, and risk.
+- Read documentation narrowly and reuse already established context. Do not skip necessary verification to save time.
+- Treat files present in the repository as part of the maintained baseline unless the task explicitly identifies them as obsolete.
 
-## Preserve the provided repository baseline
+## Change integrity
 
-- Treat files already present in the original assessment repository as part of the assignment unless explicitly identified otherwise.
-- Do not remove, replace, simplify, disable, or weaken existing tests, checks, workflows, configuration, infrastructure, dependencies, or safeguards merely because they are not yet used by the current implementation.
-- Prefer extending the existing setup over replacing it.
-- Modify an existing baseline file only when the current issue explicitly requires it or when a concrete defect blocks the requested work.
-- Before changing a baseline file, inspect its purpose and preserve its existing behavior unless the approved change explicitly says otherwise.
-- Report potentially obsolete, premature, or failing baseline configuration instead of deleting or reducing it without approval.
+- Preserve tests, validation, migrations, CI, Docker configuration, and reproducibility tooling unless an approved change requires an update.
+- Do not remove, disable, weaken, or rewrite requirements, checks, or tests merely to make a change pass.
+- Do not change unrelated files. Prefer small, explicit solutions over speculative abstractions.
+- Keep domain logic separate from transport and persistence concerns where practical, and handle errors explicitly.
+- Add or update deterministic tests for changed behavior and important failure paths.
+- Update documentation when behavior, configuration, API contracts, setup, or operations change. Do not document hypothetical behavior as implemented.
 
-## Development workflow
+## Security and local state
 
-- Work from a dedicated branch created from the latest `origin/main`.
-- Keep each issue and pull request focused on one logical change.
-- Do not commit directly to `main`.
-- Do not push working branches to the `target` remote.
-- `origin` is the private development repository.
-- `target` is used only for final delivery of verified `main`.
-- Prefer small, reviewable commits while working; pull requests may be squash-merged.
-- Do not rewrite shared branch history unless explicitly requested.
+- Never log or commit credentials, access tokens, private keys, full database URLs with credentials, or sensitive user data.
+- Keep generated benchmark artifacts, local configuration, build outputs, and editor state untracked.
+- Use the documented local workflow for database, Docker, and benchmark work. Run destructive benchmark setup only against a dedicated database whose name ends in `_benchmark`, with its required acknowledgement.
 
-## Implementation rules
+## Git and pull requests
 
-- Preserve correctness, atomicity, idempotency, and data consistency.
-- Prefer simple, explicit solutions over speculative abstractions.
-- Do not introduce new services, infrastructure, dependencies, caches, or background processing unless required by the issue or approved design.
-- Keep domain logic separate from transport and persistence concerns where practical.
-- Handle errors explicitly; do not silently ignore failures.
-- Never log secrets, credentials, access tokens, or sensitive user data.
-- Do not change unrelated files.
-- Do not modify requirements or tests merely to match an implementation.
+- Work on a dedicated branch created from the current `origin/main`; do not commit directly to `main`.
+- Keep each pull request focused on one logical change. Prefer small, reviewable commits.
+- Do not push to the `target` remote unless explicitly instructed.
+- Do not rewrite shared history unless explicitly requested.
+- Before delivery, review the final diff for unrelated changes, generated artifacts, secrets, accidental formatting churn, and weakened safeguards.
+- A pull request summary must state what changed, why, how it was verified, and any remaining risks or limitations.
 
-## Rust quality
+## Verification
 
-Before marking implementation work complete, run the applicable checks:
+Run the applicable checks before completion:
 
 ```bash
 cargo fmt --all --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets --all-features
+python3 -m unittest discover -s benchmarks/tests
+cargo run --bin generate-openapi -- --check
 ```
 
-When relevant, also verify the application, database migrations, and infrastructure through the documented local workflow.
-
-Do not claim that a check passed unless it was actually executed. Report commands that could not be run and why.
-
-## Tests
-
-- Add or update tests for changed behavior.
-- Cover important failure paths and boundary conditions.
-- Prefer deterministic tests.
-- Do not remove or weaken tests solely to make a change pass.
-
-## Documentation
-
-Update documentation when behavior, configuration, API contracts, setup, or operational procedures change.
-
-Keep documentation concise and aligned with the implemented state. Do not document hypothetical components as if they already exist.
-
-## Pull request completion
-
-A pull request should state:
-
-- what changed;
-- why it changed;
-- how it was verified;
-- any remaining risks or limitations.
-
-Before completion, review the final diff for unrelated changes, generated files, secrets, accidental formatting churn, changes to `README.md` or `LICENSE`, and any unintended weakening of the original repository baseline.
+Database-backed tests require PostgreSQL; use `./scripts/test-local.sh` when integration validation applies. Report every check that could not be run and why.

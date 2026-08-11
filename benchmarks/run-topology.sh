@@ -27,7 +27,7 @@ for index in $(seq 1 "$instances"); do
   port=$((3000 + index - 1))
   BIND_ADDRESS="127.0.0.1:$port" DATABASE_URL="$BENCHMARK_DATABASE_URL" \
     JWT_ISSUER="$BENCHMARK_JWT_ISSUER" JWT_AUDIENCE="$BENCHMARK_JWT_AUDIENCE" \
-    JWT_PUBLIC_KEY_PEM="$JWT_PUBLIC_KEY_PEM" ./target/release/rust-backend-technical-assessment \
+    JWT_PUBLIC_KEY_PEM="$JWT_PUBLIC_KEY_PEM" ./target/release/ledger-service \
     >"benchmark-results/service-$port.log" 2>&1 &
   pids+=("$!")
   urls+=("http://127.0.0.1:$port")

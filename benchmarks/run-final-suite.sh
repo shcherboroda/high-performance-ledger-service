@@ -37,7 +37,7 @@ start_services() {
     local port=$((3100 + index)); local log="$out/logs/${label}-service-${port}.log"
     RUST_LOG="${RUST_LOG:-warn}" BIND_ADDRESS="127.0.0.1:$port" DATABASE_URL="$BENCHMARK_DATABASE_URL" DB_MAX_CONNECTIONS="$pool" \
       JWT_ISSUER="$BENCHMARK_JWT_ISSUER" JWT_AUDIENCE="$BENCHMARK_JWT_AUDIENCE" JWT_PUBLIC_KEY_PEM="$public_key" \
-      ./target/release/rust-backend-technical-assessment >"$log" 2>&1 &
+      ./target/release/ledger-service >"$log" 2>&1 &
     pids+=("$!"); urls+=("http://127.0.0.1:$port")
   done
   for url in "${urls[@]}"; do
@@ -46,7 +46,7 @@ start_services() {
   done
 }
 stop_services() { for pid in "${pids[@]:-}"; do kill "$pid" 2>/dev/null || true; done; wait 2>/dev/null || true; pids=(); }
-cargo build --release -p rust-backend-technical-assessment -p ledger-benchmarks
+cargo build --release -p ledger-service -p ledger-benchmarks
 campaign_failed=0
 while IFS=$'\t' read -r scenario concurrency operations warmup pool instances account_pool_size label; do
   if [[ "$concurrency" == "__NONE__" ]]; then

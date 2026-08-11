@@ -8,7 +8,7 @@ cd "$repo_root"
 results_dir="benchmark-results"
 pid_file="$results_dir/local-service.pid"
 log_file="$results_dir/local-service.log"
-service_binary="target/release/rust-backend-technical-assessment"
+service_binary="target/release/ledger-service"
 
 require_env() {
   local name="$1"
@@ -20,7 +20,7 @@ require_env() {
 
 is_recorded_service() {
   local pid="$1"
-  ps -p "$pid" -o args= 2>/dev/null | grep -Fq -- "rust-backend-technical-assessment"
+  ps -p "$pid" -o args= 2>/dev/null | grep -Fq -- "ledger-service"
 }
 
 require_env BENCHMARK_DATABASE_URL
@@ -67,7 +67,7 @@ if curl --fail --silent --show-error --max-time 2 "$ready_url" >/dev/null 2>&1; 
   exit 1
 fi
 
-cargo build --release -p rust-backend-technical-assessment
+cargo build --release -p ledger-service
 
 echo "starting local benchmark service on $bind_address"
 RUST_LOG="${RUST_LOG:-warn}" BIND_ADDRESS="$bind_address" DATABASE_URL="$BENCHMARK_DATABASE_URL" \

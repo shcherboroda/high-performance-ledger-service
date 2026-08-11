@@ -1100,6 +1100,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "ledger-service"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "dotenvy",
+ "jsonwebtoken",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "num-bigint",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1659,31 +1684,6 @@ dependencies = [
  "libc",
  "untrusted 0.9.0",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "rust-backend-technical-assessment"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "dotenvy",
- "jsonwebtoken",
- "metrics",
- "metrics-exporter-prometheus",
- "num-bigint",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sqlx",
- "tokio",
- "tower",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "utoipa",
- "uuid",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 [package]
-name = "rust-backend-technical-assessment"
-default-run = "rust-backend-technical-assessment"
+name = "ledger-service"
+default-run = "ledger-service"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"

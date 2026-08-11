@@ -34,6 +34,8 @@ target
 
 # Local application configuration may contain credentials or keys.
 /.env
+/.env.*
+!/.env.example
 
 # Benchmark output is intentionally local unless explicitly selected for review.
 /benchmark-results/
