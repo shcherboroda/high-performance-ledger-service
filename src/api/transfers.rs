@@ -231,6 +231,57 @@ pub(crate) async fn create_transfer(
         ));
     }
 
+    // Currency and scale are immutable account metadata. Read them before acquiring the
+    // transaction so decimal validation and fingerprinting do not retain a pool connection.
+    // The locked account read below compares this snapshot again before any balance mutation.
+    let preflight_started = Instant::now();
+    let mut preflight_connection = match state.pool.acquire().await {
+        Ok(connection) => connection,
+        Err(error) => {
+            record_transfer_pool_acquire(
+                PoolAcquireOutcome::Failure,
+                preflight_started.elapsed().as_secs_f64(),
+            );
+            return Err(AppError::internal(error));
+        }
+    };
+    let preliminary = sqlx::query_as::<_, (String, i16, String, i16)>(
+        "SELECT source.currency, source.currency_scale, destination.currency, destination.currency_scale \
+         FROM accounts source JOIN accounts destination ON destination.id = $2 WHERE source.id = $1",
+    )
+    .bind(source_account_id)
+    .bind(destination_account_id)
+    .fetch_optional(&mut *preflight_connection)
+    .await
+    .map_err(AppError::internal)?
+    .ok_or_else(AppError::account_unavailable)?;
+    drop(preflight_connection);
+    let operation_type = if preliminary.0 == preliminary.2 {
+        if preliminary.1 != preliminary.3 {
+            return Err(AppError::internal(anyhow::anyhow!(
+                "same currency accounts have different scales"
+            )));
+        }
+        idempotency::TRANSFER_OPERATION
+    } else {
+        idempotency::FX_TRANSFER_OPERATION
+    };
+    let source_scale = u8::try_from(preliminary.1).map_err(AppError::internal)?;
+    let amount_minor =
+        parse_minor_units(&request.amount, source_scale).map_err(transfer_money_error)?;
+    if amount_minor <= 0 {
+        return Err(AppError::validation(
+            "non_positive_amount",
+            "The amount must be greater than zero",
+        ));
+    }
+    let fingerprint = idempotency::transfer_fingerprint(
+        source_account_id,
+        destination_account_id,
+        &preliminary.0,
+        amount_minor,
+    );
+
     let acquire_started = Instant::now();
     let mut connection = match state.pool.acquire().await {
         Ok(connection) => {
@@ -250,26 +301,6 @@ pub(crate) async fn create_transfer(
     };
     let mut transaction = connection.begin().await.map_err(AppError::internal)?;
     let transaction_started = Instant::now();
-    let preliminary = sqlx::query_as::<_, (String, i16, String, i16)>(
-        "SELECT source.currency, source.currency_scale, destination.currency, destination.currency_scale \
-         FROM accounts source JOIN accounts destination ON destination.id = $2 WHERE source.id = $1",
-    )
-    .bind(source_account_id)
-    .bind(destination_account_id)
-    .fetch_optional(&mut *transaction)
-    .await
-    .map_err(AppError::internal)?
-    .ok_or_else(AppError::account_unavailable)?;
-    let operation_type = if preliminary.0 == preliminary.2 {
-        if preliminary.1 != preliminary.3 {
-            return Err(AppError::internal(anyhow::anyhow!(
-                "same currency accounts have different scales"
-            )));
-        }
-        idempotency::TRANSFER_OPERATION
-    } else {
-        idempotency::FX_TRANSFER_OPERATION
-    };
     let mut observation = TransactionObservation::started(
         if operation_type == idempotency::TRANSFER_OPERATION {
             FinancialOperation::Transfer
@@ -279,21 +310,6 @@ pub(crate) async fn create_transfer(
         transaction_started,
     );
     let result = async {
-    let source_scale = u8::try_from(preliminary.1).map_err(AppError::internal)?;
-    let amount_minor = parse_minor_units(&request.amount, source_scale).map_err(transfer_money_error)?;
-    if amount_minor <= 0 {
-        let error = AppError::validation(
-            "non_positive_amount",
-            "The amount must be greater than zero",
-        );
-        return Err(error);
-    }
-    let fingerprint = idempotency::transfer_fingerprint(
-        source_account_id,
-        destination_account_id,
-        &preliminary.0,
-        amount_minor,
-    );
     if let Some((stored_fingerprint, http_status, response_body)) = idempotency::completed_success(
         &mut transaction,
         &client_id,
