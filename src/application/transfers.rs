@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use sqlx::{Acquire, PgPool};
+use sqlx::{Acquire, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -212,170 +212,68 @@ pub(crate) async fn create(
             }
             Reservation::Owned => observation.idempotency(IdempotencyOutcome::Owner),
         }
-        let operation_time = transfers::transaction_time(&mut transaction)
-            .await
-            .map_err(AppError::internal)?;
-        let fx_configuration = if operation_type == idempotency::FX_TRANSFER_OPERATION {
-            Some((
-                fx::select_exchange_rate(
-                    &mut transaction,
-                    &preliminary.source_currency,
-                    &preliminary.destination_currency,
-                    operation_time,
-                )
-                .await
-                .map_err(transfer_configuration_error)?,
-                fx::select_fee_rule(
-                    &mut transaction,
-                    &preliminary.source_currency,
-                    &preliminary.destination_currency,
-                    operation_time,
-                )
-                .await
-                .map_err(transfer_configuration_error)?,
-            ))
-        } else {
-            None
-        };
-        let locked =
-            transfers::lock_accounts(&mut transaction, source_account_id, destination_account_id)
-                .await
-                .map_err(AppError::internal)?;
-        if locked.len() != 2 {
-            return Err(AppError::account_unavailable());
-        }
-        let source = locked
-            .iter()
-            .find(|account| account.id == source_account_id)
-            .expect("both locked accounts returned");
-        let destination = locked
-            .iter()
-            .find(|account| account.id == destination_account_id)
-            .expect("both locked accounts returned");
-        if source.owner_id != command.client_id
-            || source.status != "active"
-            || destination.status != "active"
-        {
-            return Err(AppError::account_unavailable());
-        }
-        if (
-            source.currency.as_str(),
-            source.scale,
-            destination.currency.as_str(),
-            destination.scale,
-        ) != (
-            preliminary.source_currency.as_str(),
-            preliminary.source_scale,
-            preliminary.destination_currency.as_str(),
-            preliminary.destination_scale,
-        ) {
-            return Err(AppError::internal(anyhow::anyhow!(
-                "account currency metadata changed during transfer"
-            )));
-        }
-        let (
-            kind,
-            destination_amount_minor,
-            fee_amount_minor,
-            total_source_debit_minor,
-            fee_bps,
-            exchange_rate,
-            exchange_rate_id,
-        ) = match fx_configuration {
-            None => (
-                TransferKind::Transfer,
+        let plan = build_transfer_plan(
+            &mut transaction,
+            &command,
+            &PreparedTransfer {
+                source_account_id,
+                destination_account_id,
+                preliminary,
                 amount_minor,
-                0,
-                amount_minor,
-                None,
-                None,
-                None,
-            ),
-            Some((rate, fee)) => {
-                let fee_calculation =
-                    calculate_fee(amount_minor, fee.fee_bps).map_err(transfer_arithmetic_error)?;
-                let exact_rate = ExactRate::parse(&rate.rate).map_err(transfer_arithmetic_error)?;
-                let destination_amount = calculate_destination(
-                    amount_minor,
-                    source.scale,
-                    destination.scale,
-                    &exact_rate,
-                )
-                .map_err(transfer_arithmetic_error)?;
-                (
-                    TransferKind::FxTransfer,
-                    destination_amount,
-                    fee_calculation.fee_minor,
-                    fee_calculation.total_source_debit_minor,
-                    Some(fee.fee_bps),
-                    Some(rate.rate),
-                    Some(rate.id),
-                )
-            }
-        };
-        if source.balance_minor < total_source_debit_minor {
-            return Err(AppError::business(
-                "insufficient_funds",
-                "The source account has insufficient funds",
-            ));
-        }
-        let source_balance = source
-            .balance_minor
-            .checked_sub(total_source_debit_minor)
-            .ok_or_else(|| {
-                AppError::business("arithmetic_overflow", "The transfer amount is out of range")
-            })?;
-        let destination_balance = destination
-            .balance_minor
-            .checked_add(destination_amount_minor)
-            .ok_or_else(|| {
-                AppError::business("arithmetic_overflow", "The transfer amount is out of range")
-            })?;
+                operation_type,
+                fingerprint,
+            },
+        )
+        .await?;
         let transfer_id = Uuid::new_v4();
         let created_at = transfers::insert(
             &mut transaction,
             NewTransfer {
                 id: transfer_id,
-                source_account_id,
-                destination_account_id,
-                source_currency: &source.currency,
-                destination_currency: &destination.currency,
-                source_amount_minor: amount_minor,
-                destination_amount_minor,
-                fee_amount_minor,
-                total_source_debit_minor,
-                fee_bps,
-                exchange_rate: exchange_rate.as_deref(),
-                exchange_rate_id,
-                kind: kind.as_str(),
+                source_account_id: plan.source_account_id,
+                destination_account_id: plan.destination_account_id,
+                source_currency: &plan.source_currency,
+                destination_currency: &plan.destination_currency,
+                source_amount_minor: plan.source_amount_minor,
+                destination_amount_minor: plan.destination_amount_minor,
+                fee_amount_minor: plan.fee_amount_minor,
+                total_source_debit_minor: plan.total_source_debit_minor,
+                fee_bps: plan.fee_bps,
+                exchange_rate: plan.exchange_rate.as_deref(),
+                exchange_rate_id: plan.exchange_rate_id,
+                kind: plan.kind.as_str(),
                 initiated_by: command.client_id,
             },
         )
         .await
         .map_err(AppError::internal)?;
-        transfers::update_balance(&mut transaction, source_account_id, source_balance)
-            .await
-            .map_err(AppError::internal)?;
         transfers::update_balance(
             &mut transaction,
-            destination_account_id,
-            destination_balance,
+            plan.source_account_id,
+            plan.source_balance,
         )
         .await
         .map_err(AppError::internal)?;
-        let is_fx = matches!(kind, TransferKind::FxTransfer);
+        transfers::update_balance(
+            &mut transaction,
+            plan.destination_account_id,
+            plan.destination_balance,
+        )
+        .await
+        .map_err(AppError::internal)?;
+        let is_fx = matches!(plan.kind, TransferKind::FxTransfer);
         transfers::insert_account_entry(
             &mut transaction,
             NewAccountEntry {
-                account_id: source_account_id,
+                account_id: plan.source_account_id,
                 transfer_id,
-                counterparty_account_id: destination_account_id,
+                counterparty_account_id: plan.destination_account_id,
                 direction: "debit",
-                operation_kind: kind.as_str(),
-                amount_minor: total_source_debit_minor,
-                currency: &source.currency,
-                principal_amount_minor: is_fx.then_some(amount_minor),
-                fee_amount_minor: is_fx.then_some(fee_amount_minor),
+                operation_kind: plan.kind.as_str(),
+                amount_minor: plan.total_source_debit_minor,
+                currency: &plan.source_currency,
+                principal_amount_minor: is_fx.then_some(plan.source_amount_minor),
+                fee_amount_minor: is_fx.then_some(plan.fee_amount_minor),
             },
         )
         .await
@@ -383,40 +281,46 @@ pub(crate) async fn create(
         transfers::insert_account_entry(
             &mut transaction,
             NewAccountEntry {
-                account_id: destination_account_id,
+                account_id: plan.destination_account_id,
                 transfer_id,
-                counterparty_account_id: source_account_id,
+                counterparty_account_id: plan.source_account_id,
                 direction: "credit",
-                operation_kind: kind.as_str(),
-                amount_minor: destination_amount_minor,
-                currency: &destination.currency,
-                principal_amount_minor: is_fx.then_some(destination_amount_minor),
+                operation_kind: plan.kind.as_str(),
+                amount_minor: plan.destination_amount_minor,
+                currency: &plan.destination_currency,
+                principal_amount_minor: is_fx.then_some(plan.destination_amount_minor),
                 fee_amount_minor: None,
             },
         )
         .await
         .map_err(AppError::internal)?;
-        let response = match kind {
+        let response = match plan.kind {
             TransferKind::Transfer => CreatedTransferResponse::Transfer {
                 id: transfer_id,
                 status: "completed",
-                source_account_id,
-                destination_account_id,
-                currency: source.currency.clone(),
-                amount: format_minor_units(amount_minor, source.scale),
+                source_account_id: plan.source_account_id,
+                destination_account_id: plan.destination_account_id,
+                currency: plan.source_currency.clone(),
+                amount: format_minor_units(plan.source_amount_minor, plan.source_scale),
                 created_at,
             },
             TransferKind::FxTransfer => CreatedTransferResponse::FxTransfer {
                 id: transfer_id,
                 status: "completed",
-                source_account_id,
-                destination_account_id,
-                source_currency: source.currency.clone(),
-                source_amount: format_minor_units(amount_minor, source.scale),
-                destination_currency: destination.currency.clone(),
-                destination_amount: format_minor_units(destination_amount_minor, destination.scale),
-                fee_amount: format_minor_units(fee_amount_minor, source.scale),
-                total_source_debit: format_minor_units(total_source_debit_minor, source.scale),
+                source_account_id: plan.source_account_id,
+                destination_account_id: plan.destination_account_id,
+                source_currency: plan.source_currency.clone(),
+                source_amount: format_minor_units(plan.source_amount_minor, plan.source_scale),
+                destination_currency: plan.destination_currency.clone(),
+                destination_amount: format_minor_units(
+                    plan.destination_amount_minor,
+                    plan.destination_scale,
+                ),
+                fee_amount: format_minor_units(plan.fee_amount_minor, plan.source_scale),
+                total_source_debit: format_minor_units(
+                    plan.total_source_debit_minor,
+                    plan.source_scale,
+                ),
                 created_at,
             },
         };
@@ -456,6 +360,174 @@ pub(crate) async fn create(
             Err(error)
         }
     }
+}
+
+/// A fully authorized and funded transfer assembled from rows protected by `FOR UPDATE`.
+struct TransferPlan {
+    source_account_id: Uuid,
+    destination_account_id: Uuid,
+    source_currency: String,
+    destination_currency: String,
+    source_scale: u8,
+    destination_scale: u8,
+    source_amount_minor: i64,
+    destination_amount_minor: i64,
+    fee_amount_minor: i64,
+    total_source_debit_minor: i64,
+    fee_bps: Option<i32>,
+    exchange_rate: Option<String>,
+    exchange_rate_id: Option<Uuid>,
+    kind: TransferKind,
+    source_balance: i64,
+    destination_balance: i64,
+}
+
+/// Re-reads immutable metadata under account locks before calculating any debit or credit.
+async fn build_transfer_plan(
+    transaction: &mut Transaction<'_, Postgres>,
+    command: &CreateTransferCommand<'_>,
+    prepared: &PreparedTransfer,
+) -> Result<TransferPlan, AppError> {
+    let operation_time = transfers::transaction_time(transaction)
+        .await
+        .map_err(AppError::internal)?;
+    let fx_configuration = if prepared.operation_type == idempotency::FX_TRANSFER_OPERATION {
+        Some((
+            fx::select_exchange_rate(
+                transaction,
+                &prepared.preliminary.source_currency,
+                &prepared.preliminary.destination_currency,
+                operation_time,
+            )
+            .await
+            .map_err(transfer_configuration_error)?,
+            fx::select_fee_rule(
+                transaction,
+                &prepared.preliminary.source_currency,
+                &prepared.preliminary.destination_currency,
+                operation_time,
+            )
+            .await
+            .map_err(transfer_configuration_error)?,
+        ))
+    } else {
+        None
+    };
+    let locked = transfers::lock_accounts(
+        transaction,
+        prepared.source_account_id,
+        prepared.destination_account_id,
+    )
+    .await
+    .map_err(AppError::internal)?;
+    if locked.len() != 2 {
+        return Err(AppError::account_unavailable());
+    }
+    let source = locked
+        .iter()
+        .find(|account| account.id == prepared.source_account_id)
+        .expect("both locked accounts returned");
+    let destination = locked
+        .iter()
+        .find(|account| account.id == prepared.destination_account_id)
+        .expect("both locked accounts returned");
+    if source.owner_id != command.client_id
+        || source.status != "active"
+        || destination.status != "active"
+    {
+        return Err(AppError::account_unavailable());
+    }
+    if (
+        source.currency.as_str(),
+        source.scale,
+        destination.currency.as_str(),
+        destination.scale,
+    ) != (
+        prepared.preliminary.source_currency.as_str(),
+        prepared.preliminary.source_scale,
+        prepared.preliminary.destination_currency.as_str(),
+        prepared.preliminary.destination_scale,
+    ) {
+        return Err(AppError::internal(anyhow::anyhow!(
+            "account currency metadata changed during transfer"
+        )));
+    }
+    let (
+        kind,
+        destination_amount_minor,
+        fee_amount_minor,
+        total_source_debit_minor,
+        fee_bps,
+        exchange_rate,
+        exchange_rate_id,
+    ) = match fx_configuration {
+        None => (
+            TransferKind::Transfer,
+            prepared.amount_minor,
+            0,
+            prepared.amount_minor,
+            None,
+            None,
+            None,
+        ),
+        Some((rate, fee)) => {
+            let fee_calculation = calculate_fee(prepared.amount_minor, fee.fee_bps)
+                .map_err(transfer_arithmetic_error)?;
+            let exact_rate = ExactRate::parse(&rate.rate).map_err(transfer_arithmetic_error)?;
+            let destination_amount = calculate_destination(
+                prepared.amount_minor,
+                source.scale,
+                destination.scale,
+                &exact_rate,
+            )
+            .map_err(transfer_arithmetic_error)?;
+            (
+                TransferKind::FxTransfer,
+                destination_amount,
+                fee_calculation.fee_minor,
+                fee_calculation.total_source_debit_minor,
+                Some(fee.fee_bps),
+                Some(rate.rate),
+                Some(rate.id),
+            )
+        }
+    };
+    if source.balance_minor < total_source_debit_minor {
+        return Err(AppError::business(
+            "insufficient_funds",
+            "The source account has insufficient funds",
+        ));
+    }
+    let source_balance = source
+        .balance_minor
+        .checked_sub(total_source_debit_minor)
+        .ok_or_else(|| {
+            AppError::business("arithmetic_overflow", "The transfer amount is out of range")
+        })?;
+    let destination_balance = destination
+        .balance_minor
+        .checked_add(destination_amount_minor)
+        .ok_or_else(|| {
+            AppError::business("arithmetic_overflow", "The transfer amount is out of range")
+        })?;
+    Ok(TransferPlan {
+        source_account_id: prepared.source_account_id,
+        destination_account_id: prepared.destination_account_id,
+        source_currency: source.currency.clone(),
+        destination_currency: destination.currency.clone(),
+        source_scale: source.scale,
+        destination_scale: destination.scale,
+        source_amount_minor: prepared.amount_minor,
+        destination_amount_minor,
+        fee_amount_minor,
+        total_source_debit_minor,
+        fee_bps,
+        exchange_rate,
+        exchange_rate_id,
+        kind,
+        source_balance,
+        destination_balance,
+    })
 }
 
 struct PreparedTransfer {
