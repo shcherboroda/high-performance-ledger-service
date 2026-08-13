@@ -80,9 +80,9 @@ Logical components:
 * SQLx persistence layer;
 * configuration and observability.
 
-HTTP handlers perform transport validation and response mapping. Application services own use-case logic, domain validation, and transaction boundaries. Repository modules own SQL statements and map database rows to persistence representations; they do not make business decisions.
+HTTP handlers perform transport validation and response mapping. Application services own use-case logic, domain validation, and transaction boundaries. Persistence modules own SQL statements and map database rows to persistence representations; they do not make business decisions.
 
-The account endpoints follow this boundary today: the HTTP layer parses Axum inputs and maps application results to API schemas, the account application service coordinates validation and idempotency in one transaction, and the account repository owns account inserts and owner-scoped balance reads. Transfers and reversals retain their existing behavior while they are migrated incrementally through the same pattern.
+The account endpoints follow this boundary today: the HTTP layer parses Axum inputs and maps application results to API schemas, the account application service coordinates validation and idempotency in one transaction, and the account persistence module owns account inserts and owner-scoped balance reads. Transfers and reversals retain their existing behavior while they are migrated incrementally through the same pattern.
 
 ## 5. Authentication and authorization
 

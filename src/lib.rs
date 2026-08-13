@@ -10,4 +10,4 @@ pub mod idempotency;
 pub mod money;
 pub mod observability;
 pub mod openapi;
-pub(crate) mod repository;
+pub(crate) mod persistence;

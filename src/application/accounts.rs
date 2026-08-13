@@ -8,7 +8,7 @@ use crate::{
     api_error::AppError,
     idempotency::{self, IdempotencyKey, Reservation},
     money::{MoneyError, currency, format_minor_units, parse_initial_balance},
-    repository::accounts::{self, NewAccount},
+    persistence::accounts::{self, NewAccount},
 };
 
 /// Transport-independent input for the account-creation use case.
