@@ -1,6 +1,7 @@
 pub(crate) mod api;
 pub mod api_error;
 pub mod app;
+pub(crate) mod application;
 pub mod auth;
 pub mod config;
 pub mod db;
@@ -9,3 +10,4 @@ pub mod idempotency;
 pub mod money;
 pub mod observability;
 pub mod openapi;
+pub(crate) mod repository;
