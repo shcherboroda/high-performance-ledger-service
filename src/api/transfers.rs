@@ -17,6 +17,7 @@ use uuid::Uuid;
 use crate::{
     api_error::{AppError, ErrorEnvelope},
     app::AppState,
+    application::transfers,
     auth::AuthenticatedClient,
     fx::{
         ArithmeticError, ConfigurationError, ExactRate, calculate_destination, calculate_fee,
@@ -133,56 +134,23 @@ pub(crate) async fn get_transfer(
 ) -> Result<Json<TransferDetailsResponse>, AppError> {
     let transfer_id = Uuid::parse_str(&transfer_id)
         .map_err(|_| AppError::validation("malformed_transfer_id", "The transfer ID is invalid"))?;
-    type TransferRow = (
-        Uuid,
-        Uuid,
-        String,
-        String,
-        i64,
-        i64,
-        i64,
-        i64,
-        Option<i32>,
-        Option<String>,
-        Option<Uuid>,
-        String,
-        Option<Uuid>,
-        String,
-        i16,
-        i16,
-    );
-    let row = sqlx::query_as::<_, TransferRow>(
-        "SELECT t.source_account_id, t.destination_account_id, t.source_currency, t.destination_currency, \
-         t.source_amount_minor, t.destination_amount_minor, t.fee_amount_minor, t.total_source_debit_minor, \
-         t.fee_bps, t.exchange_rate::text, t.exchange_rate_id, t.kind::text, t.reverses_transfer_id, \
-         t.created_at::text, source.currency_scale, destination.currency_scale \
-         FROM transfers t \
-         JOIN accounts source ON source.id = t.source_account_id \
-         JOIN accounts destination ON destination.id = t.destination_account_id \
-         WHERE t.id = $1 AND (source.owner_id = $2 OR destination.owner_id = $2)",
-    )
-    .bind(transfer_id)
-    .bind(client_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(AppError::internal)?
-    .ok_or_else(AppError::not_found)?;
+    let transfer = transfers::get_details(&state.pool, &client_id, transfer_id).await?;
     Ok(Json(TransferDetailsResponse {
-        id: transfer_id,
-        source_account_id: row.0,
-        destination_account_id: row.1,
-        source_currency: row.2,
-        destination_currency: row.3,
-        source_amount: format_minor_units(row.4, row.14 as u8),
-        destination_amount: format_minor_units(row.5, row.15 as u8),
-        fee_amount: format_minor_units(row.6, row.14 as u8),
-        total_source_debit: format_minor_units(row.7, row.14 as u8),
-        fee_bps: row.8,
-        exchange_rate: row.9,
-        exchange_rate_id: row.10,
-        kind: row.11,
-        reverses_transfer_id: row.12,
-        created_at: row.13,
+        id: transfer.id,
+        source_account_id: transfer.source_account_id,
+        destination_account_id: transfer.destination_account_id,
+        source_currency: transfer.source_currency,
+        destination_currency: transfer.destination_currency,
+        source_amount: transfer.source_amount,
+        destination_amount: transfer.destination_amount,
+        fee_amount: transfer.fee_amount,
+        total_source_debit: transfer.total_source_debit,
+        fee_bps: transfer.fee_bps,
+        exchange_rate: transfer.exchange_rate,
+        exchange_rate_id: transfer.exchange_rate_id,
+        kind: transfer.kind,
+        reverses_transfer_id: transfer.reverses_transfer_id,
+        created_at: transfer.created_at,
     }))
 }
 
