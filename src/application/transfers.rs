@@ -225,106 +225,8 @@ pub(crate) async fn create(
             },
         )
         .await?;
-        let transfer_id = Uuid::new_v4();
-        let created_at = transfers::insert(
-            &mut transaction,
-            NewTransfer {
-                id: transfer_id,
-                source_account_id: plan.source_account_id,
-                destination_account_id: plan.destination_account_id,
-                source_currency: &plan.source_currency,
-                destination_currency: &plan.destination_currency,
-                source_amount_minor: plan.source_amount_minor,
-                destination_amount_minor: plan.destination_amount_minor,
-                fee_amount_minor: plan.fee_amount_minor,
-                total_source_debit_minor: plan.total_source_debit_minor,
-                fee_bps: plan.fee_bps,
-                exchange_rate: plan.exchange_rate.as_deref(),
-                exchange_rate_id: plan.exchange_rate_id,
-                kind: plan.kind.as_str(),
-                initiated_by: command.client_id,
-            },
-        )
-        .await
-        .map_err(AppError::internal)?;
-        transfers::update_balance(
-            &mut transaction,
-            plan.source_account_id,
-            plan.source_balance,
-        )
-        .await
-        .map_err(AppError::internal)?;
-        transfers::update_balance(
-            &mut transaction,
-            plan.destination_account_id,
-            plan.destination_balance,
-        )
-        .await
-        .map_err(AppError::internal)?;
-        let is_fx = matches!(plan.kind, TransferKind::FxTransfer);
-        transfers::insert_account_entry(
-            &mut transaction,
-            NewAccountEntry {
-                account_id: plan.source_account_id,
-                transfer_id,
-                counterparty_account_id: plan.destination_account_id,
-                direction: "debit",
-                operation_kind: plan.kind.as_str(),
-                amount_minor: plan.total_source_debit_minor,
-                currency: &plan.source_currency,
-                principal_amount_minor: is_fx.then_some(plan.source_amount_minor),
-                fee_amount_minor: is_fx.then_some(plan.fee_amount_minor),
-            },
-        )
-        .await
-        .map_err(AppError::internal)?;
-        transfers::insert_account_entry(
-            &mut transaction,
-            NewAccountEntry {
-                account_id: plan.destination_account_id,
-                transfer_id,
-                counterparty_account_id: plan.source_account_id,
-                direction: "credit",
-                operation_kind: plan.kind.as_str(),
-                amount_minor: plan.destination_amount_minor,
-                currency: &plan.destination_currency,
-                principal_amount_minor: is_fx.then_some(plan.destination_amount_minor),
-                fee_amount_minor: None,
-            },
-        )
-        .await
-        .map_err(AppError::internal)?;
-        let response = match plan.kind {
-            TransferKind::Transfer => CreatedTransferResponse::Transfer {
-                id: transfer_id,
-                status: "completed",
-                source_account_id: plan.source_account_id,
-                destination_account_id: plan.destination_account_id,
-                currency: plan.source_currency.clone(),
-                amount: format_minor_units(plan.source_amount_minor, plan.source_scale),
-                created_at,
-            },
-            TransferKind::FxTransfer => CreatedTransferResponse::FxTransfer {
-                id: transfer_id,
-                status: "completed",
-                source_account_id: plan.source_account_id,
-                destination_account_id: plan.destination_account_id,
-                source_currency: plan.source_currency.clone(),
-                source_amount: format_minor_units(plan.source_amount_minor, plan.source_scale),
-                destination_currency: plan.destination_currency.clone(),
-                destination_amount: format_minor_units(
-                    plan.destination_amount_minor,
-                    plan.destination_scale,
-                ),
-                fee_amount: format_minor_units(plan.fee_amount_minor, plan.source_scale),
-                total_source_debit: format_minor_units(
-                    plan.total_source_debit_minor,
-                    plan.source_scale,
-                ),
-                created_at,
-            },
-        };
-        let response_body = serde_json::to_value(response).map_err(AppError::internal)?;
+        let persisted = persist_transfer(&mut transaction, &plan, command.client_id).await?;
+        let response_body = create_response_body(&plan, &persisted)?;
         idempotency::store_success(
             &mut transaction,
             command.client_id,
@@ -332,7 +234,7 @@ pub(crate) async fn create(
             command.idempotency_key,
             201,
             &response_body,
-            transfer_id,
+            persisted.id,
         )
         .await
         .map_err(AppError::internal)?;
@@ -360,6 +262,123 @@ pub(crate) async fn create(
             Err(error)
         }
     }
+}
+
+struct PersistedTransfer {
+    id: Uuid,
+    created_at: String,
+}
+
+/// Writes the transfer, both account balances, and their corresponding immutable ledger entries.
+async fn persist_transfer(
+    transaction: &mut Transaction<'_, Postgres>,
+    plan: &TransferPlan,
+    client_id: &str,
+) -> Result<PersistedTransfer, AppError> {
+    let id = Uuid::new_v4();
+    let created_at = transfers::insert(
+        transaction,
+        NewTransfer {
+            id,
+            source_account_id: plan.source_account_id,
+            destination_account_id: plan.destination_account_id,
+            source_currency: &plan.source_currency,
+            destination_currency: &plan.destination_currency,
+            source_amount_minor: plan.source_amount_minor,
+            destination_amount_minor: plan.destination_amount_minor,
+            fee_amount_minor: plan.fee_amount_minor,
+            total_source_debit_minor: plan.total_source_debit_minor,
+            fee_bps: plan.fee_bps,
+            exchange_rate: plan.exchange_rate.as_deref(),
+            exchange_rate_id: plan.exchange_rate_id,
+            kind: plan.kind.as_str(),
+            initiated_by: client_id,
+        },
+    )
+    .await
+    .map_err(AppError::internal)?;
+    transfers::update_balance(transaction, plan.source_account_id, plan.source_balance)
+        .await
+        .map_err(AppError::internal)?;
+    transfers::update_balance(
+        transaction,
+        plan.destination_account_id,
+        plan.destination_balance,
+    )
+    .await
+    .map_err(AppError::internal)?;
+    let is_fx = matches!(plan.kind, TransferKind::FxTransfer);
+    transfers::insert_account_entry(
+        transaction,
+        NewAccountEntry {
+            account_id: plan.source_account_id,
+            transfer_id: id,
+            counterparty_account_id: plan.destination_account_id,
+            direction: "debit",
+            operation_kind: plan.kind.as_str(),
+            amount_minor: plan.total_source_debit_minor,
+            currency: &plan.source_currency,
+            principal_amount_minor: is_fx.then_some(plan.source_amount_minor),
+            fee_amount_minor: is_fx.then_some(plan.fee_amount_minor),
+        },
+    )
+    .await
+    .map_err(AppError::internal)?;
+    transfers::insert_account_entry(
+        transaction,
+        NewAccountEntry {
+            account_id: plan.destination_account_id,
+            transfer_id: id,
+            counterparty_account_id: plan.source_account_id,
+            direction: "credit",
+            operation_kind: plan.kind.as_str(),
+            amount_minor: plan.destination_amount_minor,
+            currency: &plan.destination_currency,
+            principal_amount_minor: is_fx.then_some(plan.destination_amount_minor),
+            fee_amount_minor: None,
+        },
+    )
+    .await
+    .map_err(AppError::internal)?;
+    Ok(PersistedTransfer { id, created_at })
+}
+
+/// Keeps the original successful response as the exact value retained for idempotent replays.
+fn create_response_body(
+    plan: &TransferPlan,
+    persisted: &PersistedTransfer,
+) -> Result<serde_json::Value, AppError> {
+    let response = match plan.kind {
+        TransferKind::Transfer => CreatedTransferResponse::Transfer {
+            id: persisted.id,
+            status: "completed",
+            source_account_id: plan.source_account_id,
+            destination_account_id: plan.destination_account_id,
+            currency: plan.source_currency.clone(),
+            amount: format_minor_units(plan.source_amount_minor, plan.source_scale),
+            created_at: persisted.created_at.clone(),
+        },
+        TransferKind::FxTransfer => CreatedTransferResponse::FxTransfer {
+            id: persisted.id,
+            status: "completed",
+            source_account_id: plan.source_account_id,
+            destination_account_id: plan.destination_account_id,
+            source_currency: plan.source_currency.clone(),
+            source_amount: format_minor_units(plan.source_amount_minor, plan.source_scale),
+            destination_currency: plan.destination_currency.clone(),
+            destination_amount: format_minor_units(
+                plan.destination_amount_minor,
+                plan.destination_scale,
+            ),
+            fee_amount: format_minor_units(plan.fee_amount_minor, plan.source_scale),
+            total_source_debit: format_minor_units(
+                plan.total_source_debit_minor,
+                plan.source_scale,
+            ),
+            created_at: persisted.created_at.clone(),
+        },
+    };
+    serde_json::to_value(response).map_err(AppError::internal)
 }
 
 /// A fully authorized and funded transfer assembled from rows protected by `FOR UPDATE`.
