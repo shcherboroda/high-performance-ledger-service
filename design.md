@@ -82,7 +82,7 @@ Logical components:
 
 HTTP handlers perform transport validation and response mapping. Application services own use-case logic, domain validation, and transaction boundaries. Persistence modules own SQL statements and map database rows to persistence representations; they do not make business decisions.
 
-The account endpoints follow this boundary today: the HTTP layer parses Axum inputs and maps application results to API schemas, the account application service coordinates validation and idempotency in one transaction, and the account persistence module owns account inserts and owner-scoped balance reads. The transfer-details endpoint uses the same boundary for its participant-scoped immutable read. Transfer creation and reversals retain their existing behavior while they are migrated incrementally through the same pattern.
+The account endpoints follow this boundary today: the HTTP layer parses Axum inputs and maps application results to API schemas, the account application service coordinates validation and idempotency in one transaction, and the account persistence module owns account inserts and owner-scoped balance reads. Transfer details and creation use the same boundary: application owns the use-case flow, transaction and observability; persistence owns account locking and all transfer, balance and ledger-entry SQL. Reversals retain their existing behavior while they are migrated incrementally through the same pattern.
 
 ## 5. Authentication and authorization
 
