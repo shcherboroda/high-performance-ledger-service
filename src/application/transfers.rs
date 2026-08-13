@@ -130,60 +130,14 @@ pub(crate) async fn create(
     idempotency_retention: Duration,
     command: CreateTransferCommand<'_>,
 ) -> Result<CreateTransferResult, AppError> {
-    let source_account_id = Uuid::parse_str(command.source_account_id)
-        .map_err(|_| AppError::validation("malformed_account_id", "The account ID is invalid"))?;
-    let destination_account_id = Uuid::parse_str(command.destination_account_id)
-        .map_err(|_| AppError::validation("malformed_account_id", "The account ID is invalid"))?;
-    if source_account_id == destination_account_id {
-        return Err(AppError::validation(
-            "same_source_and_destination",
-            "The source and destination accounts must differ",
-        ));
-    }
-    let preflight_started = Instant::now();
-    let mut preflight_connection = match pool.acquire().await {
-        Ok(connection) => connection,
-        Err(error) => {
-            record_transfer_pool_acquire(
-                PoolAcquireOutcome::Failure,
-                preflight_started.elapsed().as_secs_f64(),
-            );
-            return Err(AppError::internal(error));
-        }
-    };
-    let preliminary = transfers::find_metadata(
-        &mut preflight_connection,
+    let PreparedTransfer {
         source_account_id,
         destination_account_id,
-    )
-    .await
-    .map_err(AppError::internal)?
-    .ok_or_else(AppError::account_unavailable)?;
-    drop(preflight_connection);
-    let operation_type = if preliminary.source_currency == preliminary.destination_currency {
-        if preliminary.source_scale != preliminary.destination_scale {
-            return Err(AppError::internal(anyhow::anyhow!(
-                "same currency accounts have different scales"
-            )));
-        }
-        idempotency::TRANSFER_OPERATION
-    } else {
-        idempotency::FX_TRANSFER_OPERATION
-    };
-    let amount_minor = parse_minor_units(command.amount, preliminary.source_scale)
-        .map_err(transfer_money_error)?;
-    if amount_minor <= 0 {
-        return Err(AppError::validation(
-            "non_positive_amount",
-            "The amount must be greater than zero",
-        ));
-    }
-    let fingerprint = idempotency::transfer_fingerprint(
-        source_account_id,
-        destination_account_id,
-        &preliminary.source_currency,
+        preliminary,
         amount_minor,
-    );
+        operation_type,
+        fingerprint,
+    } = prepare_transfer(pool, &command).await?;
     let acquire_started = Instant::now();
     let mut connection = match pool.acquire().await {
         Ok(connection) => {
@@ -502,6 +456,81 @@ pub(crate) async fn create(
             Err(error)
         }
     }
+}
+
+struct PreparedTransfer {
+    source_account_id: Uuid,
+    destination_account_id: Uuid,
+    preliminary: transfers::TransferMetadata,
+    amount_minor: i64,
+    operation_type: &'static str,
+    fingerprint: String,
+}
+
+/// Validates the request and releases the preflight connection before CPU work or mutation.
+async fn prepare_transfer(
+    pool: &PgPool,
+    command: &CreateTransferCommand<'_>,
+) -> Result<PreparedTransfer, AppError> {
+    let source_account_id = Uuid::parse_str(command.source_account_id)
+        .map_err(|_| AppError::validation("malformed_account_id", "The account ID is invalid"))?;
+    let destination_account_id = Uuid::parse_str(command.destination_account_id)
+        .map_err(|_| AppError::validation("malformed_account_id", "The account ID is invalid"))?;
+    if source_account_id == destination_account_id {
+        return Err(AppError::validation(
+            "same_source_and_destination",
+            "The source and destination accounts must differ",
+        ));
+    }
+    let started = Instant::now();
+    let mut connection = match pool.acquire().await {
+        Ok(connection) => connection,
+        Err(error) => {
+            record_transfer_pool_acquire(
+                PoolAcquireOutcome::Failure,
+                started.elapsed().as_secs_f64(),
+            );
+            return Err(AppError::internal(error));
+        }
+    };
+    let preliminary =
+        transfers::find_metadata(&mut connection, source_account_id, destination_account_id)
+            .await
+            .map_err(AppError::internal)?
+            .ok_or_else(AppError::account_unavailable)?;
+    drop(connection);
+    let operation_type = if preliminary.source_currency == preliminary.destination_currency {
+        if preliminary.source_scale != preliminary.destination_scale {
+            return Err(AppError::internal(anyhow::anyhow!(
+                "same currency accounts have different scales"
+            )));
+        }
+        idempotency::TRANSFER_OPERATION
+    } else {
+        idempotency::FX_TRANSFER_OPERATION
+    };
+    let amount_minor = parse_minor_units(command.amount, preliminary.source_scale)
+        .map_err(transfer_money_error)?;
+    if amount_minor <= 0 {
+        return Err(AppError::validation(
+            "non_positive_amount",
+            "The amount must be greater than zero",
+        ));
+    }
+    let fingerprint = idempotency::transfer_fingerprint(
+        source_account_id,
+        destination_account_id,
+        &preliminary.source_currency,
+        amount_minor,
+    );
+    Ok(PreparedTransfer {
+        source_account_id,
+        destination_account_id,
+        preliminary,
+        amount_minor,
+        operation_type,
+        fingerprint,
+    })
 }
 
 fn transfer_money_error(error: MoneyError) -> AppError {
