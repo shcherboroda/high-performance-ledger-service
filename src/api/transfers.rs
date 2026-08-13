@@ -19,16 +19,14 @@ use crate::{
     app::AppState,
     application::transfers,
     auth::AuthenticatedClient,
-    fx::{
-        ArithmeticError, ConfigurationError, ExactRate, calculate_destination, calculate_fee,
-        select_exchange_rate, select_fee_rule,
-    },
+    fx::{ArithmeticError, ConfigurationError, ExactRate, calculate_destination, calculate_fee},
     idempotency::{self, IdempotencyKey, Reservation},
     money::{MoneyError, format_minor_units, parse_minor_units},
     observability::{
         FinancialOperation, FinancialReason, IdempotencyOutcome, PoolAcquireOutcome,
         TerminalOutcome, TransactionObservation, record_transfer_pool_acquire,
     },
+    persistence::fx::{select_exchange_rate, select_fee_rule},
 };
 
 #[derive(Deserialize, ToSchema)]
