@@ -23,6 +23,20 @@ pub(crate) struct ReverseTransferCommand<'a> {
     pub original_transfer_id: &'a str,
 }
 
+struct PreparedReversal {
+    original_transfer_id: Uuid,
+    fingerprint: String,
+}
+
+fn prepare_reversal(command: &ReverseTransferCommand<'_>) -> Result<PreparedReversal, AppError> {
+    let original_transfer_id = Uuid::parse_str(command.original_transfer_id)
+        .map_err(|_| AppError::validation("malformed_transfer_id", "The transfer ID is invalid"))?;
+    Ok(PreparedReversal {
+        fingerprint: idempotency::reversal_fingerprint(original_transfer_id),
+        original_transfer_id,
+    })
+}
+
 #[derive(serde::Serialize)]
 struct ReversalResponse {
     id: Uuid,
@@ -52,9 +66,10 @@ pub(crate) async fn reverse(
     idempotency_retention: Duration,
     command: ReverseTransferCommand<'_>,
 ) -> Result<ReverseTransferResult, AppError> {
-    let original_transfer_id = Uuid::parse_str(command.original_transfer_id)
-        .map_err(|_| AppError::validation("malformed_transfer_id", "The transfer ID is invalid"))?;
-    let fingerprint = idempotency::reversal_fingerprint(original_transfer_id);
+    let PreparedReversal {
+        original_transfer_id,
+        fingerprint,
+    } = prepare_reversal(&command)?;
     let mut transaction = match pool.begin().await {
         Ok(transaction) => transaction,
         Err(error) => {
