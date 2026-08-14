@@ -80,7 +80,9 @@ Logical components:
 * SQLx persistence layer;
 * configuration and observability.
 
-HTTP handlers perform transport validation and response mapping. Application services own use-case logic and transaction boundaries.
+HTTP handlers perform transport validation and response mapping. Application services own use-case logic, domain validation, and transaction boundaries. Persistence modules own SQL statements and map database rows to persistence representations; they do not make business decisions.
+
+The account endpoints follow this boundary today: the HTTP layer parses Axum inputs and maps application results to API schemas, the account application service coordinates validation and idempotency in one transaction, and the account persistence module owns account inserts and owner-scoped balance reads. Transfer details and creation use the same boundary: application owns the use-case flow, transaction and observability; persistence owns account locking and all transfer, balance and ledger-entry SQL. Reversals retain their existing behavior while they are migrated incrementally through the same pattern.
 
 ## 5. Authentication and authorization
 
@@ -381,22 +383,27 @@ A negative initial balance is rejected and rolls back the reservation. No transf
 
 ## 10. Atomic same-currency transfer
 
-A normal transfer runs in one PostgreSQL transaction:
+A normal transfer first reads immutable account currency and scale metadata, then parses and
+validates the positive decimal-string amount and derives the idempotency fingerprint. This
+preflight is intentionally outside the transaction so CPU-only work does not retain a transaction
+or pool connection. The locked account read inside the transaction compares the metadata again
+before any balance mutation.
 
-1. parse and validate the positive decimal-string amount;
-2. reserve or replay the idempotency key;
-3. lock both account rows using `SELECT ... FOR UPDATE` in deterministic ascending account-ID order;
-4. verify both accounts exist and are active;
-5. verify source and destination differ;
-6. verify the caller owns the source account;
-7. verify both accounts use the same currency;
-8. verify sufficient source balance;
-9. debit the source and credit the destination;
-10. increment account versions;
-11. insert the immutable transfer;
-12. insert one debit and one credit account entry;
-13. store the successful response in the idempotency row;
-14. commit atomically.
+The transaction then:
+
+1. reserves or replays the idempotency key;
+2. locks both account rows using `SELECT ... FOR UPDATE` in deterministic ascending account-ID order;
+3. verifies both accounts exist and are active;
+4. verifies source and destination differ;
+5. verifies the caller owns the source account;
+6. verifies the locked metadata matches the preflight snapshot and, for a normal transfer, both accounts use the same currency;
+7. verifies sufficient source balance;
+8. debits the source and credits the destination;
+9. increments account versions;
+10. inserts the immutable transfer;
+11. inserts one debit and one credit account entry;
+12. stores the successful response in the idempotency row;
+13. commits atomically.
 
 Any business error rolls back all work, including the idempotency reservation.
 

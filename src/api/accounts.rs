@@ -14,9 +14,9 @@ use uuid::Uuid;
 use crate::{
     api_error::{AppError, ErrorEnvelope},
     app::AppState,
+    application::accounts::{self, CreateAccountCommand, CreateAccountResult},
     auth::AuthenticatedClient,
-    idempotency::{self, IdempotencyKey, Reservation},
-    money::{MoneyError, currency, format_minor_units, parse_initial_balance},
+    idempotency::IdempotencyKey,
 };
 
 #[derive(Deserialize, ToSchema)]
@@ -69,67 +69,29 @@ pub(crate) async fn create_account(
     let idempotency_key = IdempotencyKey::from_headers(&headers)?;
     let Json(request) =
         request.map_err(|_| AppError::validation("invalid_json", "The request body is invalid"))?;
-    let currency = currency(&request.currency).ok_or_else(|| {
-        AppError::validation("unsupported_currency", "The currency is not supported")
-    })?;
-    let balance_minor =
-        parse_initial_balance(&request.initial_balance, currency.scale()).map_err(money_error)?;
-    let fingerprint = idempotency::account_creation_fingerprint(currency.code(), balance_minor);
-    let mut transaction = state.pool.begin().await.map_err(AppError::internal)?;
-    match idempotency::reserve(
-        &mut transaction,
-        &client_id,
-        idempotency::ACCOUNT_CREATION_OPERATION,
-        &idempotency_key,
-        &fingerprint,
+    match accounts::create_account(
+        &state.pool,
         state.idempotency_retention,
+        CreateAccountCommand {
+            client_id: &client_id,
+            idempotency_key: &idempotency_key,
+            currency: &request.currency,
+            initial_balance: &request.initial_balance,
+        },
     )
-    .await
-    .map_err(AppError::internal)?
+    .await?
     {
-        Reservation::Replay {
+        CreateAccountResult::Created { response_body } => {
+            Ok((StatusCode::CREATED, Json(response_body)).into_response())
+        }
+        CreateAccountResult::Replay {
             http_status,
             response_body,
         } => {
-            transaction.commit().await.map_err(AppError::internal)?;
             let status = StatusCode::from_u16(http_status as u16).map_err(AppError::internal)?;
-            return Ok((status, Json(response_body)).into_response());
+            Ok((status, Json(response_body)).into_response())
         }
-        Reservation::Conflict => return Err(AppError::idempotency_conflict()),
-        Reservation::Owned => {}
     }
-    let id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO accounts (id, owner_id, currency, currency_scale, balance_minor) \
-         VALUES ($1, $2, $3, $4, $5)",
-    )
-    .bind(id)
-    .bind(&client_id)
-    .bind(currency.code())
-    .bind(i16::from(currency.scale()))
-    .bind(balance_minor)
-    .execute(&mut *transaction)
-    .await
-    .map_err(AppError::internal)?;
-    let response_body = serde_json::to_value(AccountCreatedResponse {
-        id,
-        currency: currency.code().to_owned(),
-        balance: format_minor_units(balance_minor, currency.scale()),
-    })
-    .map_err(AppError::internal)?;
-    idempotency::store_success(
-        &mut transaction,
-        &client_id,
-        idempotency::ACCOUNT_CREATION_OPERATION,
-        &idempotency_key,
-        StatusCode::CREATED.as_u16().into(),
-        &response_body,
-        id,
-    )
-    .await
-    .map_err(AppError::internal)?;
-    transaction.commit().await.map_err(AppError::internal)?;
-    Ok((StatusCode::CREATED, Json(response_body)).into_response())
 }
 
 #[utoipa::path(
@@ -152,39 +114,11 @@ pub(crate) async fn get_balance(
 ) -> Result<Json<AccountBalanceResponse>, AppError> {
     let id = Uuid::parse_str(&account_id)
         .map_err(|_| AppError::validation("malformed_account_id", "The account ID is invalid"))?;
-    let account = sqlx::query_as::<_, (String, i16, i64, i64)>(
-        "SELECT currency, currency_scale, balance_minor, version \
-         FROM accounts WHERE id = $1 AND owner_id = $2",
-    )
-    .bind(id)
-    .bind(client_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(AppError::internal)?
-    .ok_or_else(AppError::not_found)?;
+    let account = accounts::get_balance(&state.pool, &client_id, id).await?;
     Ok(Json(AccountBalanceResponse {
-        id,
-        currency: account.0,
-        balance: format_minor_units(account.2, account.1 as u8),
-        version: account.3,
+        id: account.id,
+        currency: account.currency,
+        balance: account.balance,
+        version: account.version,
     }))
-}
-
-fn money_error(error: MoneyError) -> AppError {
-    match error {
-        MoneyError::Malformed => {
-            AppError::validation("malformed_amount", "The amount is malformed")
-        }
-        MoneyError::TooManyFractionalDigits => AppError::validation(
-            "too_many_fractional_digits",
-            "The amount has too many fractional digits for this currency",
-        ),
-        MoneyError::Negative => AppError::validation(
-            "negative_initial_balance",
-            "The initial balance cannot be negative",
-        ),
-        MoneyError::Overflow => {
-            AppError::validation("amount_overflow", "The amount is out of range")
-        }
-    }
 }
